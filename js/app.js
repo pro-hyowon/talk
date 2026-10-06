@@ -5,7 +5,7 @@ import { CONFIG } from './config.js';
 import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 
-const VERSION = '1.6.0';
+const VERSION = '1.8.0';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 const APP = CONFIG.APP_NAME;
 const app = document.getElementById('app');
@@ -52,7 +52,9 @@ const S = {
   pending: 0,
   suggestions: [],
   phone: undefined,
-  listSeen: new Set(),   // 채팅 목록에 이미 반영한 메시지 번호   // undefined = 아직 모름, null = 등록 안 함, { phone, findable }
+  listSeen: new Set(),   // 채팅 목록에 이미 반영한 메시지 번호
+  requests: [],          // 받은 친구 요청
+  chatFilter: 'all',     // 채팅 목록: all / dm / group   // undefined = 아직 모름, null = 등록 안 함, { phone, findable }
 };
 
 function cacheProfile(p) {
@@ -434,9 +436,10 @@ async function enterApp(id) {
   if (S.me.status && S.me.status !== 'active') { renderBlocked(S.me.status); return; }
   cacheProfile(S.me);
   buildShell();
-  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus });
+  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted });
   await Promise.all([loadFriends(), loadRooms()]).catch(showErr);
   loadSuggestions();
+  loadRequests();
   route();
   touchLastSeen();
   enablePush({ silent: true }).then(() => { if (S.tab === 'more' && !S.room) renderMain(); }).catch((e) => console.warn('push', e));
@@ -481,6 +484,7 @@ function leaveApp() {
     uid: null, entered: false, me: null, friends: [], rooms: [], roomsLoaded: false, room: null,
     fromList: false, unsub: null, wasSubscribed: false, tab: 'friends', pushOn: false,
     admin: null, adminFromMore: false, lastTouch: 0, pending: 0, suggestions: [], phone: undefined,
+    requests: [], chatFilter: 'all',
   });
   S.profiles.clear(); S.imgUrls.clear();
   setBadge(0);
@@ -495,7 +499,7 @@ function buildShell() {
   <div id="main" class="screen main">
     <div class="top" id="mainHeader"></div>
     <div class="scroll" id="mainBody"></div>
-    <nav class="tabbar">${tabs.map(([k, l, i]) => `<button data-act="tab" data-tab="${k}" aria-label="${l}"><span class="pill">${ic(i, 24)}${k === 'chats' ? '<span class="tab-badge" id="chatBadge"></span>' : ''}</span><span class="lbl">${l}</span></button>`).join('')}</nav>
+    <nav class="tabbar">${tabs.map(([k, l, i]) => `<button data-act="tab" data-tab="${k}" aria-label="${l}"><span class="pill">${ic(i, 24)}${k === 'chats' ? '<span class="tab-badge" id="chatBadge"></span>' : k === 'friends' ? '<span class="tab-badge" id="friendBadge"></span>' : ''}</span><span class="lbl">${l}</span></button>`).join('')}</nav>
   </div>
   <div id="admin" class="screen admin" hidden></div>
   <div id="room" class="screen room" hidden></div>
@@ -523,7 +527,7 @@ function route() {
   const t = (h.match(/^#\/(friends|chats|more)$/) || [])[1];
   if (t) S.tab = t;
   renderMain();
-  if (S.tab === 'friends') { loadFriends().catch(() => {}); loadSuggestions(); }
+  if (S.tab === 'friends') { loadFriends().catch(() => {}); loadSuggestions(); loadRequests(); }
 }
 window.addEventListener('hashchange', route);
 function go(hash) { if (location.hash !== hash) location.hash = hash; else route(); }
@@ -549,6 +553,19 @@ async function loadSuggestions() {
   } catch (e) { console.warn('suggestions', e); S.suggestions = []; }
   if (S.tab === 'friends' && !S.room && $('#main')) renderMain();
 }
+async function loadRequests() {
+  if (!api.listRequests) return;
+  try {
+    S.requests = await api.listRequests();
+    S.requests.forEach((p) => cacheProfile({ id: p.id, username: p.username, display_name: p.display_name, status_message: p.status_message, avatar_url: p.avatar_url }));
+  } catch (e) { console.warn('requests', e); S.requests = []; }
+  updateFriendBadge();
+  if (S.tab === 'friends' && !S.room && $('#main')) renderMain();
+}
+function updateFriendBadge() {
+  const b = $('#friendBadge');
+  if (b) b.innerHTML = S.requests.length ? `<span class="badge">${badgeTxt(S.requests.length)}</span>` : '';
+}
 async function loadPhone() {
   if (!api.getMyPhone) { S.phone = null; return; }
   try { S.phone = (await api.getMyPhone()) || null; } catch (e) { console.warn('phone', e); S.phone = null; }
@@ -556,6 +573,10 @@ async function loadPhone() {
 async function loadRooms() {
   S.rooms = await api.listRooms();
   S.roomsLoaded = true;
+  // 보고 있던 단체방에서 내보내졌으면 닫기 (실시간 알림을 못 받은 경우 대비)
+  if (S.room && S.room.info && S.room.info.is_group && !S.room.info.is_notice && !S.rooms.some((r) => r.room_id === S.room.id)) {
+    kickedOut(S.room.id, S.room.info.title);
+  }
   S.rooms.forEach((r) => (r.members || []).forEach(cacheProfile));
   updateBadges();
   if (S.tab === 'chats' && $('#main')) renderMain();
@@ -600,7 +621,12 @@ function renderMain() {
         <span class="chip-mine">내 프로필</span></button>
       <button class="find-card" data-act="contacts"><span class="tile mint">${ic('book', 20)}</span>
         <span class="meta"><span class="name">연락처로 친구 찾기</span><span class="desc">내 연락처에 있는 ${esc(APP)} 친구를 추천해 드려요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      ${S.suggestions.length ? `<div class="sec">추천 친구 ${S.suggestions.length}</div>${S.suggestions.map((g) => `
+      ${S.requests.length ? `<div class="sec">받은 친구 요청 ${S.requests.length}</div>${S.requests.map((g) => `
+        <div class="row sug req"><button class="sug-main" data-act="profile" data-id="${esc(g.id)}">${av(g, 48)}
+          <span class="meta"><span class="name">${esc(g.display_name)}</span><span class="desc">@${esc(g.username)} · 나를 친구로 추가했어요</span></span></button>
+          <button class="mini-btn" data-act="req-accept" data-id="${esc(g.id)}">수락</button>
+          <button class="ibtn sm" data-act="req-hide" data-id="${esc(g.id)}" aria-label="요청 숨기기">${ic('x', 18)}</button></div>`).join('')}` : ''}
+      ${sugList().length ? `<div class="sec">추천 친구 ${sugList().length}</div>${sugList().map((g) => `
         <div class="row sug"><button class="sug-main" data-act="profile" data-id="${esc(g.id)}">${av(g, 48)}
           <span class="meta"><span class="name">${esc(g.display_name)}</span><span class="desc">${esc([g.contact_name ? `내 연락처: ${g.contact_name}` : '내 연락처에 있는 친구', g.added_me ? '나를 친구로 추가했어요' : ''].filter(Boolean).join(' · '))}</span></span></button>
           <button class="mini-btn" data-act="sug-add" data-id="${esc(g.id)}">추가</button>
@@ -608,13 +634,24 @@ function renderMain() {
       ${S.friends.length ? `<div class="sec">친구 ${S.friends.length}</div>${S.friends.map((f) => `
         <button class="row" data-act="profile" data-id="${esc(f.id)}">${av(f, 48)}
           <div class="meta"><div class="name">${esc(f.display_name)}</div>${f.mutual === false ? '<div class="desc">아직 상대방이 나를 추가하지 않았어요</div>' : f.status_message ? `<div class="desc">${esc(f.status_message)}</div>` : ''}</div></button>`).join('')}`
-    : S.suggestions.length ? '<div class="empty-line" style="padding-top:20px">아직 친구가 없어요. 추천 친구를 추가하거나 아이디·휴대폰 번호로 찾아보세요.</div>'
+    : (sugList().length || S.requests.length) ? '<div class="empty-line" style="padding-top:20px">아직 친구가 없어요. 받은 요청이나 추천 친구를 추가하거나 아이디·휴대폰 번호로 찾아보세요.</div>'
     : `<div class="empty-state" style="padding-top:28px"><div class="es-icon lav">${ic('logo', 64)}</div><b>아직 친구가 없어요</b><p>친구의 아이디나 휴대폰 번호로 찾아서 추가해 보세요.</p>
         <button class="btn sm" data-act="add-friend">${ic('userplus', 20)}친구 추가하기</button></div>`}`;
   } else if (S.tab === 'chats') {
     head.innerHTML = `<h1>채팅</h1><button class="ibtn" data-act="new-chat" aria-label="새 채팅">${ic('chatplus', 24)}</button>`;
     if (!S.roomsLoaded) { body.innerHTML = '<div class="spinner"></div>'; return; }
-    if (S.rooms.length) { patchList(body, S.rooms.map((r) => [r.room_id, chatRowHtml(r)]), 'cw'); return; }
+    if (S.rooms.length) {
+      let list = $('#chatList', body);
+      if (!list) { body.innerHTML = '<div class="chat-filter" id="chatFilter"></div><div id="chatList"></div>'; list = $('#chatList', body); }
+      const dms = S.rooms.filter((r) => !r.is_group); const groups = S.rooms.filter((r) => r.is_group && !r.is_notice);
+      const unread = (arr) => arr.some((r) => r.unread);
+      $('#chatFilter', body).innerHTML = [['all', '전체', S.rooms], ['dm', '1:1', dms], ['group', '단체', groups]]
+        .map(([k, l, arr]) => `<button data-act="chat-filter" data-f="${k}" class="${S.chatFilter === k ? 'on' : ''}">${l}<span class="n">${arr.length}</span>${unread(arr) ? '<i class="dot"></i>' : ''}</button>`).join('');
+      const shown = S.chatFilter === 'dm' ? dms : S.chatFilter === 'group' ? groups : S.rooms;
+      if (shown.length) patchList(list, shown.map((r) => [r.room_id, chatRowHtml(r)]), 'cw');
+      else list.innerHTML = `<div class="empty-line">${S.chatFilter === 'dm' ? '1:1 대화방이 없어요' : '단체방이 없어요'}</div>`;
+      return;
+    }
     body.innerHTML = `<div class="empty-state" style="padding-top:72px"><div class="es-icon sky">${ic('chat', 52)}</div><b>대화 중인 채팅방이 없어요</b><p>친구를 골라 첫 대화를 시작해 보세요.</p>
         <button class="btn sm" data-act="new-chat">${ic('chatplus', 20)}새 채팅</button></div>`;
   } else {
@@ -624,7 +661,7 @@ function renderMain() {
 
 function chatRowHtml(r) {
   return `<button class="row chat" data-act="open-room" data-id="${esc(r.room_id)}">${roomAv(r)}
-    <div class="meta"><div class="title-line"><span class="name">${esc(roomName(r, r.members || []))}</span>${r.is_group && !r.is_notice ? `<span class="cnt">${r.member_count}</span>` : ''}</div>
+    <div class="meta"><div class="title-line">${r.is_group && !r.is_notice ? '<span class="tag-group">단체</span>' : ''}<span class="name">${esc(roomName(r, r.members || []))}</span>${r.is_group && !r.is_notice ? `<span class="cnt">${r.member_count}</span>` : ''}</div>
     <div class="desc">${esc(previewText(r.last_message))}</div></div>
     <div class="side"><span class="time">${esc(fmtListTime(r.last_message_at))}</span>${r.unread ? `<span class="badge">${badgeTxt(r.unread)}</span>` : ''}</div></button>`;
 }
@@ -823,7 +860,7 @@ function renderRoomHeader() {
 
 const isNoticeRoom = () => !!(S.room && S.room.info && S.room.info.is_notice);
 function unreadCount(m) {
-  if (!isNum(m.id) || isNoticeRoom()) return 0;
+  if (!isNum(m.id) || isNoticeRoom() || m.kind === 'deleted') return 0;
   return S.room.members.filter((mb) => mb.last_read_id < m.id).length;
 }
 
@@ -850,6 +887,7 @@ function msgHtml(m, prev, next) {
   const p = profileOf(m.sender_id);
   const content = m.kind === 'image'
     ? `<button class="bubble photo" data-act="view-img" data-id="${esc(m.id)}" aria-label="사진 크게 보기"><img alt="사진" ${m.localUrl ? `src="${esc(m.localUrl)}"` : ''} data-path="${esc(m.content)}"></button>`
+    : m.kind === 'deleted' ? `<div class="bubble deleted">${ic('ban', 15, 'flex:none')}삭제된 메시지예요</div>`
     : m.kind === 'sticker' ? `<button class="bubble sticker" data-act="replay-sticker" aria-label="이모티콘 다시 움직이기">${stickerSvg(m.content, 120)}</button>`
       : `<div class="bubble">${notice ? noticeText(m.content) : linkify(m.content)}</div>`;
   const showMeta = !m.pending && !m.failed;
@@ -984,8 +1022,9 @@ async function refreshMembers() {  // 입장·퇴장 등으로 참여자가 바�
   if (!S.room) return;
   const id = S.room.id;
   try {
-    const rows = await api.getMembers(id);
+    const [rows, info] = await Promise.all([api.getMembers(id), api.getRoom(id).catch(() => null)]);
     if (!S.room || S.room.id !== id) return;
+    if (info) S.room.info = { ...S.room.info, ...info };
     setMembers(rows);
     renderRoomHeader();
     renderMsgs();
@@ -1103,6 +1142,26 @@ function wireComposer() {
     if (box.scrollTop < 80) loadOlder();
   }, { passive: true });
   box.addEventListener('load', (e) => { if (e.target.tagName === 'IMG' && S.room && S.room.atBottom) box.scrollTop = box.scrollHeight; }, true);
+  // 메시지 길게 누르기(휴대폰) / 오른쪽 클릭(PC) → 복사·삭제 메뉴
+  let lp = null;
+  const msgOf = (el) => { const w = el.closest('.mw'); return w && S.room ? S.room.msgs.find((x) => String(x.id) === w.dataset.k) : null; };
+  const cancelLp = () => { if (lp) { clearTimeout(lp.t); lp = null; } };
+  box.addEventListener('pointerdown', (e) => {
+    const b = e.target.closest('.bubble'); if (!b || e.button > 0) return;
+    const m = msgOf(b); if (!m) return;
+    cancelLp();
+    lp = { x: e.clientX, y: e.clientY, t: setTimeout(() => { lp = null; S.room.suppressClick = true; try { navigator.vibrate?.(15); } catch { /* 없음 */ } showMsgMenu(m); }, 520) };
+  });
+  box.addEventListener('pointermove', (e) => { if (lp && (Math.abs(e.clientX - lp.x) > 10 || Math.abs(e.clientY - lp.y) > 10)) cancelLp(); });
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach((ev) => box.addEventListener(ev, cancelLp));
+  box.addEventListener('scroll', cancelLp, { passive: true });
+  box.addEventListener('contextmenu', (e) => {
+    const b = e.target.closest('.bubble'); if (!b) return;
+    const m = msgOf(b); if (!m) return;
+    e.preventDefault(); cancelLp(); showMsgMenu(m);
+  });
+  // 길게 누른 뒤 손을 뗄 때 생기는 클릭(사진 열기 등)은 무시
+  box.addEventListener('click', (e) => { if (S.room && S.room.suppressClick) { S.room.suppressClick = false; e.stopPropagation(); e.preventDefault(); } }, true);
   $('#photoInput').onchange = async (e) => {
     const files = [...e.target.files]; e.target.value = '';
     for (const f of files.slice(0, 10)) await sendPhoto(f);
@@ -1140,6 +1199,53 @@ async function sendText(retryMsg) {
     showErr(e);
   }
 }
+
+// ---------- 메시지 메뉴 (복사·삭제) ----------
+let msgMenuAt = 0;
+function showMsgMenu(m) {
+  if (!S.room || m.kind === 'deleted' || m.kind === 'system') return;
+  // 안드로이드는 길게 누르면 contextmenu 도 함께 발생 → 메뉴가 두 번 뜨지 않게
+  if (Date.now() - msgMenuAt < 400 || $(".msg-menu")) return;
+  msgMenuAt = Date.now();
+  const R = S.room;
+  const mineMsg = m.sender_id === S.uid;
+  const local = !isNum(m.id);   // 아직 안 보내졌거나 실패한 메시지
+  const items = [];
+  if (m.kind === 'text') items.push(['copy', ic('copy', 22), '복사']);
+  if (mineMsg) items.push(['delete', ic('ban', 22), local ? '보내기 취소' : '삭제']);
+  if (!items.length) return;
+  openSheet({
+    title: '메시지', bare: true,
+    body: `<div class="msg-menu">${items.map(([k, i, l]) => `<button class="menu-row ${k === 'delete' ? 'leave' : ''}" data-x="${k}">${i}<span>${l}</span></button>`).join('')}</div>
+      <button class="btn gray" data-close style="margin-top:8px">닫기</button>`,
+    onMount(sheet, close) {
+      sheet.addEventListener('click', async (e) => {
+        const x = e.target.closest('[data-x]'); if (!x) return;
+        close();
+        if (x.dataset.x === 'copy') {
+          try { await navigator.clipboard.writeText(m.content); toast('메시지를 복사했어요'); } catch { toast('복사하지 못했어요', { error: true }); }
+        }
+        if (x.dataset.x === 'delete') {
+          if (local) { R.msgs = R.msgs.filter((y) => y !== m); if (S.room === R) renderMsgs(); return; }
+          if (!(await ask('메시지를 삭제할까요?', '모든 대화 상대의 화면에서 "삭제된 메시지예요"로 바뀌어요. 되돌릴 수 없어요.', '삭제', true))) return;
+          try {
+            await api.deleteMessage(m);
+            markDeleted(m.room_id, m.id);
+            toast('메시지를 삭제했어요');
+          } catch (ex) { showErr(ex); }
+        }
+      });
+    },
+  });
+}
+function markDeleted(roomId, id) {
+  if (S.room && S.room.id === roomId) {
+    const m = S.room.msgs.find((x) => x.id === id);
+    if (m && m.kind !== 'deleted') { m.kind = 'deleted'; m.content = '-'; renderMsgs(); }
+  }
+  refreshRoomsSoon();   // 목록 미리보기 갱신
+}
+function onDeleted(p) { markDeleted(p.room_id, p.id); }
 
 // ---------- 이모티콘 ----------
 const RECENT_KEY = 'minitalk-recent-stickers';
@@ -1268,6 +1374,7 @@ function onStatus(status) {
 async function catchUp() {
   if (!S.entered || !$('#main')) return;
   refreshRoomsSoon();
+  loadRequests();
   if (S.room) {
     const R = S.room;
     const lastReal = [...R.msgs].reverse().find((m) => isNum(m.id));
@@ -1373,17 +1480,20 @@ function showAddFriend() {
         const ph = normPhone(raw);
         const q = ph || raw.replace(/^@/, '').toLowerCase();
         if (!q) { box.classList.add('err'); out.innerHTML = `<div class="field-err" style="padding:10px 4px 30px">${ic('alert', 16)}아이디 또는 휴대폰 번호를 입력해 주세요</div>`; return; }
+        form.q.blur();   // 휴대폰 키보드를 내려서 결과가 가려지지 않게
         out.innerHTML = '<div class="spinner"></div>';
         try {
           const u = await api.findUser(q);
           if (!u) {
             box.classList.add('err');
+            toast(ph ? '그 번호로 찾을 수 있는 회원이 없어요' : `‘${q}’ 아이디를 찾을 수 없어요`, { error: true });
             out.innerHTML = ph
               ? `<div class="field-err" style="padding:10px 4px 0">${ic('alert', 16)}${esc(fmtPhone(ph))} 번호로 찾을 수 있는 회원이 없어요</div><div class="help" style="padding:6px 4px 30px">번호를 등록하지 않았거나 ‘번호로 나를 찾을 수 있게’를 꺼 둔 회원은 찾을 수 없어요. 아이디로 검색해 보세요.</div>`
               : `<div class="field-err" style="padding:10px 4px 30px">${ic('alert', 16)}‘${esc(q)}’ 아이디를 찾을 수 없어요</div>`;
             return;
           }
           cacheProfile(u);
+          setTimeout(() => out.scrollIntoView({ block: 'nearest', behavior: 'smooth' }), 50);
           const isMe = u.id === S.uid; const isFriend = S.friends.some((f) => f.id === u.id);
           out.innerHTML = `<div class="found">${av(u, 76)}<div class="fn">${esc(u.display_name)}</div><div class="fid">@${esc(u.username)}</div>
             ${u.status_message ? `<div class="fst">${esc(u.status_message)}</div>` : ''}
@@ -1581,6 +1691,37 @@ function showPhone() {
   });
 }
 
+// 추천 친구 (받은 요청에 이미 있는 사람은 빼고)
+const sugList = () => S.suggestions.filter((g) => !S.requests.some((q) => q.id === g.id));
+
+// 실시간: 누군가 나를 친구로 추가함
+function onFriend(p) {
+  loadRequests();
+  const person = { id: p.from_id, display_name: p.display_name || '누군가' };
+  cacheProfile({ id: p.from_id, display_name: p.display_name, username: p.username });
+  const text = `${person.display_name}님이 나를 친구로 추가했어요. 나도 추가하면 대화할 수 있어요`;
+  if (document.hidden) {
+    if (S.pushOn) return; // 서버 알림이 대신 보여 줌
+    if ('Notification' in window && Notification.permission === 'granted' && navigator.serviceWorker) {
+      navigator.serviceWorker.ready.then((reg) => reg.showNotification('친구 요청', { body: text, tag: 'friend-' + p.from_id, icon: './icons/icon-192.png', badge: './icons/badge-72.png', data: { url: './#/friends' } })).catch(() => {});
+    }
+    return;
+  }
+  toastMsg({ person, title: '친구 요청', body: text, onClick: () => go('#/friends') });
+}
+// 실시간: 단체방에서 내보내짐
+function onKicked(p) { kickedOut(p.room_id, p.title); }
+function kickedOut(roomId, title) {
+  const r = S.rooms.find((x) => x.room_id === roomId);
+  const name = title || (r ? roomName(r, r.members || []) : '단체방');
+  S.rooms = S.rooms.filter((x) => x.room_id !== roomId);
+  updateBadges();
+  if (S.room && S.room.id === roomId) {
+    closeRoom(); S.fromList = false; S.tab = 'chats'; location.replace('#/chats');
+  } else if (S.tab === 'chats') scheduleMain();
+  toast(`‘${name}’ 채팅방에서 내보내졌어요`, { error: true, ms: 4500 });
+}
+
 function friendAddedToast(id, name) {
   const f = S.friends.find((x) => x.id === id);
   if (f && f.mutual) toast(`${name}님과 이제 서로 친구예요. 대화를 시작할 수 있어요`, { ms: 3200 });
@@ -1589,7 +1730,7 @@ function friendAddedToast(id, name) {
 
 // 친구 고르기 (새 채팅·초대 공용) — 서로 친구인 사람만
 
-async function pickFriends({ invite = false, exclude = [] } = {}) {
+async function pickFriends({ invite = false, exclude = [], fromDm = false } = {}) {
   await loadFriends().catch(() => {});
   return new Promise((resolve) => {
     const list = S.friends.filter((f) => f.mutual !== false && !exclude.includes(f.id));
@@ -1598,7 +1739,7 @@ async function pickFriends({ invite = false, exclude = [] } = {}) {
     let finished = false;
     openSheet({
       title: invite ? '대화상대 초대' : '새 채팅',
-      body: `<div class="sub-text">${invite ? '채팅방에 초대할 친구를 선택하세요' : '대화할 친구를 선택하세요. 여러 명을 고르면 단체방이 돼요.'}</div>
+      body: `<div class="sub-text">${fromDm ? '고른 친구와 지금 대화 상대가 함께하는 새 단체방이 만들어져요. 지금 1:1 대화방은 그대로 남아요.' : invite ? '채팅방에 초대할 친구를 선택하세요' : '대화할 친구를 선택하세요. 여러 명을 고르면 단체방이 돼요.'}</div>
         <div class="sel-chips" id="selChips" hidden></div>
         ${list.length ? `<div class="pick-list bleed">${list.map((f) => `<button class="pick" data-pick="${esc(f.id)}" role="checkbox" aria-checked="false">${av(f, 44)}<span class="nm">${esc(f.display_name)}</span><span class="ck">${ic('check', 16)}</span></button>`).join('')}</div>`
     : `<div class="empty-line">${!S.friends.length ? '먼저 친구를 추가해 주세요.' : waiting && S.friends.length === waiting ? '서로 친구인 사람이 아직 없어요.<br>상대방도 나를 친구로 추가해야 대화할 수 있어요.' : '초대할 수 있는 친구가 없어요.'}</div>`}
@@ -1616,7 +1757,7 @@ async function pickFriends({ invite = false, exclude = [] } = {}) {
           if (gt) { $('#gWrap', sheet).hidden = !needName; $('#gHelp', sheet).textContent = `2명 이상과 대화하면 단체방이 만들어져요 · ${gt.value.length}/20`; }
           const disabled = !sel.length || (needName && !gt.value.trim());
           ok.disabled = disabled;
-          ok.textContent = invite ? (sel.length ? `${sel.length}명 초대하기` : '초대할 친구를 선택하세요')
+          ok.textContent = invite ? (sel.length ? (fromDm ? `${sel.length}명 초대해서 단체방 만들기` : `${sel.length}명 초대하기`) : '초대할 친구를 선택하세요')
             : !sel.length ? '친구를 선택하세요' : sel.length === 1 ? '1:1 채팅 시작' : `${sel.length}명과 단체방 만들기`;
         };
         sheet.addEventListener('click', (e) => {
@@ -1650,12 +1791,14 @@ function showRoomMenu() {
   if (!S.room || !S.room.info || S.room.info.is_notice) return;
   const R = S.room;
   const members = R.members.map((m) => (m.id === S.uid ? S.me : profileOf(m.id)) || { id: m.id, display_name: '(알 수 없음)' })
-    .sort((a, b) => (a.id === S.uid ? -1 : b.id === S.uid ? 1 : 0));
+    .sort((a, b) => (a.id === S.uid ? -1 : b.id === S.uid ? 1 : a.id === R.info.created_by ? -1 : b.id === R.info.created_by ? 1 : 0));
+  const canKick = R.info.is_group && (R.info.created_by === S.uid || S.me.is_admin);
   openSheet({
     title: roomName(R.info, roomOthers()),
-    body: `${R.info.is_group ? `<button class="menu-row invite bleed" data-x="invite" style="width:calc(100% + 40px)"><span class="circ">${ic('userplus', 22)}</span><span>대화상대 초대</span></button>` : ''}
+    body: `<button class="menu-row invite bleed" data-x="invite" style="width:calc(100% + 40px)"><span class="circ">${ic('userplus', 22)}</span><span>대화상대 초대${R.info.is_group ? '' : '<span class="sub">새 단체방으로 만들어져요</span>'}</span></button>
       <div class="sec" style="padding:12px 0 4px">참여자 ${members.length}</div>
-      <div class="bleed">${members.map((p) => `<button class="menu-row" data-x="profile" data-id="${esc(p.id)}">${av(p, 42)}<span style="font-size:15px">${esc(p.display_name)}</span>${p.id === S.uid ? '<span class="chip me">나</span>' : ''}</button>`).join('')}</div>
+      <div class="bleed">${members.map((p) => `<div class="menu-row mem"><button class="mem-main" data-x="profile" data-id="${esc(p.id)}">${av(p, 42)}<span style="font-size:15px">${esc(p.display_name)}</span>${p.id === S.uid ? '<span class="chip me">나</span>' : ''}${R.info.is_group && p.id === R.info.created_by ? '<span class="chip owner">방장</span>' : ''}</button>
+        ${canKick && p.id !== S.uid ? `<button class="kick-btn" data-x="kick" data-id="${esc(p.id)}">내보내기</button>` : ''}</div>`).join('')}</div>
       <div class="divider"></div>
       <button class="menu-row leave bleed" data-x="leave" style="width:calc(100% + 40px)">${ic('logout', 22)}채팅방 나가기</button>`,
     onMount(sheet, close) {
@@ -1664,8 +1807,25 @@ function showRoomMenu() {
         if (x.dataset.x === 'profile') { close(); showProfile(x.dataset.id); }
         if (x.dataset.x === 'invite') {
           close();
-          const r = await pickFriends({ invite: true, exclude: R.members.map((m) => m.id) });
-          if (r && r.ids.length) { try { await api.inviteToRoom(R.id, r.ids); } catch (ex) { showErr(ex); } }
+          if (R.info.is_group) {
+            const r = await pickFriends({ invite: true, exclude: R.members.map((m) => m.id) });
+            if (r && r.ids.length) { try { await api.inviteToRoom(R.id, r.ids); } catch (ex) { showErr(ex); } }
+          } else {
+            // 1:1 방에서 초대 → 지금 상대 + 고른 친구로 새 단체방
+            const other = R.members.map((m) => m.id).filter((id) => id !== S.uid);
+            const r = await pickFriends({ invite: true, fromDm: true, exclude: R.members.map((m) => m.id) });
+            if (r && r.ids.length) {
+              try { const gid = await api.createGroup('', [...other, ...r.ids]); goRoom(gid); refreshRoomsSoon(); toast('새 단체방을 만들었어요'); }
+              catch (ex) { showErr(ex); }
+            }
+          }
+        }
+        if (x.dataset.x === 'kick') {
+          const p = profileOf(x.dataset.id) || { display_name: '이 사람' };
+          close();
+          if (!(await ask(`${p.display_name}님을 내보낼까요?`, '내보내면 이 방의 대화를 볼 수 없고, 다시 초대해야 들어올 수 있어요.', '내보내기', true))) return;
+          try { await api.kickFromRoom(R.id, x.dataset.id); toast(`${p.display_name}님을 내보냈어요`); refreshMembers(); }
+          catch (ex) { showErr(ex); }
         }
         if (x.dataset.x === 'leave') {
           close();
@@ -1936,6 +2096,20 @@ app.addEventListener('click', async (e) => {
       el.disabled = true;
       try { await api.addFriend(el.dataset.id); await loadFriends(); await loadSuggestions(); friendAddedToast(el.dataset.id, g ? g.display_name : '친구'); }
       catch (ex) { el.disabled = false; showErr(ex); }
+      break;
+    }
+    case 'chat-filter': S.chatFilter = el.dataset.f; renderMain(); break;
+    case 'req-accept': {
+      const g = S.requests.find((x) => x.id === el.dataset.id);
+      el.disabled = true;
+      try { await api.addFriend(el.dataset.id); await loadFriends(); await loadRequests(); loadSuggestions(); friendAddedToast(el.dataset.id, g ? g.display_name : '친구'); }
+      catch (ex) { el.disabled = false; showErr(ex); }
+      break;
+    }
+    case 'req-hide': {
+      const id = el.dataset.id;
+      try { await api.dismissRequest(id); S.requests = S.requests.filter((x) => x.id !== id); updateFriendBadge(); renderMain(); toast('친구 요청을 숨겼어요. 상대에게는 알리지 않아요'); }
+      catch (ex) { showErr(ex); }
       break;
     }
     case 'sug-hide': {

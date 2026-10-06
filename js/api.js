@@ -14,7 +14,7 @@ function friendly(error) {
   const map = [
     [/Invalid login credentials/i, '아이디 또는 비밀번호가 맞지 않아요'],
     [/banned/i, '이용이 정지된 계정이에요. 관리자에게 문의해 주세요'],
-    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/messages_kind_check|messages_sticker_check/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/already registered|already exists/i, '이미 사용 중인 아이디예요'],
     [/Database error saving new user/i, '가입할 수 없는 아이디예요. 영문 소문자·숫자·밑줄(_) 3~20자로 입력해 주세요'],
@@ -109,6 +109,8 @@ export function createApi() {
     async matchContacts(phones, names) { return must(await sb.rpc('match_contacts', { p_phones: phones, p_names: names })); },
     async listSuggestions() { return must(await sb.rpc('my_suggestions')); },
     async dismissSuggestion(id) { must(await sb.rpc('dismiss_suggestion', { p_user: id })); },
+    async listRequests() { return must(await sb.rpc('my_friend_requests')); },
+    async dismissRequest(id) { must(await sb.rpc('dismiss_request', { p_user: id })); },
     async listFriends() { return must(await sb.rpc('my_friends')); },
     async addFriend(id) {
       const { error } = await sb.from('friends').insert({ friend_id: id });
@@ -124,9 +126,10 @@ export function createApi() {
     async createGroup(title, ids) { return must(await sb.rpc('create_group', { p_title: title, p_members: ids })); },
     async inviteToRoom(roomId, ids) { must(await sb.rpc('invite_to_room', { p_room: roomId, p_members: ids })); },
     async leaveRoom(roomId) { must(await sb.rpc('leave_room', { p_room: roomId })); },
+    async kickFromRoom(roomId, userId) { must(await sb.rpc('kick_from_room', { p_room: roomId, p_user: userId })); },
     async markRead(roomId) { must(await sb.rpc('mark_read', { p_room: roomId })); },
     async getRoom(roomId) {
-      return must(await sb.from('rooms').select('id,is_group,is_notice,title').eq('id', roomId).maybeSingle());
+      return must(await sb.from('rooms').select('id,is_group,is_notice,title,created_by').eq('id', roomId).maybeSingle());
     },
     async getMembers(roomId) {
       return must(await sb.from('room_members')
@@ -146,6 +149,13 @@ export function createApi() {
     },
     async sendText(roomId, text) {
       return must(await sb.from('messages').insert({ room_id: roomId, kind: 'text', content: text }).select().single());
+    },
+    // 내 메시지 삭제 (사진이면 파일도 지움)
+    async deleteMessage(m) {
+      must(await sb.rpc('delete_message', { p_id: m.id }));
+      if (m.kind === 'image' && m.content && m.content !== '-') {
+        try { await sb.storage.from('chat-images').remove([m.content]); } catch { /* 파일 삭제 실패는 무시 */ }
+      }
     },
     async sendSticker(roomId, id) {
       return must(await sb.from('messages').insert({ room_id: roomId, kind: 'sticker', content: id }).select().single());
@@ -191,13 +201,14 @@ export function createApi() {
     // 기본: 내 전용 비공개 채널(user:<내 ID>)로 내가 속한 방의 새 메시지만 받음 (Broadcast).
     //   → 접속자가 많아도 메시지 1건당 그 방 참여자에게만 전달돼 빠름.
     // 데이터베이스가 아직 v1.6 이 아니면(채널 권한 없음) 예전 방식(Postgres Changes)으로 자동 전환.
-    subscribe({ onMessage, onMemberUpdate, onStatus }) {
+    subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted }) {
       let closed = false; let ch = null; let joined = false;
       const legacy = () => {
         rtMode = 'legacy';
         ch = sb.channel('minitalk-' + uid)
           .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (p) => onMessage(p.new))
           .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'room_members' }, (p) => onMemberUpdate(p.new))
+          .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'messages' }, (p) => { if (p.new && p.new.kind === 'deleted' && onDeleted) onDeleted({ id: p.new.id, room_id: p.new.room_id }); })
           .subscribe((status) => onStatus && onStatus(status));
       };
       (async () => {
@@ -207,6 +218,9 @@ export function createApi() {
         ch = sb.channel('user:' + uid, { config: { private: true } })
           .on('broadcast', { event: 'message' }, ({ payload }) => payload && onMessage(payload))
           .on('broadcast', { event: 'read' }, ({ payload }) => payload && onMemberUpdate(payload))
+          .on('broadcast', { event: 'friend' }, ({ payload }) => payload && onFriend && onFriend(payload))
+          .on('broadcast', { event: 'kicked' }, ({ payload }) => payload && onKicked && onKicked(payload))
+          .on('broadcast', { event: 'deleted' }, ({ payload }) => payload && onDeleted && onDeleted(payload))
           .subscribe((status) => {
             if (status === 'SUBSCRIBED') joined = true;
             if (!joined && status === 'CHANNEL_ERROR' && !closed) {

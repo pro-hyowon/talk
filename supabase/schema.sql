@@ -1,5 +1,5 @@
 -- =====================================================================
---  미니톡(MiniTalk) v1.6 — Supabase 데이터베이스 설정 스크립트
+--  미니톡(MiniTalk) v1.8 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -70,7 +70,7 @@ create table if not exists public.messages (
   id         bigint generated always as identity primary key,
   room_id    uuid not null references public.rooms(id) on delete cascade,
   sender_id  uuid default auth.uid() references public.profiles(id) on delete set null,
-  kind       text not null default 'text' check (kind in ('text', 'image', 'sticker', 'system')),
+  kind       text not null default 'text' check (kind in ('text', 'image', 'sticker', 'system', 'deleted')),
   content    text not null check (char_length(content) between 1 and 2000),
   created_at timestamptz not null default now()
 );
@@ -81,7 +81,9 @@ create index if not exists friends_friend_idx on public.friends(friend_id);
 create index if not exists rooms_created_by_idx on public.rooms(created_by);
 -- v1.5 추가: 이모티콘 메시지 (content = 이모티콘 이름)
 alter table public.messages drop constraint if exists messages_kind_check;
-alter table public.messages add constraint messages_kind_check check (kind in ('text', 'image', 'sticker', 'system'));
+alter table public.messages add constraint messages_kind_check check (kind in ('text', 'image', 'sticker', 'system', 'deleted'));
+-- v1.8: 삭제한 메시지 (kind = 'deleted' 로 바뀌고 내용은 지워짐)
+alter table public.messages add column if not exists deleted_at timestamptz;
 alter table public.messages drop constraint if exists messages_sticker_check;
 alter table public.messages add constraint messages_sticker_check check (kind <> 'sticker' or content ~ '^[a-z0-9_]{1,30}$');
 
@@ -123,6 +125,15 @@ create table if not exists private.lookup_quota (
   primary key (user_id, day)
 );
 revoke all on private.lookup_quota from public, anon, authenticated;
+
+-- v1.7: 친구 요청 알림 기록 (같은 사람에게 하루 한 번만 알림 — 친구 추가·삭제 반복으로 알림 도배 방지)
+create table if not exists private.friend_request_log (
+  from_id uuid not null,
+  to_id   uuid not null,
+  sent_at timestamptz not null default now(),
+  primary key (from_id, to_id)
+);
+revoke all on private.friend_request_log from public, anon, authenticated;
 
 -- ---------------------------------------------------------------------
 -- 2. 보조 함수 (보안 정책에서 사용)
@@ -310,11 +321,67 @@ create trigger messages_after_insert
   for each row execute function public.on_message_insert();
 
 -- 친구로 추가하면 추천 목록에서 정리
+-- v1.7: 상대가 아직 나를 추가하지 않았으면 → 상대에게 "친구 요청" 알림 (앱 안 + 앱을 닫아도 오는 알림)
 create or replace function public.on_friend_insert()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
   delete from friend_suggestions where user_id = new.user_id and suggested_id = new.friend_id;
+  if not exists (select 1 from friends where user_id = new.friend_id and friend_id = new.user_id) then
+    perform public.notify_friend_request(new.user_id, new.friend_id);
+  end if;
   return new;
+end;
+$$;
+
+create or replace function public.notify_friend_request(p_from uuid, p_to uuid)
+returns void language plpgsql security definer set search_path = public, extensions as $$
+declare
+  v_name    text;
+  v_user    text;
+  v_url     text;
+  v_secret  text;
+  v_preview boolean;
+  v_subs    jsonb;
+begin
+  -- 하루에 한 번만
+  if exists (select 1 from private.friend_request_log
+              where from_id = p_from and to_id = p_to and sent_at > now() - interval '1 day') then
+    return;
+  end if;
+  insert into private.friend_request_log (from_id, to_id, sent_at) values (p_from, p_to, now())
+  on conflict (from_id, to_id) do update set sent_at = excluded.sent_at;
+
+  select display_name, username into v_name, v_user from profiles where id = p_from;
+
+  -- 앱이 열려 있으면 바로 표시 (실시간)
+  if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null then
+    begin
+      perform realtime.send(jsonb_build_object('from_id', p_from, 'display_name', v_name, 'username', v_user),
+                            'friend', 'user:' || p_to::text, true);
+    exception when others then null;
+    end;
+  end if;
+
+  -- 앱을 닫아도 오는 알림 (push-setup.sql 설정을 마친 경우)
+  if to_regclass('private.push_config') is null then return; end if;
+  select function_url, secret, show_preview into v_url, v_secret, v_preview from private.push_config where id = 1;
+  if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return; end if;
+  select jsonb_agg(jsonb_build_object('endpoint', s.endpoint, 'p256dh', s.p256dh, 'auth', s.auth))
+    into v_subs
+    from push_subscriptions s join profiles p on p.id = s.user_id and p.status = 'active'
+   where s.user_id = p_to;
+  if v_subs is null then return; end if;
+  perform net.http_post(
+    url := v_url,
+    body := jsonb_build_object('subs', v_subs, 'title', '친구 요청',
+              'body', case when coalesce(v_preview, true)
+                           then coalesce(v_name, '누군가') || '님이 나를 친구로 추가했어요. 나도 추가하면 대화할 수 있어요.'
+                           else '새 친구 요청이 있어요.' end),
+    headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
+    timeout_milliseconds := 8000
+  );
+exception when others then
+  raise warning 'notify_friend_request 실패: %', sqlerrm;   -- 알림 문제로 친구 추가가 막히면 안 됨
 end;
 $$;
 drop trigger if exists friends_after_insert on public.friends;
@@ -521,6 +588,29 @@ returns void language sql security definer set search_path = public as $$
   update friend_suggestions set dismissed = true where user_id = auth.uid() and suggested_id = p_user;
 $$;
 
+-- v1.7: 받은 친구 요청 (나를 친구로 추가했지만 나는 아직 추가하지 않은 사람, 숨긴 요청 제외)
+create or replace function public.my_friend_requests()
+returns table (id uuid, username text, display_name text, status_message text, avatar_url text, requested_at timestamptz)
+language sql stable security definer set search_path = public as $$
+  select p.id, p.username, p.display_name, p.status_message, p.avatar_url, f.created_at
+    from friends f join profiles p on p.id = f.user_id
+   where f.friend_id = auth.uid() and (select public.is_active()) and p.status = 'active'
+     and not exists (select 1 from friends m where m.user_id = auth.uid() and m.friend_id = p.id)
+     and not exists (select 1 from friend_suggestions s
+                      where s.user_id = auth.uid() and s.suggested_id = p.id and s.dismissed)
+   order by f.created_at desc
+   limit 200;
+$$;
+
+-- 친구 요청 숨기기 (상대에게는 알리지 않음)
+create or replace function public.dismiss_request(p_user uuid)
+returns void language sql security definer set search_path = public as $$
+  insert into friend_suggestions (user_id, suggested_id, dismissed)
+  select auth.uid(), p_user, true
+   where auth.uid() is not null and auth.uid() <> p_user and exists (select 1 from profiles where id = p_user)
+  on conflict (user_id, suggested_id) do update set dismissed = true;
+$$;
+
 -- 내 채팅방 목록 (안 읽은 수, 참여자 미리보기 4명까지)
 --   안 읽은 수는 300까지만 셈 (화면에는 99+ 로 보이므로 그 이상 셀 필요 없음)
 drop function if exists public.my_rooms();
@@ -534,7 +624,7 @@ language sql stable security definer set search_path = public as $$
          (select count(*)::int from (
             select 1 from messages m
              where m.room_id = r.id and m.id > me.last_read_id
-               and m.kind <> 'system' and m.sender_id is distinct from (select auth.uid())
+               and m.kind not in ('system', 'deleted') and m.sender_id is distinct from (select auth.uid())
              limit 300) u),
          (select count(*)::int from room_members x where x.room_id = r.id),
          case when r.is_notice then '[]'::jsonb else
@@ -693,9 +783,49 @@ begin
 
   select is_group into v_group from rooms where id = p_room;
   if v_group then
+    -- 방장이 나가면 가장 먼저 들어온 사람이 방장이 됨
+    update rooms set created_by = (select user_id from room_members where room_id = p_room
+                                    order by joined_at, user_id limit 1)
+     where id = p_room and (created_by = v_me or created_by is null);
     select display_name into v_mine from profiles where id = v_me;
     insert into messages (room_id, sender_id, kind, content)
     values (p_room, null, 'system', v_mine || '님이 나갔어요.');
+  end if;
+end;
+$$;
+
+-- v1.7: 단체방에서 내보내기 (방장 또는 관리자만)
+create or replace function public.kick_from_room(p_room uuid, p_user uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_me    uuid := auth.uid();
+  v_room  rooms%rowtype;
+  v_mine  text;
+  v_name  text;
+begin
+  if not public.is_room_member(p_room) then raise exception '이 방의 참여자가 아니에요'; end if;
+  select * into v_room from rooms where id = p_room;
+  if v_room.is_notice then raise exception '공지사항 방에서는 내보낼 수 없어요'; end if;
+  if not v_room.is_group then raise exception '1:1 대화방에서는 내보낼 수 없어요'; end if;
+  if v_room.created_by is distinct from v_me and not public.is_admin() then
+    raise exception '방장만 내보낼 수 있어요';
+  end if;
+  if p_user = v_me then raise exception '나 자신은 내보낼 수 없어요. 채팅방 나가기를 이용해 주세요'; end if;
+
+  delete from room_members where room_id = p_room and user_id = p_user;
+  if not found then raise exception '이미 이 방에 없는 사람이에요'; end if;
+
+  select display_name into v_mine from profiles where id = v_me;
+  select display_name into v_name from profiles where id = p_user;
+  insert into messages (room_id, sender_id, kind, content)
+  values (p_room, null, 'system', left(coalesce(v_mine, '방장') || '님이 ' || coalesce(v_name, '(알 수 없음)') || '님을 내보냈어요.', 2000));
+
+  -- 내보낸 사람의 앱에 바로 알림 (열려 있으면 그 방을 닫음)
+  if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null then
+    begin
+      perform realtime.send(jsonb_build_object('room_id', p_room, 'title', v_room.title), 'kicked', 'user:' || p_user::text, true);
+    exception when others then null;
+    end;
   end if;
 end;
 $$;
@@ -708,6 +838,38 @@ returns void language sql security definer set search_path = public as $$
      set last_read_id = v.mx
     from (select coalesce(max(id), 0) as mx from messages where room_id = p_room) v
    where m.room_id = p_room and m.user_id = auth.uid() and m.last_read_id < v.mx;
+$$;
+
+-- v1.8: 내가 보낸 메시지 삭제 → 모든 사람 화면에 "삭제된 메시지예요" 로 남음
+create or replace function public.delete_message(p_id bigint)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_m    messages%rowtype;
+  v_last bigint;
+begin
+  select * into v_m from messages where id = p_id;
+  if not found then raise exception '메시지를 찾을 수 없어요'; end if;
+  if v_m.sender_id is distinct from auth.uid() then raise exception '내가 보낸 메시지만 삭제할 수 있어요'; end if;
+  if not public.is_room_member(v_m.room_id) then raise exception '이 방의 참여자가 아니에요'; end if;
+  if v_m.kind = 'deleted' then return; end if;
+
+  update messages set kind = 'deleted', content = '-', deleted_at = now() where id = p_id;
+
+  -- 방의 마지막 메시지였다면 목록 미리보기도 바꿈
+  select max(id) into v_last from messages where room_id = v_m.room_id and kind <> 'system';
+  if v_last = p_id then
+    update rooms set last_message = '삭제된 메시지예요' where id = v_m.room_id;
+  end if;
+
+  -- 참여자 화면에 바로 반영 (실시간)
+  if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null then
+    begin
+      perform realtime.send(jsonb_build_object('id', p_id, 'room_id', v_m.room_id), 'deleted', 'user:' || m.user_id::text, true)
+         from room_members m where m.room_id = v_m.room_id;
+    exception when others then null;
+    end;
+  end if;
+end;
 $$;
 
 -- 최근 접속 시각 기록 (앱을 열 때 호출)
@@ -961,6 +1123,7 @@ declare
     'mark_read(uuid)', 'touch_last_seen()',
     'get_my_phone()', 'set_my_phone(text, boolean)', 'set_phone_findable(boolean)',
     'match_contacts(text[], text[])', 'my_suggestions()', 'dismiss_suggestion(uuid)', 'admin_clear_phone(uuid)',
+    'my_friend_requests()', 'dismiss_request(uuid)', 'kick_from_room(uuid, uuid)', 'delete_message(bigint)',
     'admin_list_users(text)', 'admin_set_status(uuid, text)', 'admin_set_admin(uuid, boolean)',
     'admin_reset_password(uuid)', 'admin_delete_user(uuid)', 'admin_get_settings()',
     'admin_set_settings(boolean)', 'admin_broadcast(text)'];
@@ -976,6 +1139,7 @@ begin
   -- 내부용 함수는 앱에서 직접 부를 수 없게
   execute 'revoke execute on function public.join_notice_room(uuid) from public, anon, authenticated';
   execute 'revoke execute on function public.use_lookup_quota(integer) from public, anon, authenticated';
+  execute 'revoke execute on function public.notify_friend_request(uuid, uuid) from public, anon, authenticated';
 end;
 $$;
 
@@ -1002,6 +1166,11 @@ drop policy if exists "minitalk_chat_insert" on storage.objects;
 create policy "minitalk_chat_insert" on storage.objects for insert to authenticated
   with check (bucket_id = 'chat-images' and public.is_room_member_text((storage.foldername(name))[1])
               and public.can_post_text((storage.foldername(name))[1]));
+
+-- v1.8: 내가 올린 채팅 사진은 삭제 가능 (파일 이름이 내 회원ID로 시작)
+drop policy if exists "minitalk_chat_delete" on storage.objects;
+create policy "minitalk_chat_delete" on storage.objects for delete to authenticated
+  using (bucket_id = 'chat-images' and split_part(name, '/', 2) like (select auth.uid())::text || '-%');
 
 drop policy if exists "minitalk_chat_select" on storage.objects;
 create policy "minitalk_chat_select" on storage.objects for select to authenticated
