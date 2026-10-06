@@ -5,11 +5,11 @@
 
 export const CONFIG = {
   // 예) 'https://abcdefghijklmn.supabase.co'
-  SUPABASE_URL: 'YOUR_SUPABASE_URL',
+  SUPABASE_URL: 'https://djqrwushizofwjhshixl.supabase.co',
 
   // 예) 'eyJhbGciOi...' (anon public 키) 또는 'sb_publishable_...' (Publishable 키)
   //  ※ service_role / secret 키는 절대 넣지 마세요.
-  SUPABASE_ANON_KEY: 'YOUR_SUPABASE_ANON_KEY',
+  SUPABASE_ANON_KEY: 'sb_publishable_5BWMz_Dcb2i_SmN__qQuQA_DutMv-Bt',
 
   // 화면에 표시될 앱 이름
   APP_NAME: '미니톡',
