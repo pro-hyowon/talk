@@ -1,5 +1,5 @@
 -- =====================================================================
---  미니톡(MiniTalk) v1.8 — Supabase 데이터베이스 설정 스크립트
+--  미니톡(MiniTalk) v1.10 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -65,12 +65,12 @@ create table if not exists public.room_members (
 );
 create index if not exists room_members_user_idx on public.room_members(user_id);
 
--- 메시지 (kind: text=글, image=사진, sticker=이모티콘, system=입장·퇴장 안내)
+-- 메시지 (kind: text=글, image=사진, sticker=이모티콘, file=파일, contact=연락처, system=입장·퇴장 안내)
 create table if not exists public.messages (
   id         bigint generated always as identity primary key,
   room_id    uuid not null references public.rooms(id) on delete cascade,
   sender_id  uuid default auth.uid() references public.profiles(id) on delete set null,
-  kind       text not null default 'text' check (kind in ('text', 'image', 'sticker', 'system', 'deleted')),
+  kind       text not null default 'text' check (kind in ('text', 'image', 'sticker', 'file', 'contact', 'system', 'deleted')),
   content    text not null check (char_length(content) between 1 and 2000),
   created_at timestamptz not null default now()
 );
@@ -81,11 +81,54 @@ create index if not exists friends_friend_idx on public.friends(friend_id);
 create index if not exists rooms_created_by_idx on public.rooms(created_by);
 -- v1.5 추가: 이모티콘 메시지 (content = 이모티콘 이름)
 alter table public.messages drop constraint if exists messages_kind_check;
-alter table public.messages add constraint messages_kind_check check (kind in ('text', 'image', 'sticker', 'system', 'deleted'));
+alter table public.messages add constraint messages_kind_check check (kind in ('text', 'image', 'sticker', 'file', 'contact', 'system', 'deleted'));
 -- v1.8: 삭제한 메시지 (kind = 'deleted' 로 바뀌고 내용은 지워짐)
 alter table public.messages add column if not exists deleted_at timestamptz;
 alter table public.messages drop constraint if exists messages_sticker_check;
 alter table public.messages add constraint messages_sticker_check check (kind <> 'sticker' or content ~ '^[a-z0-9_]{1,30}$');
+
+-- v1.10: 파일·연락처 메시지 (content = JSON)
+--   파일   {"path":"<방ID>/<내ID>-…","name":"원래 파일 이름","size":바이트,"type":"형식"}
+--   연락처 {"name":"이름","phones":["01012345678"]}
+create or replace function public.valid_file_msg(p_content text, p_room uuid, p_sender uuid)
+returns boolean language plpgsql immutable as $$
+declare
+  j jsonb;
+begin
+  j := p_content::jsonb;
+  return jsonb_typeof(j) = 'object'
+     and coalesce(j->>'path', '') ~ '^[0-9a-f-]{36}/[0-9a-f-]{36}-[A-Za-z0-9._-]{1,80}$'
+     and split_part(j->>'path', '/', 1) = p_room::text
+     and (p_sender is null or split_part(j->>'path', '/', 2) like p_sender::text || '-%')
+     and char_length(coalesce(j->>'name', '')) between 1 and 200
+     and jsonb_typeof(j->'size') = 'number';
+exception when others then
+  return false;
+end;
+$$;
+
+create or replace function public.valid_contact_msg(p_content text)
+returns boolean language plpgsql immutable as $$
+declare
+  j jsonb;
+begin
+  j := p_content::jsonb;
+  return jsonb_typeof(j) = 'object'
+     and char_length(trim(coalesce(j->>'name', ''))) between 1 and 60
+     and jsonb_typeof(j->'phones') = 'array'
+     and jsonb_array_length(j->'phones') between 1 and 5
+     and not exists (select 1 from jsonb_array_elements(j->'phones') e
+                      where jsonb_typeof(e) <> 'string' or (e #>> '{}') !~ '^\+?[0-9]{3,20}$');
+exception when others then
+  return false;
+end;
+$$;
+
+alter table public.messages drop constraint if exists messages_file_check;
+alter table public.messages add constraint messages_file_check check (
+  case when kind = 'file' then public.valid_file_msg(content, room_id, sender_id)
+       when kind = 'contact' then public.valid_contact_msg(content)
+       else true end);
 
 -- v1.5 추가: 휴대폰 번호 (본인과 관리자만 볼 수 있음. findable = 번호로 나를 찾을 수 있게 허용)
 create table if not exists public.user_phones (
@@ -292,7 +335,8 @@ declare
   v_dm_key text;
 begin
   update rooms
-     set last_message = case new.kind when 'image' then '사진' when 'sticker' then '이모티콘' else left(new.content, 100) end,
+     set last_message = case new.kind when 'image' then '사진' when 'sticker' then '이모티콘'
+                                      when 'file' then '파일' when 'contact' then '연락처' else left(new.content, 100) end,
          last_message_at = new.created_at
    where id = new.room_id
   returning dm_key into v_dm_key;
@@ -431,6 +475,10 @@ begin
     v_body := '사진을 보냈어요.';
   elsif new.kind = 'sticker' then
     v_body := '이모티콘을 보냈어요.';
+  elsif new.kind = 'file' then
+    v_body := '파일을 보냈어요.';
+  elsif new.kind = 'contact' then
+    v_body := '연락처를 보냈어요.';
   else
     v_body := left(new.content, 120);
   end if;
@@ -564,6 +612,45 @@ begin
   select count(*)::int into v_n from hit
    where not exists (select 1 from friends f where f.user_id = v_me and f.friend_id = hit.suggested_id);
   return v_n;
+end;
+$$;
+
+-- v1.9: 연락처 확인 — 고른 번호마다 결과(가입한 회원·이미 친구 여부)를 돌려줌
+--        번호를 등록하고 검색을 허용한 활동 중인 회원만 나오고, 나머지 번호는 결과에 없음
+create or replace function public.match_contacts_detail(p_phones text[], p_names text[] default null)
+returns table (phone text, id uuid, username text, display_name text, status_message text,
+               avatar_url text, is_friend boolean, added_me boolean)
+language plpgsql volatile security definer set search_path = public as $$
+#variable_conflict use_column
+declare
+  v_me uuid := auth.uid();
+begin
+  if not public.is_active() then raise exception '사용할 수 없는 계정이에요'; end if;
+  if coalesce(cardinality(p_phones), 0) = 0 then return; end if;
+  if cardinality(p_phones) > 1000 then raise exception '연락처는 한 번에 1000개까지 확인할 수 있어요'; end if;
+  perform public.use_lookup_quota(cardinality(p_phones));
+
+  -- 아직 친구가 아닌 사람은 추천 친구에도 넣어 둠
+  insert into friend_suggestions (user_id, suggested_id, contact_name)
+  select distinct on (up.user_id) v_me, up.user_id, nullif(left(trim(p_names[t.i]), 40), '')
+    from unnest(p_phones) with ordinality as t(ph, i)
+    join user_phones up on up.phone = public.norm_phone(t.ph) and up.findable
+    join profiles p on p.id = up.user_id and p.status = 'active'
+   where up.user_id <> v_me
+     and not exists (select 1 from friends f where f.user_id = v_me and f.friend_id = up.user_id)
+   order by up.user_id, t.i
+  on conflict (user_id, suggested_id) do update
+    set contact_name = coalesce(excluded.contact_name, friend_suggestions.contact_name);
+
+  return query
+    select distinct on (up.phone) up.phone, p.id, p.username, p.display_name, p.status_message, p.avatar_url,
+           exists (select 1 from friends f where f.user_id = v_me and f.friend_id = p.id),
+           exists (select 1 from friends b where b.user_id = p.id and b.friend_id = v_me)
+      from unnest(p_phones) as t(ph)
+      join user_phones up on up.phone = public.norm_phone(t.ph) and up.findable
+      join profiles p on p.id = up.user_id and p.status = 'active'
+     where up.user_id <> v_me
+     order by up.phone;
 end;
 $$;
 
@@ -1099,7 +1186,7 @@ drop policy if exists "messages_insert_member" on public.messages;
 create policy "messages_insert_member" on public.messages for insert to authenticated
   with check (
     sender_id = auth.uid()
-    and kind in ('text', 'image', 'sticker')
+    and kind in ('text', 'image', 'sticker', 'file', 'contact')
     and public.can_post(room_id)
   );
 
@@ -1122,7 +1209,7 @@ declare
     'create_group(text, uuid[])', 'invite_to_room(uuid, uuid[])', 'leave_room(uuid)',
     'mark_read(uuid)', 'touch_last_seen()',
     'get_my_phone()', 'set_my_phone(text, boolean)', 'set_phone_findable(boolean)',
-    'match_contacts(text[], text[])', 'my_suggestions()', 'dismiss_suggestion(uuid)', 'admin_clear_phone(uuid)',
+    'match_contacts(text[], text[])', 'match_contacts_detail(text[], text[])', 'my_suggestions()', 'dismiss_suggestion(uuid)', 'admin_clear_phone(uuid)',
     'my_friend_requests()', 'dismiss_request(uuid)', 'kick_from_room(uuid, uuid)', 'delete_message(bigint)',
     'admin_list_users(text)', 'admin_set_status(uuid, text)', 'admin_set_admin(uuid, boolean)',
     'admin_reset_password(uuid)', 'admin_delete_user(uuid)', 'admin_get_settings()',
@@ -1130,7 +1217,8 @@ declare
   helper_fns text[] := array[
     'is_active()', 'is_active_user(uuid)', 'is_admin()', 'is_room_member(uuid)', 'is_room_member_text(text)',
     'shares_room_with(uuid)', 'is_notice_room(uuid)', 'admin_guard()',
-    'is_mutual_friend(uuid, uuid)', 'can_post(uuid)', 'can_post_text(text)'];
+    'is_mutual_friend(uuid, uuid)', 'can_post(uuid)', 'can_post_text(text)',
+    'valid_file_msg(text, uuid, uuid)', 'valid_contact_msg(text)'];
 begin
   foreach f in array user_fns || helper_fns loop
     execute format('revoke execute on function public.%s from public, anon', f);
@@ -1154,6 +1242,11 @@ insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_typ
 values ('chat-images', 'chat-images', false, 5242880, array['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
 on conflict (id) do nothing;
 
+-- v1.10: 채팅 파일 (방 참여자만, 한 파일 20MB까지)
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('chat-files', 'chat-files', false, 20971520, null)
+on conflict (id) do nothing;
+
 drop policy if exists "minitalk_avatar_insert" on storage.objects;
 create policy "minitalk_avatar_insert" on storage.objects for insert to authenticated
   with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
@@ -1164,17 +1257,18 @@ create policy "minitalk_avatar_delete" on storage.objects for delete to authenti
 
 drop policy if exists "minitalk_chat_insert" on storage.objects;
 create policy "minitalk_chat_insert" on storage.objects for insert to authenticated
-  with check (bucket_id = 'chat-images' and public.is_room_member_text((storage.foldername(name))[1])
-              and public.can_post_text((storage.foldername(name))[1]));
+  with check (bucket_id in ('chat-images', 'chat-files') and public.is_room_member_text((storage.foldername(name))[1])
+              and public.can_post_text((storage.foldername(name))[1])
+              and split_part(name, '/', 2) like (select auth.uid())::text || '-%');
 
--- v1.8: 내가 올린 채팅 사진은 삭제 가능 (파일 이름이 내 회원ID로 시작)
+-- v1.8: 내가 올린 채팅 사진·파일은 삭제 가능 (파일 이름이 내 회원ID로 시작)
 drop policy if exists "minitalk_chat_delete" on storage.objects;
 create policy "minitalk_chat_delete" on storage.objects for delete to authenticated
-  using (bucket_id = 'chat-images' and split_part(name, '/', 2) like (select auth.uid())::text || '-%');
+  using (bucket_id in ('chat-images', 'chat-files') and split_part(name, '/', 2) like (select auth.uid())::text || '-%');
 
 drop policy if exists "minitalk_chat_select" on storage.objects;
 create policy "minitalk_chat_select" on storage.objects for select to authenticated
-  using (bucket_id = 'chat-images' and public.is_room_member_text((storage.foldername(name))[1]));
+  using (bucket_id in ('chat-images', 'chat-files') and public.is_room_member_text((storage.foldername(name))[1]));
 
 -- ---------------------------------------------------------------------
 -- 9. 실시간(Realtime) 전달 — v1.6: Broadcast 방식

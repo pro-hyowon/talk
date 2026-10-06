@@ -15,7 +15,7 @@ function friendly(error) {
     [/Invalid login credentials/i, '아이디 또는 비밀번호가 맞지 않아요'],
     [/banned/i, '이용이 정지된 계정이에요. 관리자에게 문의해 주세요'],
     [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
-    [/messages_kind_check|messages_sticker_check/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/already registered|already exists/i, '이미 사용 중인 아이디예요'],
     [/Database error saving new user/i, '가입할 수 없는 아이디예요. 영문 소문자·숫자·밑줄(_) 3~20자로 입력해 주세요'],
     [/Password should be at least/i, '비밀번호는 6자 이상이어야 해요'],
@@ -25,7 +25,7 @@ function friendly(error) {
     [/Signups not allowed|signup is disabled/i, '지금은 신규 가입이 막혀 있어요. 관리자에게 문의해 주세요'],
     [/Failed to fetch|NetworkError|Load failed/i, '인터넷 연결을 확인해 주세요'],
     [/JWT expired/i, '로그인이 만료됐어요. 다시 로그인해 주세요'],
-    [/Payload too large|exceeded the maximum allowed size/i, '파일이 너무 커요 (최대 5MB)'],
+    [/Payload too large|exceeded the maximum allowed size/i, '파일이 너무 커요 (사진 5MB, 파일 20MB까지)'],
     [/row-level security/i, '권한이 없어요'],
     [/(save|delete)_push_subscription/i, '알림 서버 설정(push-setup.sql)이 아직 안 되어 있어요. 관리자에게 문의해 주세요'],
   ];
@@ -107,6 +107,15 @@ export function createApi() {
     async setMyPhone(phone, findable = true) { return must(await sb.rpc('set_my_phone', { p_phone: phone || '', p_findable: findable })); },
     async setPhoneFindable(on) { must(await sb.rpc('set_phone_findable', { p_on: on })); },
     async matchContacts(phones, names) { return must(await sb.rpc('match_contacts', { p_phones: phones, p_names: names })); },
+    // v1.9: 번호마다 결과를 받음. 데이터베이스가 아직 예전 버전이면 예전 방식(찾은 수만)으로
+    async matchContactsDetail(phones, names) {
+      const { data, error } = await sb.rpc('match_contacts_detail', { p_phones: phones, p_names: names });
+      if (!error) return { rows: data || [] };
+      if (error.code === 'PGRST202' || /Could not find the function public\.match_contacts_detail/i.test(error.message || '')) {
+        return { count: must(await sb.rpc('match_contacts', { p_phones: phones, p_names: names })) || 0 };
+      }
+      throw friendly(error);
+    },
     async listSuggestions() { return must(await sb.rpc('my_suggestions')); },
     async dismissSuggestion(id) { must(await sb.rpc('dismiss_suggestion', { p_user: id })); },
     async listRequests() { return must(await sb.rpc('my_friend_requests')); },
@@ -156,6 +165,9 @@ export function createApi() {
       if (m.kind === 'image' && m.content && m.content !== '-') {
         try { await sb.storage.from('chat-images').remove([m.content]); } catch { /* 파일 삭제 실패는 무시 */ }
       }
+      if (m.kind === 'file') {
+        try { const f = JSON.parse(m.content); if (f && f.path) await sb.storage.from('chat-files').remove([f.path]); } catch { /* 무시 */ }
+      }
     },
     async sendSticker(roomId, id) {
       return must(await sb.from('messages').insert({ room_id: roomId, kind: 'sticker', content: id }).select().single());
@@ -164,6 +176,24 @@ export function createApi() {
       const path = `${roomId}/${uid}-${Date.now()}.${ext}`;
       must(await sb.storage.from('chat-images').upload(path, blob, { contentType: blob.type, cacheControl: '31536000' }));
       return must(await sb.from('messages').insert({ room_id: roomId, kind: 'image', content: path }).select().single());
+    },
+    // v1.10: 파일 보내기 (원래 이름은 메시지에, 저장소에는 영문 이름으로)
+    async sendFile(roomId, file) {
+      const ext = ((String(file.name || '').match(/\.([A-Za-z0-9]{1,8})$/) || [])[1] || '').toLowerCase();
+      const path = `${roomId}/${uid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext ? '.' + ext : ''}`;
+      must(await sb.storage.from('chat-files').upload(path, file, { contentType: file.type || 'application/octet-stream', cacheControl: '3600' }));
+      const content = JSON.stringify({ path, name: String(file.name || '파일').slice(0, 200), size: file.size, type: String(file.type || '').slice(0, 100) });
+      const { data, error } = await sb.from('messages').insert({ room_id: roomId, kind: 'file', content }).select().single();
+      if (error) { sb.storage.from('chat-files').remove([path]).catch(() => {}); throw friendly(error); }
+      return data;
+    },
+    // 내려받기 주소 (원래 파일 이름으로 저장되게)
+    async fileUrl(path, name) {
+      return must(await sb.storage.from('chat-files').createSignedUrl(path, 60 * 60 * 6, { download: name || true })).signedUrl;
+    },
+    async sendContact(roomId, c) {
+      const content = JSON.stringify({ name: c.name, phones: c.phones });
+      return must(await sb.from('messages').insert({ room_id: roomId, kind: 'contact', content }).select().single());
     },
     async imageUrls(paths) {
       if (!paths.length) return {};

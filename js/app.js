@@ -5,7 +5,7 @@ import { CONFIG } from './config.js';
 import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 
-const VERSION = '1.8.0';
+const VERSION = '1.10.0';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 const APP = CONFIG.APP_NAME;
 const app = document.getElementById('app');
@@ -41,6 +41,7 @@ const S = {
   fromList: false,
   profiles: new Map(),
   imgUrls: new Map(),
+  fileUrls: new Map(),
   unsub: null,
   wasSubscribed: false,
   installEvt: null,
@@ -143,7 +144,9 @@ function normPhone(v) {
 }
 const fmtPhone = (d) => (!d ? '' : d.length === 11 ? `${d.slice(0, 3)}-${d.slice(3, 7)}-${d.slice(7)}` : `${d.slice(0, 3)}-${d.slice(3, 6)}-${d.slice(6)}`);
 const maskPhone = (d) => (d ? `${d.slice(0, 3)}-****-${d.slice(-4)}` : '');
-const previewText = (t) => (t === '사진' ? '사진을 보냈어요' : t === '이모티콘' ? '이모티콘을 보냈어요' : (t || '대화를 시작해 보세요').split('\n')[0]);
+const PREVIEW = { 사진: '사진을 보냈어요', 이모티콘: '이모티콘을 보냈어요', 파일: '파일을 보냈어요', 연락처: '연락처를 보냈어요' };
+const previewText = (t) => PREVIEW[t] || (t || '대화를 시작해 보세요').split('\n')[0];
+const KIND_LABEL = { image: '사진', sticker: '이모티콘', file: '파일', contact: '연락처' };
 function linkify(text) {
   return esc(text).replace(/(https?:\/\/[^\s<]+[^\s<.,!?)\]'"])/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
 }
@@ -791,13 +794,15 @@ async function openRoom(id) {
       <div class="stk-preview" id="stkPreview" hidden></div></div>
     <div class="composer" id="composer">
       <div class="crow">
-        <button class="photo-btn" data-act="pick-photo" aria-label="사진 보내기">${ic('image', 22)}</button>
+        <button class="photo-btn" data-act="attach" aria-label="사진·파일·연락처 보내기">${ic('plus', 24)}</button>
         <div class="ta-wrap"><textarea id="msgInput" rows="1" maxlength="2000" placeholder="메시지를 입력하세요" aria-label="메시지 입력"></textarea>
           <button class="emo-btn" data-act="stickers" id="emoBtn" aria-label="이모티콘" aria-expanded="false">${ic('smile', 24)}</button></div>
         <button class="send-btn" id="sendBtn" data-act="send" disabled aria-label="보내기">${ic('send', 22)}</button>
       </div>
       <div class="sticker-panel" id="stickerPanel" hidden></div>
       <input type="file" id="photoInput" accept="image/*" multiple hidden>
+      <input type="file" id="cameraInput" accept="image/*" capture="environment" hidden>
+      <input type="file" id="fileInput" multiple hidden>
     </div>`;
   wireComposer();
 
@@ -826,7 +831,7 @@ function setupNoticeComposer() {
   const comp = $('#composer');
   if (!comp) return;
   if (S.me.is_admin) {
-    $('[data-act=pick-photo]', comp).hidden = true;
+    $('[data-act=attach]', comp).hidden = true;
     $('[data-act=stickers]', comp).hidden = true;
     $('#msgInput').placeholder = '모든 회원에게 보낼 공지를 입력하세요';
     comp.insertAdjacentHTML('afterbegin', `<div class="hint-line">${ic('mega', 14)}관리자 공지 작성 · 모든 회원에게 전달돼요</div>`);
@@ -889,6 +894,8 @@ function msgHtml(m, prev, next) {
     ? `<button class="bubble photo" data-act="view-img" data-id="${esc(m.id)}" aria-label="사진 크게 보기"><img alt="사진" ${m.localUrl ? `src="${esc(m.localUrl)}"` : ''} data-path="${esc(m.content)}"></button>`
     : m.kind === 'deleted' ? `<div class="bubble deleted">${ic('ban', 15, 'flex:none')}삭제된 메시지예요</div>`
     : m.kind === 'sticker' ? `<button class="bubble sticker" data-act="replay-sticker" aria-label="이모티콘 다시 움직이기">${stickerSvg(m.content, 120)}</button>`
+    : m.kind === 'file' ? fileBubble(m)
+    : m.kind === 'contact' ? contactBubble(m)
       : `<div class="bubble">${notice ? noticeText(m.content) : linkify(m.content)}</div>`;
   const showMeta = !m.pending && !m.failed;
   const metaCol = showMeta ? `<div class="meta-col"><span class="unread" data-unread="${esc(m.id)}"></span><span class="tm">${fmtTime(m.created_at)}</span></div>` : '';
@@ -930,6 +937,7 @@ function renderMsgs() {
   for (const el of box.children) el.classList.toggle('nolast', notLast.has(el.dataset.k));
   updateReadCounts();   // 읽음 숫자는 그린 뒤 따로 채움 → 누가 읽어도 메시지를 다시 그리지 않음
   hydrateImages();
+  hydrateFiles();
 }
 
 // 바뀐 메시지만 다시 그리기 (전체를 새로 그리면 메시지가 많을 때 화면이 버벅여요)
@@ -1101,7 +1109,7 @@ function applyToList(m) {
   if (S.listSeen.has(m.id)) return true;
   S.listSeen.add(m.id);
   if (S.listSeen.size > 3000) S.listSeen = new Set([...S.listSeen].slice(-1000));
-  r.last_message = m.kind === 'image' ? '사진' : m.kind === 'sticker' ? '이모티콘' : String(m.content).slice(0, 100);
+  r.last_message = KIND_LABEL[m.kind] || String(m.content).slice(0, 100);
   r.last_message_at = m.created_at;
   const viewing = S.room && S.room.id === m.room_id && !document.hidden;
   if (m.sender_id !== S.uid && !viewing) r.unread = (r.unread || 0) + 1;
@@ -1166,6 +1174,15 @@ function wireComposer() {
     const files = [...e.target.files]; e.target.value = '';
     for (const f of files.slice(0, 10)) await sendPhoto(f);
   };
+  $('#cameraInput').onchange = async (e) => {
+    const f = e.target.files[0]; e.target.value = '';
+    if (f) await sendPhoto(f);
+  };
+  $('#fileInput').onchange = async (e) => {
+    const files = [...e.target.files]; e.target.value = '';
+    if (files.length > 10) toast('파일은 한 번에 10개까지 보낼 수 있어요');
+    for (const f of files.slice(0, 10)) await sendFileMsg(f);
+  };
 }
 
 async function sendText(retryMsg) {
@@ -1212,6 +1229,8 @@ function showMsgMenu(m) {
   const local = !isNum(m.id);   // 아직 안 보내졌거나 실패한 메시지
   const items = [];
   if (m.kind === 'text') items.push(['copy', ic('copy', 22), '복사']);
+  if (m.kind === 'contact' && contactOf(m)) items.push(['copy', ic('copy', 22), '이름·번호 복사']);
+  if (m.kind === 'file' && isNum(m.id)) items.push(['save', ic('download', 22), '저장']);
   if (mineMsg) items.push(['delete', ic('ban', 22), local ? '보내기 취소' : '삭제']);
   if (!items.length) return;
   openSheet({
@@ -1223,8 +1242,11 @@ function showMsgMenu(m) {
         const x = e.target.closest('[data-x]'); if (!x) return;
         close();
         if (x.dataset.x === 'copy') {
-          try { await navigator.clipboard.writeText(m.content); toast('메시지를 복사했어요'); } catch { toast('복사하지 못했어요', { error: true }); }
+          const c = m.kind === 'contact' ? contactOf(m) : null;
+          const text = c ? `${c.name} ${c.phones.map(fmtTel).join(', ')}` : m.content;
+          try { await navigator.clipboard.writeText(text); toast(c ? '이름과 번호를 복사했어요' : '메시지를 복사했어요'); } catch { toast('복사하지 못했어요', { error: true }); }
         }
+        if (x.dataset.x === 'save') openFile(m);
         if (x.dataset.x === 'delete') {
           if (local) { R.msgs = R.msgs.filter((y) => y !== m); if (S.room === R) renderMsgs(); return; }
           if (!(await ask('메시지를 삭제할까요?', '모든 대화 상대의 화면에서 "삭제된 메시지예요"로 바뀌어요. 되돌릴 수 없어요.', '삭제', true))) return;
@@ -1341,6 +1363,234 @@ async function sendPhoto(file, retryMsg) {
 }
 
 // ---------------------------------------------------------------------
+// v1.10: 앨범·카메라·파일·연락처 보내기
+// ---------------------------------------------------------------------
+const FILE_MAX = 20 * 1024 * 1024;   // 파일 한 개 20MB까지 (Supabase 무료 플랜 한도 안)
+const BLOCKED_EXT = /\.(exe|msi|bat|cmd|com|scr|pif|vbs|vbe|ps1|jar|apk|lnk|reg|hta|cpl|wsf|dll)$/i;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+function fileOf(m) {
+  try { const f = JSON.parse(m.content); return f && typeof f === 'object' && f.name ? f : null; } catch { return null; }
+}
+function contactOf(m) {
+  try { const c = JSON.parse(m.content); return c && c.name && Array.isArray(c.phones) && c.phones.length ? c : null; } catch { return null; }
+}
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${Math.max(1, Math.round(n / 1024))}KB`;
+  return `${(n / 1024 / 1024).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)}MB`;
+}
+// 전화번호 보기 좋게 (휴대폰·서울·지역번호·대표번호)
+function fmtTel(v) {
+  const d = String(v || '').replace(/[^\d+]/g, '');
+  const m = normPhone(d); if (m) return fmtPhone(m);
+  if (/^02\d{7,8}$/.test(d)) return d.length === 9 ? `02-${d.slice(2, 5)}-${d.slice(5)}` : `02-${d.slice(2, 6)}-${d.slice(6)}`;
+  if (/^0\d{9,10}$/.test(d)) return d.length === 10 ? `${d.slice(0, 3)}-${d.slice(3, 6)}-${d.slice(6)}` : `${d.slice(0, 3)}-${d.slice(3, 7)}-${d.slice(7)}`;
+  if (/^1\d{7}$/.test(d)) return `${d.slice(0, 4)}-${d.slice(4)}`;
+  return d;
+}
+// 저장할 때는 숫자만 (휴대폰은 010… 으로 맞춤)
+const telDigits = (v) => { const d = String(v || '').replace(/[^\d+]/g, '').replace(/(?!^)\+/g, ''); return normPhone(d) || d; };
+function fileKind(name) {
+  const e = ((String(name).match(/\.([A-Za-z0-9]{1,5})$/) || [])[1] || '').toLowerCase();
+  if (e === 'pdf') return 'pdf';
+  if (/^(xls|xlsx|xlsm|csv|cell|numbers)$/.test(e)) return 'xls';
+  if (/^(ppt|pptx|show|key)$/.test(e)) return 'ppt';
+  if (/^(doc|docx|hwp|hwpx|txt|rtf|odt|pages|md)$/.test(e)) return 'doc';
+  if (/^(zip|7z|rar|alz|egg|tar|gz)$/.test(e)) return 'zip';
+  if (/^(jpg|jpeg|png|gif|webp|heic|bmp|svg)$/.test(e)) return 'img';
+  if (/^(mp4|mov|avi|mkv|webm|m4v)$/.test(e)) return 'vid';
+  if (/^(mp3|m4a|wav|aac|flac|ogg)$/.test(e)) return 'aud';
+  return 'etc';
+}
+
+function fileBubble(m) {
+  const f = fileOf(m);
+  if (!f) return `<div class="bubble">${linkify(m.content)}</div>`;
+  const ext = ((String(f.name).match(/\.([A-Za-z0-9]{1,5})$/) || [])[1] || '').toUpperCase();
+  const sub = m.pending ? `${fmtSize(f.size)} · 보내는 중` : m.failed ? `${fmtSize(f.size)} · 보내지 못했어요` : fmtSize(f.size);
+  return `<button class="bubble file" data-act="open-file" data-id="${esc(m.id)}"${f.path ? ` data-fpath="${esc(f.path)}" data-fname="${esc(f.name)}"` : ''} aria-label="${esc(f.name)} 파일 저장">
+    <span class="f-ic k-${fileKind(f.name)}">${ext ? esc(ext.slice(0, 4)) : ic('file', 22)}</span>
+    <span class="f-meta"><span class="f-name">${esc(f.name)}</span><span class="f-sub">${esc(sub)}</span></span>
+    <span class="f-dl">${ic('download', 20)}</span></button>`;
+}
+
+function contactBubble(m) {
+  const c = contactOf(m);
+  if (!c) return `<div class="bubble">${linkify(m.content)}</div>`;
+  const tel = telDigits(c.phones[0]);
+  return `<div class="bubble contact"><div class="ct-top"><span class="ct-av">${ic('user', 24)}</span>
+      <span class="ct-meta"><span class="ct-label">연락처</span><b class="ct-name">${esc(c.name)}</b>${c.phones.map((p) => `<span class="ct-tel">${esc(fmtTel(p))}</span>`).join('')}</span></div>
+    <div class="ct-acts"><a href="tel:${esc(tel)}">${ic('call', 16)}전화</a><a href="sms:${esc(tel)}">${ic('chat', 16)}문자</a><button data-act="save-contact" data-id="${esc(m.id)}">${ic('download', 16)}저장</button></div></div>`;
+}
+
+// 화면에 보이는 파일은 내려받기 주소를 미리 받아 둠 (누르자마자 열리게 — 아이폰은 기다리면 새 창이 막힘)
+function hydrateFiles() {
+  if (!S.room) return;
+  const now = Date.now();
+  const els = $$('#msgs [data-fpath]');
+  const seen = new Set();
+  for (const el of els.slice(-20)) {
+    const p = el.dataset.fpath;
+    if (seen.has(p)) continue; seen.add(p);
+    const c = S.fileUrls.get(p);
+    if (c && (c.loading || now - c.t < 5 * 3600 * 1000)) continue;
+    S.fileUrls.set(p, { loading: true, t: 0 });
+    api.fileUrl(p, el.dataset.fname).then((url) => S.fileUrls.set(p, { url, t: Date.now() })).catch(() => S.fileUrls.delete(p));
+  }
+}
+
+async function openFile(m) {
+  const f = fileOf(m);
+  if (!f || !f.path || !isNum(m.id)) return;
+  let c = S.fileUrls.get(f.path);
+  if (!c || !c.url || Date.now() - c.t > 5 * 3600 * 1000) {
+    try { c = { url: await api.fileUrl(f.path, f.name), t: Date.now() }; S.fileUrls.set(f.path, c); }
+    catch (e) { showErr(e); return; }
+  }
+  const a = document.createElement('a');
+  a.href = c.url; a.rel = 'noopener'; a.download = f.name;
+  if (isIOS()) a.target = '_blank';
+  document.body.appendChild(a); a.click(); a.remove();
+  toast(`‘${f.name}’ 파일을 내려받고 있어요`);
+}
+
+// 연락처 카드 → 휴대폰 연락처에 저장 (.vcf 파일을 열면 연락처 앱이 저장해 줌)
+function saveContact(m) {
+  const c = contactOf(m); if (!c) return;
+  const v = (s) => String(s).replace(/\\/g, '\\\\').replace(/[,;]/g, (x) => '\\' + x).replace(/\r?\n/g, ' ');
+  const vcf = ['BEGIN:VCARD', 'VERSION:3.0', `FN:${v(c.name)}`, `N:${v(c.name)};;;;`,
+    ...c.phones.map((p) => `TEL;TYPE=${normPhone(telDigits(p)) ? 'CELL' : 'VOICE'}:${fmtTel(p)}`), 'END:VCARD'].join('\r\n');
+  const url = URL.createObjectURL(new Blob([vcf + '\r\n'], { type: 'text/vcard;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url; a.download = `${String(c.name).replace(/[\\/:*?"<>|]/g, '_').slice(0, 40) || 'contact'}.vcf`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  toast('연락처 파일을 저장했어요. 파일을 열면 휴대폰 연락처에 추가할 수 있어요', { ms: 4000 });
+}
+
+function showAttach() {
+  if (!S.room) return;
+  toggleStickers(false);
+  const ta = $('#msgInput'); if (ta) ta.blur();
+  openSheet({
+    title: '보내기', bare: true,
+    body: `<div class="attach-grid">
+        <button data-x="album"><span class="tile lav">${ic('image', 26)}</span>앨범</button>
+        <button data-x="camera"><span class="tile mint">${ic('camera', 26)}</span>카메라</button>
+        <button data-x="file"><span class="tile sky">${ic('file', 26)}</span>파일</button>
+        <button data-x="contact"><span class="tile lemon">${ic('card', 26)}</span>연락처</button></div>
+      <div class="attach-note">사진은 자동으로 용량을 줄여 보내요 · 파일은 한 개 20MB까지</div>
+      <button class="btn gray" data-close style="margin-top:12px">닫기</button>`,
+    onMount(sheet, close) {
+      sheet.addEventListener('click', (e) => {
+        const x = e.target.closest('[data-x]'); if (!x) return;
+        close();
+        // 같은 누르기 안에서 바로 열어야 휴대폰이 사진첩·카메라를 열어 줌
+        if (x.dataset.x === 'album') $('#photoInput').click();
+        if (x.dataset.x === 'camera') $('#cameraInput').click();
+        if (x.dataset.x === 'file') $('#fileInput').click();
+        if (x.dataset.x === 'contact') showContactSend();
+      });
+    },
+  });
+}
+
+function showContactSend() {
+  if (!S.room) return;
+  const R = S.room;
+  const picker = pickerSupported();
+  openSheet({
+    title: '연락처 보내기',
+    body: `<div class="sub-text">이름과 전화번호를 카드로 보내요. 받은 사람은 바로 전화하거나 연락처에 저장할 수 있어요.</div>
+      ${picker ? `<button class="btn soft" type="button" data-x="pick" style="margin-bottom:6px">${ic('book', 20)}휴대폰 연락처에서 고르기</button>` : ''}
+      <form id="ctForm" novalidate><div class="auth-fields">${fieldHtml('ctname', '이름', { ph: '홍길동', max: 60 })}${fieldHtml('cttel', '전화번호', { type: 'tel', ph: '010-1234-5678', auto: 'off', max: 24 })}</div>
+        <div id="ctMore" class="ct-more"></div>
+        <button class="btn" type="submit" style="margin-top:18px">${ic('send', 20)}보내기</button></form>`,
+    onMount(sheet, close) {
+      const form = $('#ctForm', sheet); const name = $('#f-ctname', sheet); const tel = $('#f-cttel', sheet); const more = $('#ctMore', sheet);
+      name.autocapitalize = 'words';
+      name.oninput = () => setFieldErr(sheet, 'ctname', '');
+      tel.oninput = () => setFieldErr(sheet, 'cttel', '');
+      if (!picker) setTimeout(() => name.focus(), 50);
+      sheet.addEventListener('click', async (e) => {
+        const chip = e.target.closest('[data-tel]');
+        if (chip) { tel.value = chip.dataset.tel; setFieldErr(sheet, 'cttel', ''); $$('[data-tel]', more).forEach((b) => b.classList.toggle('on', b === chip)); return; }
+        const x = e.target.closest('[data-x=pick]'); if (!x) return;
+        try {
+          const sel = await navigator.contacts.select(['name', 'tel'], { multiple: false });
+          const c = sel && sel[0]; if (!c) return;
+          const nm = String((Array.isArray(c.name) ? c.name.find((n) => String(n || '').trim()) : c.name) || '').trim();
+          const tels = [...new Set((c.tel || []).map(telDigits).filter((d) => /^\+?\d{3,20}$/.test(d)))];
+          if (!tels.length) { toast('그 연락처에는 전화번호가 없어요', { error: true }); return; }
+          tels.sort((a, b) => (normPhone(b) ? 1 : 0) - (normPhone(a) ? 1 : 0));   // 휴대폰 번호 먼저
+          name.value = nm.slice(0, 60); tel.value = fmtTel(tels[0]);
+          setFieldErr(sheet, 'ctname', ''); setFieldErr(sheet, 'cttel', '');
+          more.innerHTML = tels.length > 1 ? `<span class="lbl">다른 번호</span>${tels.slice(0, 5).map((t, i) => `<button type="button" class="chip-tel ${i ? '' : 'on'}" data-tel="${esc(fmtTel(t))}">${esc(fmtTel(t))}</button>`).join('')}` : '';
+        } catch (ex) { if (!ex || ex.name !== 'AbortError') showErr(ex); }
+      });
+      form.onsubmit = (e) => {
+        e.preventDefault();
+        const nm = name.value.trim(); const d = telDigits(tel.value);
+        let bad = false;
+        if (!nm) { setFieldErr(sheet, 'ctname', '이름을 입력해 주세요'); bad = true; }
+        if (!tel.value.trim()) { setFieldErr(sheet, 'cttel', '전화번호를 입력해 주세요'); bad = true; }
+        else if (!/^\+?\d{3,20}$/.test(d)) { setFieldErr(sheet, 'cttel', '전화번호를 정확히 입력해 주세요 (예: 010-1234-5678)'); bad = true; }
+        if (bad) return;
+        close();
+        if (S.room !== R) return;
+        sendContactMsg({ name: nm.slice(0, 60), phones: [d] });
+      };
+    },
+  });
+}
+
+async function sendFileMsg(file, retryMsg) {
+  if (!S.room) return;
+  const R = S.room;
+  if (!retryMsg) {
+    if (!file.size) { toast(`‘${file.name}’ 은(는) 빈 파일이라 보낼 수 없어요`, { error: true }); return; }
+    if (file.size > FILE_MAX) { toast(`‘${file.name}’ 파일이 너무 커요. 20MB까지 보낼 수 있어요`, { error: true }); return; }
+    if (BLOCKED_EXT.test(file.name || '')) { toast('보안을 위해 실행 파일(.exe·.apk 등)은 보낼 수 없어요', { error: true }); return; }
+  }
+  const tmp = retryMsg || { id: 'tmp-' + (++S.tmpSeq), room_id: R.id, sender_id: S.uid, kind: 'file', file,
+    content: JSON.stringify({ name: String(file.name || '파일').slice(0, 200), size: file.size, type: file.type || '' }), created_at: new Date().toISOString() };
+  tmp.pending = true; tmp.failed = false;
+  if (!retryMsg) R.msgs.push(tmp);
+  renderMsgs(); scrollBottom();
+  try {
+    const real = await api.sendFile(R.id, tmp.file);
+    R.msgs = R.msgs.filter((m) => m !== tmp);
+    applyToList(real);
+    if (S.room === R) { addMessages([real], { forceBottom: true }); renderMsgs(); scrollBottom(); }
+  } catch (e) {
+    tmp.pending = false; tmp.failed = true;
+    if (S.room === R) renderMsgs();
+    showErr(e);
+  }
+}
+
+async function sendContactMsg(c, retryMsg) {
+  if (!S.room) return;
+  const R = S.room;
+  const tmp = retryMsg || { id: 'tmp-' + (++S.tmpSeq), room_id: R.id, sender_id: S.uid, kind: 'contact', content: JSON.stringify(c), created_at: new Date().toISOString() };
+  tmp.pending = true; tmp.failed = false;
+  if (!retryMsg) R.msgs.push(tmp);
+  renderMsgs(); scrollBottom();
+  try {
+    const real = await api.sendContact(R.id, contactOf(tmp));
+    R.msgs = R.msgs.filter((m) => m !== tmp);
+    applyToList(real);
+    if (S.room === R) { addMessages([real], { forceBottom: true }); renderMsgs(); scrollBottom(); }
+  } catch (e) {
+    tmp.pending = false; tmp.failed = true;
+    if (S.room === R) renderMsgs();
+    showErr(e);
+  }
+}
+
+// ---------------------------------------------------------------------
 // 실시간 이벤트
 // ---------------------------------------------------------------------
 function onMessage(m) {
@@ -1393,7 +1643,7 @@ function maybeNotify(m) {
   const r = S.rooms.find((x) => x.room_id === m.room_id);
   const name = r && r.is_notice ? `${APP} 운영팀` : (sender ? sender.display_name : '새 메시지');
   const title = r && r.is_group ? `${name} · ${roomName(r, r.members || [])}` : name;
-  const text = m.kind === 'image' ? '사진을 보냈어요' : m.kind === 'sticker' ? '이모티콘을 보냈어요' : m.content;
+  const text = KIND_LABEL[m.kind] ? previewText(KIND_LABEL[m.kind]) : m.content;
 
   if (document.hidden) {
     if (S.pushOn) return; // 서버 알림(Web Push)이 대신 보여 줌
@@ -1554,29 +1804,54 @@ function parseVcf(text) {
 }
 const pickerSupported = () => 'contacts' in navigator && 'ContactsManager' in window && typeof navigator.contacts.select === 'function';
 
-// 연락처 목록 [{ name, tels: [] }] → 서버에서 가입한 친구 확인
-async function matchContactList(list) {
-  const mine = S.phone && S.phone.phone;
+// 연락처 목록 [{ name, tels | tel }] → [{ name, phones: [휴대폰 번호(숫자만)], hasTel }]
+function contactEntries(list) {
+  return (list || []).map((c) => {
+    const name = String((Array.isArray(c.name) ? c.name.find((x) => String(x || '').trim()) : c.name) || '').trim().slice(0, 40);
+    const tels = ((Array.isArray(c.tels) ? c.tels : c.tel) || []).filter((t) => String(t || '').trim());
+    return { name, phones: [...new Set(tels.map(normPhone).filter(Boolean))], hasTel: tels.length > 0 };
+  });
+}
+
+// 서버에서 가입한 회원 확인 (번호는 저장하지 않음)
+async function checkContacts(entries) {
+  const mine = (S.phone && S.phone.phone) || null;
   const seen = new Map();
-  for (const c of list || []) {
-    const name = String((Array.isArray(c.name) ? c.name[0] : c.name) || '').trim().slice(0, 40);
-    for (const t of (Array.isArray(c.tels) ? c.tels : c.tel) || []) {
-      const d = normPhone(t);
-      if (d && d !== mine && !seen.has(d)) seen.set(d, name);
-    }
-  }
-  if (!seen.size) { toast('휴대폰 번호가 있는 연락처가 없어요', { error: true }); return null; }
-  let entries = [...seen.entries()];
-  const over = entries.length > 3000;
-  if (over) entries = entries.slice(0, 3000);
-  let found = 0;
-  for (let i = 0; i < entries.length; i += 1000) {
-    const part = entries.slice(i, i + 1000);
-    found += (await api.matchContacts(part.map((x) => x[0]), part.map((x) => x[1] || null))) || 0;
+  for (const c of entries) for (const d of c.phones) if (d !== mine && !seen.has(d)) seen.set(d, c.name);
+  let all = [...seen.entries()];
+  const over = all.length > 3000;
+  if (over) all = all.slice(0, 3000);
+  const hits = new Map(); let legacy = false; let legacyFound = 0;
+  for (let i = 0; i < all.length; i += 1000) {
+    const part = all.slice(i, i + 1000);
+    const r = await api.matchContactsDetail(part.map((x) => x[0]), part.map((x) => x[1] || null));
+    if (r.rows) {
+      for (const m of r.rows) {
+        hits.set(m.phone, m);
+        cacheProfile({ id: m.id, username: m.username, display_name: m.display_name, status_message: m.status_message, avatar_url: m.avatar_url });
+      }
+    } else { legacy = true; legacyFound += r.count || 0; }
   }
   await loadSuggestions();
-  return { found, checked: entries.length, over };
+  return { hits, checked: new Set(all.map((x) => x[0])), count: all.length, over, mine, legacy, legacyFound };
 }
+
+// 연락처 한 사람의 확인 결과
+function contactStatus(c, res, added) {
+  if (!c.phones.length) return { kind: c.hasTel ? 'nomobile' : 'notel' };
+  if (res.mine && c.phones.every((p) => p === res.mine)) return { kind: 'me' };
+  if (!res.done) return { kind: 'checking', phone: c.phones[0] };
+  const phone = c.phones.find((p) => res.hits.has(p));
+  if (phone) {
+    const m = res.hits.get(phone);
+    if (added.has(m.id)) return { kind: 'added', m, phone };
+    if (m.is_friend || S.friends.some((f) => f.id === m.id)) return { kind: 'friend', m, phone };
+    return { kind: 'member', m, phone };
+  }
+  if (c.phones.every((p) => p === res.mine || !res.checked.has(p))) return { kind: 'skipped', phone: c.phones[0] };
+  return { kind: 'none', phone: c.phones[0] };
+}
+const CONTACT_RANK = { member: 0, added: 0, friend: 1, checking: 2, none: 3, skipped: 4, me: 5, nomobile: 6, notel: 6 };
 
 function showContacts() {
   const picker = pickerSupported();
@@ -1586,7 +1861,7 @@ function showContacts() {
       : `<div class="kv-line warn">${ic('phone', 18, 'flex:none')}<span>내 번호를 등록하면 친구의 연락처에서도 내가 추천돼요</span><button class="link-btn" data-x="phone">등록</button></div>`);
   openSheet({
     title: '연락처로 친구 찾기',
-    body: `<div class="sub-text">내 연락처의 휴대폰 번호와 일치하는 ${esc(APP)} 회원을 찾아 <b>추천 친구</b>에 보여 드려요.</div>
+    body: `<div id="ctStart"><div class="sub-text">내 연락처의 휴대폰 번호와 일치하는 ${esc(APP)} 회원을 찾아 바로 보여 드려요.</div>
       <div id="myPhoneBox">${myPhone()}</div>
       <div class="btn-col" style="margin-top:14px">
         ${picker ? `<button class="btn" data-x="pick">${ic('book', 20)}연락처에서 고르기</button>` : ''}
@@ -1598,44 +1873,131 @@ function showContacts() {
         <li><b>완료</b>를 누른 뒤 <b>파일에 저장</b>을 골라요</li>
         <li>여기서 ‘연락처 파일 불러오기’를 눌러 저장한 파일을 골라요</li></ol>
         <p>안드로이드는 ‘연락처’ 앱 설정의 <b>연락처 내보내기</b>로 만들 수 있어요.</p></details>`}
-      <div class="note-mint" style="margin-top:14px">${ic('lock', 18)}<span>연락처의 번호는 가입한 친구를 확인하는 데에만 쓰이고 서버에 저장되지 않아요. 번호를 등록하지 않았거나 검색을 꺼 둔 회원은 찾지 않아요.</span></div>
+      <div class="note-mint" style="margin-top:14px">${ic('lock', 18)}<span>연락처의 번호는 가입한 친구를 확인하는 데에만 쓰이고 서버에 저장되지 않아요. 번호를 등록하지 않았거나 검색을 꺼 둔 회원은 찾지 않아요.</span></div></div>
+      <div id="ctResult" hidden></div>
       <input type="file" id="vcfInput" accept=".vcf,.vcard,text/vcard,text/x-vcard" hidden>`,
     onMount(sheet, close) {
       if (S.phone === undefined) loadPhone().then(() => { const b = $('#myPhoneBox', sheet); if (b) b.innerHTML = myPhone(); });
-      const run = async (btn, getList) => {
-        btn.disabled = true;
-        const label = btn.innerHTML;
-        btn.innerHTML = '<span class="spin-sm"></span>';
+      const startEl = $('#ctStart', sheet); const out = $('#ctResult', sheet);
+      let cur = null;   // { mode, entries, res, added }
+      onSheetGone(sheet, () => { if (S.tab === 'friends' && !S.room) renderMain(); });
+
+      const showStart = () => { cur = null; out.hidden = true; out.innerHTML = ''; startEl.hidden = false; };
+      const draw = () => {
+        if (!cur) return;
+        const { mode, entries, res, added } = cur;
+        const rows = entries.map((c, i) => ({ c, i, st: contactStatus(c, res, added) }));
+        const isHit = (r) => r.st.kind === 'member' || r.st.kind === 'added' || r.st.kind === 'friend';
+        const members = new Set(rows.filter(isHit).map((r) => r.st.m.id));
+        // 직접 고른 연락처는 모두 보여 주고, 연락처 파일처럼 많으면 가입한 사람만
+        const showAll = mode === 'pick' && entries.length <= 300;
+        let list = showAll ? rows : rows.filter(isHit);
+        if (!showAll) { const once = new Set(); list = list.filter((r) => !once.has(r.st.m.id) && once.add(r.st.m.id)); }
+        list.sort((a, b) => (CONTACT_RANK[a.st.kind] - CONTACT_RANK[b.st.kind]) || (a.i - b.i));
+        const n = members.size;
+        let sum;
+        if (!res.done) sum = `<span class="spin-sm"></span><span>${mode === 'pick' ? `고른 연락처 <b>${entries.length}명</b>을 확인하고 있어요` : `연락처 <b>${entries.length.toLocaleString()}개</b>를 확인하고 있어요`}</span>`;
+        else if (res.legacy) sum = `<span>${res.legacyFound ? `연락처에서 친구 <b>${res.legacyFound}명</b>을 찾아 추천 친구에 넣었어요` : '연락처와 일치하는 새 친구가 없어요'}</span>`;
+        else if (mode === 'pick') sum = `<span>${n ? `고른 연락처 ${entries.length}명 중 <b>${n}명</b>이 ${esc(APP)} 회원이에요` : `고른 연락처 ${entries.length}명 중 ${esc(APP)}에서 찾을 수 있는 사람이 없어요`}</span>`;
+        else sum = `<span>연락처 ${entries.length.toLocaleString()}개를 확인했어요 · ${esc(APP)} 회원 <b>${n}명</b></span>`;
+
+        const desc = (st, c) => {
+          const ph = st.phone ? fmtPhone(st.phone) : '';
+          switch (st.kind) {
+            case 'checking': return `<span class="desc">${c.name ? esc(ph) : '확인하고 있어요'}</span>`;
+            case 'member': case 'added': case 'friend':
+              return `<span class="desc hit">${esc(st.m.display_name)} @${esc(st.m.username)}${st.kind === 'member' && st.m.added_me ? ' · 나를 추가했어요' : ''}</span>`;
+            case 'none': return `<span class="desc">${c.name ? `${esc(ph)} · ` : ''}${esc(APP)}에서 찾을 수 없어요</span>`;
+            case 'skipped': return `<span class="desc">${c.name ? `${esc(ph)} · ` : ''}너무 많아 확인하지 못했어요</span>`;
+            case 'me': return '<span class="desc">내 번호예요</span>';
+            case 'nomobile': return '<span class="desc">휴대폰 번호가 없어요 (집·회사 번호만 있어요)</span>';
+            default: return '<span class="desc">번호가 없어요</span>';
+          }
+        };
+        const action = (st) => {
+          switch (st.kind) {
+            case 'checking': return '<span class="spin-sm"></span>';
+            case 'member': return `<button class="mini-btn" data-add="${esc(st.m.id)}">추가</button>`;
+            case 'added': return `<span class="cres-tag ok">${ic('check', 14)}추가했어요</span>`;
+            case 'friend': return '<span class="cres-tag">친구</span>';
+            default: return '';
+          }
+        };
+        const face = (st, c) => (st.m ? av(st.m, 44)
+          : `<span class="av cav" style="width:44px;height:44px;font-size:13px">${c.name ? esc(initials(c.name)) : ic('user', 20)}</span>`);
+        const rowsHtml = list.map(({ c, st }) => `<div class="row cres ${st.m ? '' : 'dim'}" data-k="${st.kind}">${face(st, c)}
+            <span class="meta"><span class="name">${esc(c.name || (st.phone ? fmtPhone(st.phone) : '이름 없음'))}</span>${desc(st, c)}</span>${action(st)}</div>`).join('');
+        const anyNone = res.done && !res.legacy && rows.some((r) => r.st.kind === 'none');
+        const legacyList = res.done && res.legacy ? sugList() : [];
+        out.innerHTML = `<div class="cres-sum">${sum}</div>
+          ${res.legacy ? (legacyList.length ? `<div class="cres-list">${legacyList.map((g) => `<div class="row cres">${av(g, 44)}<span class="meta"><span class="name">${esc(g.display_name)}</span><span class="desc hit">${esc(g.contact_name ? `내 연락처: ${g.contact_name}` : '내 연락처에 있는 친구')}</span></span>${added.has(g.id) ? `<span class="cres-tag ok">${ic('check', 14)}추가했어요</span>` : `<button class="mini-btn" data-add="${esc(g.id)}">추가</button>`}</div>`).join('')}</div>` : '')
+            + '<div class="cres-help">데이터베이스를 업데이트(schema.sql 다시 실행)하면 고른 사람마다 결과를 볼 수 있어요.</div>'
+          : `${rowsHtml ? `<div class="cres-list">${rowsHtml}</div>` : res.done ? `<div class="empty-line" style="padding:20px 8px">연락처에서 ${esc(APP)} 회원을 찾지 못했어요</div>` : ''}`}
+          ${anyNone || (res.done && !res.legacy && !n) ? `<div class="cres-help">찾을 수 없는 사람은 아직 ${esc(APP)}에 가입하지 않았거나, 휴대폰 번호를 등록하지 않았거나, ‘번호로 나를 찾을 수 있게’를 꺼 둔 경우예요. 아이디로 찾거나 앱 주소를 보내 초대해 보세요.
+            <div class="cres-help-btns"><button class="link-btn" data-x="invite">${ic('share', 15)}앱 주소 보내기</button><button class="link-btn" data-x="search">${ic('search', 15)}아이디로 찾기</button></div></div>` : ''}
+          ${res.done && res.over ? '<div class="cres-help">연락처가 많아 앞쪽 3,000개만 확인했어요.</div>' : ''}
+          <div class="two" style="margin-top:18px"><button class="btn gray" data-x="again" ${res.done ? '' : 'disabled'}>${mode === 'pick' ? '다시 고르기' : '다른 파일'}</button><button class="btn" data-x="done">완료</button></div>`;
+      };
+
+      const begin = async (mode, btn, getList) => {
+        if (btn) { btn.disabled = true; btn.dataset.label = btn.innerHTML; btn.innerHTML = '<span class="spin-sm"></span>'; }
         try {
           const list = await getList();
           if (!list) return;
-          const r = await matchContactList(list);
-          if (!r) return;
-          close();
-          if (S.tab !== 'friends' || S.room) go('#/friends'); else renderMain();
-          toast(r.found ? `연락처에서 친구 ${r.found}명을 찾았어요. 추천 친구를 확인해 보세요` : '연락처와 일치하는 새 친구가 없어요', { ms: 3600 });
-          if (r.over) setTimeout(() => toast('연락처가 많아 앞쪽 3000개만 확인했어요'), 3800);
+          const entries = contactEntries(list);
+          if (mode === 'file' && !entries.some((c) => c.phones.length)) { toast('연락처 파일에 휴대폰 번호가 없어요', { error: true }); return; }
+          const added = cur && cur.added ? cur.added : new Set();
+          cur = { mode, entries, res: { done: false, hits: new Map(), checked: new Set(), mine: (S.phone && S.phone.phone) || null }, added };
+          startEl.hidden = true; out.hidden = false; draw();
+          sheet.scrollTop = 0;
+          const mineCur = cur;
+          let res;
+          try { res = entries.some((c) => c.phones.length) ? await checkContacts(entries) : { hits: new Map(), checked: new Set(), count: 0, mine: mineCur.res.mine }; }
+          catch (e) { if (cur === mineCur) showStart(); throw e; }
+          if (cur !== mineCur || !sheet.isConnected) return;
+          cur.res = { ...res, done: true };
+          draw();
         } catch (e) {
           if (e && (e.name === 'AbortError' || e.name === 'InvalidStateError')) return;
           showErr(e);
-        } finally { if (btn.isConnected) { btn.disabled = false; btn.innerHTML = label; } }
+        } finally { if (btn && btn.isConnected && btn.dataset.label) { btn.disabled = false; btn.innerHTML = btn.dataset.label; delete btn.dataset.label; } }
       };
-      sheet.addEventListener('click', (e) => {
-        const x = e.target.closest('[data-x]'); if (!x) return;
-        if (x.dataset.x === 'phone') { close(); showPhone(); }
-        if (x.dataset.x === 'pick') {
-          run(x, async () => {
-            const sel = await navigator.contacts.select(['name', 'tel'], { multiple: true });
-            return sel && sel.length ? sel : null;
-          });
+      const pick = (btn) => begin('pick', btn, async () => {
+        const sel = await navigator.contacts.select(['name', 'tel'], { multiple: true });
+        if (!sel || !sel.length) { toast('고른 연락처가 없어요'); return null; }
+        return sel;
+      });
+
+      sheet.addEventListener('click', async (e) => {
+        const add = e.target.closest('[data-add]');
+        if (add && cur) {
+          const id = add.dataset.add; add.disabled = true; add.innerHTML = '<span class="spin-sm"></span>';
+          try {
+            await api.addFriend(id);
+            cur.added.add(id);
+            await loadFriends(); loadSuggestions(); loadRequests();
+            const p = S.profiles.get(id) || {};
+            friendAddedToast(id, p.display_name || '친구');
+            draw();
+          } catch (ex) { add.disabled = false; add.textContent = '추가'; showErr(ex); }
+          return;
         }
-        if (x.dataset.x === 'file') $('#vcfInput', sheet).click();
+        const x = e.target.closest('[data-x]'); if (!x) return;
+        const act = x.dataset.x;
+        if (act === 'phone') { close(); showPhone(); }
+        if (act === 'pick') pick(x);
+        if (act === 'file') $('#vcfInput', sheet).click();
+        if (act === 'again') { if (cur && cur.mode === 'pick') pick(x); else $('#vcfInput', sheet).click(); }
+        if (act === 'done') { close(); if (S.tab !== 'friends' || S.room) go('#/friends'); else renderMain(); }
+        if (act === 'search') { close(); showAddFriend(); }
+        if (act === 'invite') shareApp();
       });
       $('#vcfInput', sheet).onchange = (e) => {
         const file = e.target.files[0]; e.target.value = '';
         if (!file) return;
         if (file.size > 30 * 1024 * 1024) { toast('파일이 너무 커요 (최대 30MB)', { error: true }); return; }
-        run($('[data-x=file]', sheet), async () => {
+        const btn = cur ? $('[data-x=again]', sheet) : $('[data-x=file]', sheet);
+        begin('file', btn, async () => {
           const list = parseVcf(await file.text());
           if (!list.length) throw new Error('연락처 파일(.vcf)이 아니거나 비어 있어요');
           return list;
@@ -1643,6 +2005,17 @@ function showContacts() {
       };
     },
   });
+}
+
+// 앱 주소 보내기 (친구 초대)
+async function shareApp() {
+  const url = new URL('./', location.href).href;   // 앱이 있는 폴더 주소
+  const text = `${APP}에서 같이 대화해요! 가입하고 휴대폰 번호를 등록하면 친구로 찾을 수 있어요.`;
+  try {
+    if (navigator.share) { await navigator.share({ title: APP, text, url }); return; }
+  } catch (e) { if (e && e.name === 'AbortError') return; }
+  try { await navigator.clipboard.writeText(`${text}\n${url}`); toast('앱 주소를 복사했어요. 메시지에 붙여 넣어 보내세요'); }
+  catch { toast(url, { ms: 6000 }); }
 }
 
 // ---------- 내 휴대폰 번호 ----------
@@ -2119,11 +2492,15 @@ app.addEventListener('click', async (e) => {
       break;
     }
     case 'pick-photo': $('#photoInput').click(); break;
+    case 'attach': showAttach(); break;
+    case 'open-file': { const m = S.room && S.room.msgs.find((x) => String(x.id) === el.dataset.id); if (m) openFile(m); break; }
+    case 'save-contact': { const m = S.room && S.room.msgs.find((x) => String(x.id) === el.dataset.id); if (m) saveContact(m); break; }
     case 'view-img': showImage(el); break;
     case 'retry': {
       const m = S.room && S.room.msgs.find((x) => String(x.id) === el.dataset.id);
       if (!m) break;
-      if (m.kind === 'image') sendPhoto(null, m); else if (m.kind === 'sticker') sendSticker(null, m); else sendText(m);
+      if (m.kind === 'image') sendPhoto(null, m); else if (m.kind === 'sticker') sendSticker(null, m);
+      else if (m.kind === 'file') sendFileMsg(null, m); else if (m.kind === 'contact') sendContactMsg(null, m); else sendText(m);
       break;
     }
     case 'edit-profile': showEditProfile(); break;

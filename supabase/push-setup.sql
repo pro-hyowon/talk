@@ -109,6 +109,10 @@ begin
     v_body := '사진을 보냈어요.';
   elsif new.kind = 'sticker' then
     v_body := '이모티콘을 보냈어요.';
+  elsif new.kind = 'file' then
+    v_body := '파일을 보냈어요.';
+  elsif new.kind = 'contact' then
+    v_body := '연락처를 보냈어요.';
   else
     v_body := left(new.content, 120);
   end if;
