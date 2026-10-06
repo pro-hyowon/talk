@@ -1,6 +1,6 @@
 -- =====================================================================
 --  미니톡 — 앱을 닫아도 오는 알림(Web Push) 설정
---  ※ schema.sql 을 먼저 실행한 뒤에 실행하세요.
+--  ※ schema.sql(v1.2 이상)을 먼저 실행한 뒤에 실행하세요.
 --  ※ 맨 아래 [설정값] 부분은 tools/push-setup.html 도구가 자동으로 채워 줍니다.
 --     도구가 만들어 준 SQL 전체를 그대로 붙여넣고 Run 하면 됩니다.
 --  여러 번 실행해도 안전합니다.
@@ -34,8 +34,9 @@ create or replace function public.save_push_subscription(
   p_endpoint text, p_p256dh text, p_auth text, p_user_agent text default null)
 returns void language plpgsql security definer set search_path = public as $$
 begin
-  if auth.uid() is null then raise exception '로그인이 필요합니다'; end if;
-  if p_endpoint !~ '^https://' then raise exception '잘못된 알림 주소입니다'; end if;
+  if auth.uid() is null then raise exception '로그인이 필요해요'; end if;
+  if not public.is_active() then raise exception '사용할 수 없는 계정이에요'; end if;
+  if p_endpoint !~ '^https://' then raise exception '잘못된 알림 주소예요'; end if;
   insert into push_subscriptions (endpoint, user_id, p256dh, auth, user_agent)
   values (p_endpoint, auth.uid(), p_p256dh, p_auth, left(p_user_agent, 200))
   on conflict (endpoint) do update
@@ -71,22 +72,26 @@ revoke all on private.push_config from public, anon, authenticated;
 create or replace function public.notify_push()
 returns trigger language plpgsql security definer set search_path = public, extensions as $$
 declare
-  v_cfg    private.push_config%rowtype;
-  v_subs   jsonb;
-  v_name   text;
-  v_room   rooms%rowtype;
-  v_title  text;
-  v_body   text;
+  v_url     text;
+  v_secret  text;
+  v_preview boolean;
+  v_subs    jsonb;
+  v_name    text;
+  v_room    rooms%rowtype;
+  v_title   text;
+  v_body    text;
 begin
   if new.kind = 'system' or new.sender_id is null then return new; end if;
+  if to_regclass('private.push_config') is null then return new; end if;
 
-  select * into v_cfg from private.push_config where id = 1;
-  if not found or v_cfg.function_url like '%YOUR_PROJECT_REF%' then return new; end if;
+  select function_url, secret, show_preview into v_url, v_secret, v_preview from private.push_config where id = 1;
+  if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return new; end if;
 
   select jsonb_agg(jsonb_build_object('endpoint', s.endpoint, 'p256dh', s.p256dh, 'auth', s.auth))
     into v_subs
     from push_subscriptions s
     join room_members m on m.user_id = s.user_id and m.room_id = new.room_id
+    join profiles p on p.id = s.user_id and p.status = 'active'
    where s.user_id <> new.sender_id;
   if v_subs is null then return new; end if;
 
@@ -94,23 +99,26 @@ begin
   select * into v_room from rooms where id = new.room_id;
 
   v_title := coalesce(v_name, '새 메시지');
-  if v_room.is_group then v_title := v_title || ' · ' || coalesce(v_room.title, '단체방'); end if;
+  if v_room.is_notice then v_title := '미니톡 공지사항';
+  elsif v_room.is_group then v_title := v_title || ' · ' || coalesce(v_room.title, '단체방'); end if;
 
-  if not v_cfg.show_preview then
+  if not coalesce(v_preview, true) then
     v_title := '미니톡';
-    v_body  := '새 메시지가 도착했습니다.';
+    v_body  := '새 메시지가 도착했어요.';
   elsif new.kind = 'image' then
-    v_body := '사진을 보냈습니다.';
+    v_body := '사진을 보냈어요.';
+  elsif new.kind = 'sticker' then
+    v_body := '이모티콘을 보냈어요.';
   else
     v_body := left(new.content, 120);
   end if;
 
   perform net.http_post(
-    url := v_cfg.function_url,
+    url := v_url,
     body := jsonb_build_object(
       'subs', v_subs, 'title', v_title, 'body', v_body,
       'room_id', new.room_id, 'message_id', new.id),
-    headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_cfg.secret),
+    headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
     timeout_milliseconds := 8000
   );
   return new;

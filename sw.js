@@ -1,5 +1,5 @@
 // 미니톡 서비스 워커 — 앱 화면 캐시(오프라인에서도 열림) + 푸시 알림 수신·클릭 처리
-const CACHE = 'minitalk-v1.1.0';
+const CACHE = 'minitalk-v1.6.0';
 const SHELL = [
   './',
   './index.html',
@@ -7,6 +7,8 @@ const SHELL = [
   './js/app.js',
   './js/api.js',
   './js/config.js',
+  './js/icons.js',
+  './js/stickers.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -43,7 +45,7 @@ self.addEventListener('fetch', (e) => {
   }
 
   // 글꼴·라이브러리(CDN): 캐시 우선
-  if (url.hostname === 'cdn.jsdelivr.net') {
+  if (url.hostname === 'cdn.jsdelivr.net' || url.hostname === 'fastly.jsdelivr.net') {
     e.respondWith(
       caches.match(req).then((hit) => hit || fetch(req).then((res) => {
         if (res.ok || res.type === 'opaque') { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
