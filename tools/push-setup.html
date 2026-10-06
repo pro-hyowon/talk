@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>미니톡 알림 설정 도구</title>
+<style>
+  @font-face { font-family: 'GmarketSans'; src: url('https://cdn.jsdelivr.net/gh/projectnoonnu/noonfonts_2001@1.1/GmarketSansMedium.woff') format('woff'); font-weight: 100 900; font-display: swap; }
+  :root { --fg: #111; --sub: #555; --muted: #8c8c8c; --line: #e5e5e5; --soft: #f3f3f3; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: 'GmarketSans', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; font-weight: 500; color: var(--fg); background: #fff; line-height: 1.55; font-size: 15px; }
+  main { max-width: 760px; margin: 0 auto; padding: 40px 20px 80px; }
+  h1 { font-size: 26px; font-weight: 500; margin: 0 0 6px; letter-spacing: -0.5px; }
+  h2 { font-size: 18px; font-weight: 500; margin: 36px 0 8px; display: flex; gap: 10px; align-items: center; }
+  h2 .n { width: 28px; height: 28px; border-radius: 50%; background: var(--fg); color: #fff; font-size: 14px; display: inline-flex; align-items: center; justify-content: center; flex: none; }
+  p, li { color: var(--sub); }
+  .lead { margin: 0 0 24px; }
+  label { display: block; font-size: 13px; color: var(--sub); margin: 14px 0 6px; }
+  input[type=text], input[type=email] { width: 100%; height: 48px; border: 1px solid var(--line); border-radius: 10px; padding: 0 14px; font: inherit; }
+  input:focus { outline: none; border-color: var(--fg); }
+  .check { display: flex; gap: 8px; align-items: center; margin-top: 14px; color: var(--fg); font-size: 14px; }
+  button { font: inherit; cursor: pointer; }
+  .btn { height: 50px; border: 0; border-radius: 10px; background: var(--fg); color: #fff; padding: 0 22px; font-size: 16px; margin-top: 20px; width: 100%; }
+  .err { margin-top: 10px; border-left: 3px solid var(--fg); padding-left: 8px; font-size: 14px; }
+  .err:empty { display: none; }
+  .box { border: 1px solid var(--fg); border-radius: 12px; padding: 16px; margin-top: 10px; }
+  .row { display: grid; grid-template-columns: 190px 1fr auto; gap: 8px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .row:last-child { border-bottom: 0; }
+  .row code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; word-break: break-all; }
+  .copy { height: 34px; border: 1px solid var(--fg); border-radius: 8px; background: #fff; padding: 0 12px; font-size: 13px; white-space: nowrap; }
+  .copy.done { background: var(--fg); color: #fff; }
+  textarea { width: 100%; height: 220px; border: 1px solid var(--line); border-radius: 10px; padding: 12px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; resize: vertical; background: var(--soft); }
+  .tools { display: flex; justify-content: flex-end; margin-top: 8px; }
+  .warn { border: 1px solid var(--fg); border-radius: 12px; padding: 14px 16px; margin-top: 24px; font-size: 14px; }
+  ol { padding-left: 20px; }
+  @media (max-width: 600px) { .row { grid-template-columns: 1fr auto; } .row b { grid-column: 1 / -1; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>미니톡 알림 설정 도구</h1>
+  <p class="lead">앱을 닫아도 새 메시지 알림이 오도록 필요한 키와 설정을 만들어 줍니다. 모든 값은 이 컴퓨터 안에서만 만들어지고 어디에도 전송되지 않습니다.</p>
+
+  <form id="f">
+    <label for="url">Supabase Project URL (Project Settings → API 에서 복사)</label>
+    <input type="text" id="url" placeholder="https://abcdefghij.supabase.co" autocomplete="off" spellcheck="false">
+    <label for="mail">관리자 이메일 (알림 서비스 연락처용, 메일이 발송되지는 않음)</label>
+    <input type="email" id="mail" placeholder="admin@example.com" autocomplete="off">
+    <label class="check"><input type="checkbox" id="preview" checked> 알림에 보낸 사람과 메시지 내용 보여 주기 (끄면 "새 메시지가 도착했습니다"로만 표시)</label>
+    <button class="btn" type="submit">설정값 만들기</button>
+    <div class="err" id="err"></div>
+  </form>
+
+  <section id="out" hidden>
+    <h2><span class="n">1</span>데이터베이스 설정 (SQL Editor)</h2>
+    <p>Supabase → <b>SQL Editor</b> → New query 에 아래 내용을 전부 붙여넣고 <b>Run</b>. (기본 설정인 schema.sql 을 먼저 실행해 둔 상태여야 합니다.)</p>
+    <textarea id="sql" readonly></textarea>
+    <div class="tools"><button class="copy" data-copy="sql">SQL 복사</button></div>
+
+    <h2><span class="n">2</span>알림 발송 함수 만들기 (Edge Functions)</h2>
+    <ol>
+      <li>Supabase → <b>Edge Functions</b> → <b>Deploy a new function</b> → <b>Via Editor</b></li>
+      <li>함수 이름을 정확히 <b>send-push</b> 로 입력하고, 편집기 내용을 지운 뒤 아래 코드를 붙여넣고 <b>Deploy</b></li>
+      <li>배포된 함수 → <b>Details</b>(설정) 에서 <b>Verify JWT</b>(JWT 검증) 를 <b>끄고</b> 저장</li>
+    </ol>
+    <textarea id="code" readonly>// =====================================================================
+//  미니톡 — 알림 발송 함수 (Supabase Edge Function: send-push)
+//  새 메시지가 저장되면 데이터베이스가 이 함수를 호출하고,
+//  이 함수가 받는 사람들의 휴대폰·PC로 암호화된 알림(Web Push)을 보냅니다.
+//  외부 라이브러리 없이 표준 암호 기능(WebCrypto)만 사용합니다.
+//
+//  필요한 비밀값(Edge Functions &gt; Secrets):
+//    VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT, PUSH_WEBHOOK_SECRET
+//  ※ 함수 설정에서 "Verify JWT"(JWT 검증)는 꺼 주세요. 대신 PUSH_WEBHOOK_SECRET 으로 보호합니다.
+// =====================================================================
+
+const enc = new TextEncoder();
+
+function b64url(bytes: Uint8Array): string {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function unb64url(str: string): Uint8Array {
+  const s = str.replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(s + '='.repeat((4 - (s.length % 4)) % 4));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i &lt; bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function concat(...parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((n, p) =&gt; n + p.length, 0));
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+// WebCrypto에 넘길 때 사용하는 변환 (TypeScript 버전 차이 대응)
+function buf(u: Uint8Array): ArrayBuffer { return u.slice().buffer as ArrayBuffer; }
+
+async function hmac(key: Uint8Array, data: Uint8Array): Promise&lt;Uint8Array&gt; {
+  const k = await crypto.subtle.importKey('raw', buf(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', k, buf(data)));
+}
+
+// ---------- VAPID (보내는 서버 인증, RFC 8292) ----------
+export async function importVapidPrivateKey(publicKeyB64: string, privateKeyB64: string): Promise&lt;CryptoKey&gt; {
+  const pub = unb64url(publicKeyB64);
+  if (pub.length !== 65 || pub[0] !== 4) throw new Error('VAPID_PUBLIC_KEY 형식이 올바르지 않습니다');
+  const jwk = {
+    kty: 'EC', crv: 'P-256', ext: true,
+    x: b64url(pub.slice(1, 33)), y: b64url(pub.slice(33, 65)), d: privateKeyB64,
+  };
+  return await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+}
+
+export async function vapidAuthHeader(endpoint: string, publicKeyB64: string, signKey: CryptoKey, subject: string): Promise&lt;string&gt; {
+  const aud = new URL(endpoint).origin;
+  const header = b64url(enc.encode(JSON.stringify({ typ: 'JWT', alg: 'ES256' })));
+  const claims = b64url(enc.encode(JSON.stringify({ aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: subject })));
+  const unsigned = `${header}.${claims}`;
+  const sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, signKey, buf(enc.encode(unsigned))));
+  return `vapid t=${unsigned}.${b64url(sig)}, k=${publicKeyB64}`;
+}
+
+// ---------- 내용 암호화 (RFC 8291, aes128gcm) ----------
+export async function encryptPayload(p256dhB64: string, authB64: string, plaintext: Uint8Array): Promise&lt;Uint8Array&gt; {
+  const uaPublic = unb64url(p256dhB64);
+  const authSecret = unb64url(authB64);
+  if (uaPublic.length !== 65 || authSecret.length !== 16) throw new Error('구독 키 형식 오류');
+
+  const asKeys = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']) as CryptoKeyPair;
+  const asPublic = new Uint8Array(await crypto.subtle.exportKey('raw', asKeys.publicKey));
+  const uaKey = await crypto.subtle.importKey('raw', buf(uaPublic), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const ecdhSecret = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: uaKey }, asKeys.privateKey, 256));
+
+  const prkKey = await hmac(authSecret, ecdhSecret);
+  const keyInfo = concat(enc.encode('WebPush: info\0'), uaPublic, asPublic, new Uint8Array([1]));
+  const ikm = await hmac(prkKey, keyInfo);
+
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const prk = await hmac(salt, ikm);
+  const cek = (await hmac(prk, concat(enc.encode('Content-Encoding: aes128gcm\0'), new Uint8Array([1])))).slice(0, 16);
+  const nonce = (await hmac(prk, concat(enc.encode('Content-Encoding: nonce\0'), new Uint8Array([1])))).slice(0, 12);
+
+  const padded = concat(plaintext, new Uint8Array([2])); // 마지막 레코드 구분자
+  const aesKey = await crypto.subtle.importKey('raw', buf(cek), { name: 'AES-GCM' }, false, ['encrypt']);
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: buf(nonce) }, aesKey, buf(padded)));
+
+  const rs = new Uint8Array(4); new DataView(rs.buffer).setUint32(0, 4096);
+  return concat(salt, rs, new Uint8Array([asPublic.length]), asPublic, cipher);
+}
+
+export type Sub = { endpoint: string; p256dh: string; auth: string };
+
+export async function sendWebPush(sub: Sub, payload: string, vapid: { publicKey: string; signKey: CryptoKey; subject: string }, ttl = 86400): Promise&lt;number&gt; {
+  const body = await encryptPayload(sub.p256dh, sub.auth, enc.encode(payload));
+  const res = await fetch(sub.endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: await vapidAuthHeader(sub.endpoint, vapid.publicKey, vapid.signKey, vapid.subject),
+      'Content-Encoding': 'aes128gcm',
+      'Content-Type': 'application/octet-stream',
+      TTL: String(ttl),
+      Urgency: 'high',
+    },
+    body: buf(body),
+  });
+  await res.body?.cancel();
+  return res.status;
+}
+
+// ---------- 요청 처리 ----------
+async function removeDead(endpoints: string[]) {
+  const url = Deno.env.get('SUPABASE_URL');
+  const key = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+  if (!url || !key || !endpoints.length) return;
+  const list = endpoints.map((e) =&gt; `"${e.replace(/"/g, '')}"`).join(',');
+  await fetch(`${url}/rest/v1/push_subscriptions?endpoint=in.(${encodeURIComponent(list)})`, {
+    method: 'DELETE',
+    headers: { apikey: key, Authorization: `Bearer ${key}` },
+  }).then((r) =&gt; r.body?.cancel()).catch(() =&gt; {});
+}
+
+let cachedKey: CryptoKey | null = null;
+
+export async function handler(req: Request): Promise&lt;Response&gt; {
+  if (req.method !== 'POST') return new Response('send-push ok');
+  const secret = Deno.env.get('PUSH_WEBHOOK_SECRET');
+  if (!secret || req.headers.get('x-push-secret') !== secret) return new Response('unauthorized', { status: 401 });
+
+  const publicKey = Deno.env.get('VAPID_PUBLIC_KEY') ?? '';
+  const privateKey = Deno.env.get('VAPID_PRIVATE_KEY') ?? '';
+  const subject = Deno.env.get('VAPID_SUBJECT') ?? 'mailto:admin@example.com';
+  if (!publicKey || !privateKey) return new Response('VAPID keys missing', { status: 500 });
+  cachedKey ??= await importVapidPrivateKey(publicKey, privateKey);
+
+  let data: { subs?: Sub[]; title?: string; body?: string; room_id?: string };
+  try { data = await req.json(); } catch { return new Response('bad json', { status: 400 }); }
+  const subs = Array.isArray(data.subs) ? data.subs.slice(0, 500) : [];
+  const payload = JSON.stringify({
+    title: data.title ?? '미니톡',
+    body: data.body ?? '새 메시지가 도착했습니다.',
+    tag: data.room_id ?? 'minitalk',
+    url: data.room_id ? `./#/room/${data.room_id}` : './',
+  });
+
+  const results = await Promise.allSettled(
+    subs.map((s) =&gt; sendWebPush(s, payload, { publicKey, signKey: cachedKey!, subject })),
+  );
+  const dead: string[] = [];
+  let sent = 0;
+  results.forEach((r, i) =&gt; {
+    if (r.status === 'fulfilled' &amp;&amp; r.value &gt;= 200 &amp;&amp; r.value &lt; 300) sent++;
+    else if (r.status === 'fulfilled' &amp;&amp; (r.value === 404 || r.value === 410)) dead.push(subs[i].endpoint);
+  });
+  await removeDead(dead);
+  return Response.json({ sent, failed: subs.length - sent - dead.length, removed: dead.length });
+}
+
+Deno.serve(handler);
+</textarea>
+    <div class="tools"><button class="copy" data-copy="code">함수 코드 복사</button></div>
+
+    <h2><span class="n">3</span>함수 비밀값 등록 (Edge Functions → Secrets)</h2>
+    <p>아래 4개를 이름과 값 그대로 추가하고 저장합니다.</p>
+    <div class="box" id="secrets"></div>
+
+    <h2><span class="n">4</span>앱 설정 파일 수정 (js/config.js)</h2>
+    <p><code>VAPID_PUBLIC_KEY: '',</code> 줄을 아래 줄로 바꾸고 GitHub에 다시 올립니다.</p>
+    <div class="box"><div class="row" style="grid-template-columns:1fr auto"><code id="cfg"></code><button class="copy" data-copy="cfg">복사</button></div></div>
+
+    <h2><span class="n">5</span>휴대폰에서 알림 켜기</h2>
+    <p>앱을 새로고침(또는 다시 열기)한 뒤 <b>더보기 → 새 메시지 알림</b>을 눌러 허용합니다. 아이폰은 홈 화면에 추가한 앱에서만 가능합니다(iOS 16.4 이상).</p>
+
+    <div class="warn"><b>보관 주의</b> — <code>VAPID_PRIVATE_KEY</code> 와 <code>PUSH_WEBHOOK_SECRET</code> 은 비밀번호처럼 다른 사람에게 보여 주지 마세요. 이 페이지를 닫으면 값은 사라집니다. 나중에 다시 만들면 기존 사용자는 앱을 한 번 열기만 하면 자동으로 다시 등록됩니다.</div>
+  </section>
+</main>
+
+<script>
+const SQL_TEMPLATE = "-- =====================================================================\n--  미니톡 — 앱을 닫아도 오는 알림(Web Push) 설정\n--  ※ schema.sql 을 먼저 실행한 뒤에 실행하세요.\n--  ※ 맨 아래 [설정값] 부분은 tools/push-setup.html 도구가 자동으로 채워 줍니다.\n--     도구가 만들어 준 SQL 전체를 그대로 붙여넣고 Run 하면 됩니다.\n--  여러 번 실행해도 안전합니다.\n-- =====================================================================\n\n-- 1. 서버에서 다른 서버로 요청을 보내는 확장 기능 켜기\ncreate extension if not exists pg_net with schema extensions;\n\n-- 2. 기기별 알림 구독 정보\ncreate table if not exists public.push_subscriptions (\n  endpoint   text primary key,\n  user_id    uuid not null references public.profiles(id) on delete cascade,\n  p256dh     text not null,\n  auth       text not null,\n  user_agent text,\n  created_at timestamptz not null default now()\n);\ncreate index if not exists push_subscriptions_user_idx on public.push_subscriptions(user_id);\n\nalter table public.push_subscriptions enable row level security;\n\ndrop policy if exists \"push_select_own\" on public.push_subscriptions;\ncreate policy \"push_select_own\" on public.push_subscriptions for select to authenticated\n  using (user_id = auth.uid());\n\ngrant select on public.push_subscriptions to authenticated;\ngrant all on public.push_subscriptions to service_role;\n\n-- 이 기기로 알림 받기 (같은 기기에서 다른 아이디로 로그인하면 새 아이디로 넘어감)\ncreate or replace function public.save_push_subscription(\n  p_endpoint text, p_p256dh text, p_auth text, p_user_agent text default null)\nreturns void language plpgsql security definer set search_path = public as $$\nbegin\n  if auth.uid() is null then raise exception '로그인이 필요합니다'; end if;\n  if p_endpoint !~ '^https://' then raise exception '잘못된 알림 주소입니다'; end if;\n  insert into push_subscriptions (endpoint, user_id, p256dh, auth, user_agent)\n  values (p_endpoint, auth.uid(), p_p256dh, p_auth, left(p_user_agent, 200))\n  on conflict (endpoint) do update\n    set user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,\n        user_agent = excluded.user_agent, created_at = now();\nend;\n$$;\n\n-- 이 기기 알림 끄기 (로그아웃할 때도 호출)\ncreate or replace function public.delete_push_subscription(p_endpoint text)\nreturns void language sql security definer set search_path = public as $$\n  delete from push_subscriptions where endpoint = p_endpoint and user_id = auth.uid();\n$$;\n\nrevoke execute on function public.save_push_subscription(text, text, text, text) from public, anon;\nrevoke execute on function public.delete_push_subscription(text) from public, anon;\ngrant execute on function public.save_push_subscription(text, text, text, text) to authenticated;\ngrant execute on function public.delete_push_subscription(text) to authenticated;\n\n-- 3. 발송 설정 (앱 사용자에게는 보이지 않는 별도 공간에 보관)\ncreate schema if not exists private;\nrevoke all on schema private from public, anon, authenticated;\n\ncreate table if not exists private.push_config (\n  id           int primary key default 1 check (id = 1),\n  function_url text not null,\n  secret       text not null,\n  show_preview boolean not null default true   -- false 로 바꾸면 알림에 메시지 내용 대신 \"새 메시지\"만 표시\n);\nrevoke all on private.push_config from public, anon, authenticated;\n\n-- 4. 새 메시지가 저장되면 → 받는 사람들의 기기 목록을 모아 발송 함수 호출\ncreate or replace function public.notify_push()\nreturns trigger language plpgsql security definer set search_path = public, extensions as $$\ndeclare\n  v_cfg    private.push_config%rowtype;\n  v_subs   jsonb;\n  v_name   text;\n  v_room   rooms%rowtype;\n  v_title  text;\n  v_body   text;\nbegin\n  if new.kind = 'system' or new.sender_id is null then return new; end if;\n\n  select * into v_cfg from private.push_config where id = 1;\n  if not found or v_cfg.function_url like '%YOUR_PROJECT_REF%' then return new; end if;\n\n  select jsonb_agg(jsonb_build_object('endpoint', s.endpoint, 'p256dh', s.p256dh, 'auth', s.auth))\n    into v_subs\n    from push_subscriptions s\n    join room_members m on m.user_id = s.user_id and m.room_id = new.room_id\n   where s.user_id <> new.sender_id;\n  if v_subs is null then return new; end if;\n\n  select display_name into v_name from profiles where id = new.sender_id;\n  select * into v_room from rooms where id = new.room_id;\n\n  v_title := coalesce(v_name, '새 메시지');\n  if v_room.is_group then v_title := v_title || ' · ' || coalesce(v_room.title, '단체방'); end if;\n\n  if not v_cfg.show_preview then\n    v_title := '미니톡';\n    v_body  := '새 메시지가 도착했습니다.';\n  elsif new.kind = 'image' then\n    v_body := '사진을 보냈습니다.';\n  else\n    v_body := left(new.content, 120);\n  end if;\n\n  perform net.http_post(\n    url := v_cfg.function_url,\n    body := jsonb_build_object(\n      'subs', v_subs, 'title', v_title, 'body', v_body,\n      'room_id', new.room_id, 'message_id', new.id),\n    headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_cfg.secret),\n    timeout_milliseconds := 8000\n  );\n  return new;\nexception when others then\n  -- 알림 발송 문제로 메시지 전송이 막히면 안 되므로 오류는 무시\n  raise warning 'notify_push 실패: %', sqlerrm;\n  return new;\nend;\n$$;\n\ndrop trigger if exists messages_push on public.messages;\ncreate trigger messages_push\n  after insert on public.messages\n  for each row execute function public.notify_push();\n\n-- =====================================================================\n-- [설정값] — tools/push-setup.html 이 채워 줍니다. 직접 쓸 경우:\n--   function_url : https://프로젝트ID.supabase.co/functions/v1/send-push\n--   secret       : Edge Function 비밀값 PUSH_WEBHOOK_SECRET 과 똑같은 값\n-- =====================================================================\ninsert into private.push_config (id, function_url, secret, show_preview)\nvalues (1, 'https://YOUR_PROJECT_REF.supabase.co/functions/v1/send-push', 'YOUR_PUSH_SECRET', true)\non conflict (id) do update\n  set function_url = excluded.function_url, secret = excluded.secret, show_preview = excluded.show_preview;\n";
+const $ = (id) => document.getElementById(id);
+const b64u = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const sqlStr = (s) => "'" + s.replace(/'/g, "''") + "'";
+const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+$('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('err').textContent = '';
+  let origin;
+  try {
+    const u = new URL($('url').value.trim());
+    if (u.protocol !== 'https:') throw new Error();
+    origin = u.origin;
+  } catch { $('err').textContent = 'Project URL을 정확히 입력하세요. 예) https://abcdefghij.supabase.co'; return; }
+  const mail = $('mail').value.trim();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(mail)) { $('err').textContent = '관리자 이메일을 입력하세요.'; return; }
+  if (!window.crypto || !crypto.subtle) { $('err').textContent = '이 브라우저에서는 키를 만들 수 없습니다. 최신 크롬이나 엣지로 열어 주세요.'; return; }
+
+  const kp = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const pub = b64u(new Uint8Array(await crypto.subtle.exportKey('raw', kp.publicKey)));
+  const priv = (await crypto.subtle.exportKey('jwk', kp.privateKey)).d;
+  const secret = [...crypto.getRandomValues(new Uint8Array(24))].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const fnUrl = origin + '/functions/v1/send-push';
+
+  const sql = SQL_TEMPLATE
+    .replace("'https://YOUR_PROJECT_REF.supabase.co/functions/v1/send-push'", sqlStr(fnUrl))
+    .replace("'YOUR_PUSH_SECRET'", sqlStr(secret))
+    .replace(/values \(1, (.*), true\)\non conflict/, (m) => $('preview').checked ? m : m.replace(/, true\)\n/, ', false)\n'));
+  $('sql').value = sql;
+
+  const secrets = [
+    ['VAPID_PUBLIC_KEY', pub], ['VAPID_PRIVATE_KEY', priv],
+    ['VAPID_SUBJECT', 'mailto:' + mail], ['PUSH_WEBHOOK_SECRET', secret],
+  ];
+  $('secrets').innerHTML = secrets.map(([k, v], i) =>
+    `<div class="row"><b>${k}</b><code id="s${i}">${esc(v)}</code><button class="copy" data-copy="s${i}">값 복사</button></div>`).join('');
+  $('cfg').textContent = `VAPID_PUBLIC_KEY: '${pub}',`;
+  $('out').hidden = false;
+  $('out').scrollIntoView({ behavior: 'smooth' });
+});
+
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-copy]'); if (!b) return;
+  const el = $(b.dataset.copy);
+  const text = 'value' in el && el.tagName === 'TEXTAREA' ? el.value : el.textContent;
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const t = document.createElement('textarea'); t.value = text; document.body.appendChild(t); t.select();
+    document.execCommand('copy'); t.remove();
+  }
+  const old = b.textContent; b.textContent = '복사됨'; b.classList.add('done');
+  setTimeout(() => { b.textContent = old; b.classList.remove('done'); }, 1400);
+});
+</script>
+</body>
+</html>
