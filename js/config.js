@@ -20,5 +20,5 @@ export const CONFIG = {
 
   // 앱을 닫아도 오는 알림(Web Push)용 공개 키 — tools/push-setup.html 에서 만든 값을 넣으세요.
   //  비워 두면 알림은 앱이 열려 있을 때만 옵니다.
-  VAPID_PUBLIC_KEY: 'VAPID_PUBLIC_KEY: 'BG3lSYDZ8aRg-MYvS418m9oEm8xg7APR8WflLB5xsFB6ZT-hPLUjKZg_AzzWq49iYj3R58EhhdPMyKQ2a-LLfoo',',
+  VAPID_PUBLIC_KEY: 'BG3lSYDZ8aRg-MYvS418m9oEm8xg7APR8WflLB5xsFB6ZT-hPLUjKZg_AzzWq49iYj3R58EhhdPMyKQ2a-LLfoo',',
 };
