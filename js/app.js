@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.14.0';
+const VERSION = '1.15.0';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 const APP = CONFIG.APP_NAME;
 const app = document.getElementById('app');
@@ -42,6 +42,7 @@ const S = {
   fromList: false,
   profiles: new Map(),
   imgUrls: new Map(),
+  muted: new Map(),   // v1.15: 방 ID → 알림 꺼 둠
   fileUrls: new Map(),
   unsub: null,
   wasSubscribed: false,
@@ -581,6 +582,7 @@ async function loadPhone() {
 async function loadRooms() {
   S.rooms = await api.listRooms();
   S.roomsLoaded = true;
+  S.muted = new Map(S.rooms.map((r) => [r.room_id, !!r.muted]));
   // 보고 있던 단체방에서 내보내졌으면 닫기 (실시간 알림을 못 받은 경우 대비)
   if (S.room && S.room.info && S.room.info.is_group && !S.room.info.is_notice && !S.rooms.some((r) => r.room_id === S.room.id)) {
     kickedOut(S.room.id, S.room.info.title);
@@ -601,8 +603,10 @@ function refreshRoomsSoon() {
   return roomsPromise;
 }
 const badgeTxt = (n) => (n > 99 ? '99+' : String(n));
+const isMuted = (roomId) => S.muted.get(roomId) === true;
 function updateBadges() {
-  const total = S.rooms.reduce((s, r) => s + (r.unread || 0), 0);
+  // 알림을 꺼 둔 방은 전체 숫자(탭·앱 아이콘)에 넣지 않음
+  const total = S.rooms.reduce((s, r) => s + (isMuted(r.room_id) ? 0 : r.unread || 0), 0);
   const b = $('#chatBadge');
   if (b) b.innerHTML = total ? `<span class="badge">${badgeTxt(total)}</span>` : '';
   setBadge(total);
@@ -654,7 +658,7 @@ function renderMain() {
       let list = $('#chatList', body);
       if (!list) { body.innerHTML = '<div class="chat-filter" id="chatFilter"></div><div id="chatList"></div>'; list = $('#chatList', body); }
       const dms = S.rooms.filter((r) => !r.is_group); const groups = S.rooms.filter((r) => r.is_group && !r.is_notice);
-      const unread = (arr) => arr.some((r) => r.unread);
+      const unread = (arr) => arr.some((r) => r.unread && !isMuted(r.room_id));   // 알림 꺼 둔 방은 빨간 점 없음
       $('#chatFilter', body).innerHTML = [['all', '전체', S.rooms], ['dm', '1:1', dms], ['group', '단체', groups]]
         .map(([k, l, arr]) => `<button data-act="chat-filter" data-f="${k}" class="${S.chatFilter === k ? 'on' : ''}">${l}<span class="n">${arr.length}</span>${unread(arr) ? '<i class="dot"></i>' : ''}</button>`).join('');
       const shown = S.chatFilter === 'dm' ? dms : S.chatFilter === 'group' ? groups : S.rooms;
@@ -671,9 +675,9 @@ function renderMain() {
 
 function chatRowHtml(r) {
   return `<button class="row chat" data-act="open-room" data-id="${esc(r.room_id)}">${roomAv(r)}
-    <div class="meta"><div class="title-line">${r.is_group && !r.is_notice ? '<span class="tag-group">단체</span>' : ''}<span class="name">${esc(roomName(r, r.members || []))}</span>${r.is_group && !r.is_notice ? `<span class="cnt">${r.member_count}</span>` : ''}</div>
+    <div class="meta"><div class="title-line">${r.is_group && !r.is_notice ? '<span class="tag-group">단체</span>' : ''}<span class="name">${esc(roomName(r, r.members || []))}</span>${r.is_group && !r.is_notice ? `<span class="cnt">${r.member_count}</span>` : ''}${isMuted(r.room_id) ? `<span class="mute-ic" aria-label="알림 꺼짐">${ic('belloff', 15)}</span>` : ''}</div>
     <div class="desc">${esc(previewText(r.last_message))}</div></div>
-    <div class="side"><span class="time">${esc(fmtListTime(r.last_message_at))}</span>${r.unread ? `<span class="badge">${badgeTxt(r.unread)}</span>` : ''}</div></button>`;
+    <div class="side"><span class="time">${esc(fmtListTime(r.last_message_at))}</span>${r.unread ? `<span class="badge ${isMuted(r.room_id) ? 'muted' : ''}">${badgeTxt(r.unread)}</span>` : ''}</div></button>`;
 }
 
 function renderMore(head, body) {
@@ -795,6 +799,7 @@ async function openRoom(id) {
   el.innerHTML = `
     <div class="bar"><button class="ibtn" data-act="room-back" aria-label="뒤로">${ic('back', 24)}</button>
       <div class="ttl" id="roomTitle"></div>
+      <button class="ibtn" data-act="room-mute" id="roomMuteBtn" aria-label="이 방 알림 끄기" hidden>${ic('bell', 22)}</button>
       <button class="ibtn" data-act="room-menu" id="roomMenuBtn" aria-label="채팅방 메뉴" hidden>${ic('menu', 24)}</button></div>
     <div class="msgs-wrap"><div class="msgs" id="msgs"><div class="spinner"></div></div>
       <button class="new-pill" id="newPill" data-act="to-bottom" hidden>새 메시지${ic('down', 16)}</button>
@@ -818,7 +823,7 @@ async function openRoom(id) {
     if (token !== S.roomToken) return;
     if (!info) { toast('대화방을 찾을 수 없어요', { error: true }); closeRoom(); location.replace('#/chats'); return; }
     S.room.info = info;
-    if (info.is_notice) setupNoticeComposer(); else $('#roomMenuBtn').hidden = false;
+    if (info.is_notice) { setupNoticeComposer(); $('#roomMuteBtn').hidden = false; } else $('#roomMenuBtn').hidden = false;
     setMembers(members);
     S.room.msgs = msgs;
     S.room.hasMore = msgs.length >= 50;
@@ -868,7 +873,9 @@ const roomOthers = () => S.room.members.filter((m) => m.id !== S.uid).map((m) =>
 function renderRoomHeader() {
   const info = S.room.info;
   const name = roomName(info, roomOthers());
-  $('#roomTitle').innerHTML = `${info.is_notice ? `<span class="mega-dot">${ic('mega', 16)}</span>` : ''}<span class="t">${esc(name)}</span>${info.is_group && !info.is_notice ? `<span class="c">${S.room.members.length}</span>` : ''}`;
+  $('#roomTitle').innerHTML = `${info.is_notice ? `<span class="mega-dot">${ic('mega', 16)}</span>` : ''}<span class="t">${esc(name)}</span>${info.is_group && !info.is_notice ? `<span class="c">${S.room.members.length}</span>` : ''}${isMuted(S.room.id) ? `<span class="mute-ic" aria-label="알림 꺼짐">${ic('belloff', 16)}</span>` : ''}`;
+  const mb = $('#roomMuteBtn');
+  if (mb) { const m = isMuted(S.room.id); mb.innerHTML = ic(m ? 'belloff' : 'bell', 22); mb.setAttribute('aria-label', m ? '이 방 알림 켜기' : '이 방 알림 끄기'); mb.classList.toggle('off', m); }
 }
 
 const isNoticeRoom = () => !!(S.room && S.room.info && S.room.info.is_notice);
@@ -1619,6 +1626,23 @@ async function sendContactMsg(c, retryMsg) {
   }
 }
 
+// v1.15: 채팅방 알림 켜기·끄기 (서버에 저장 → 앱을 닫아도 오는 알림·다른 기기에도 적용)
+async function toggleRoomMute(roomId, mute) {
+  const prev = isMuted(roomId);
+  const apply = (v) => {
+    S.muted.set(roomId, v);
+    const r = S.rooms.find((x) => x.room_id === roomId); if (r) r.muted = v;
+    updateBadges();
+    if (S.room && S.room.id === roomId && S.room.info) renderRoomHeader();
+    if (S.tab === 'chats' && !S.room && $('#main')) renderMain();
+  };
+  apply(mute);
+  try {
+    await api.setRoomMuted(roomId, mute);
+    toast(mute ? '이 채팅방 알림을 껐어요' : '이 채팅방 알림을 켰어요');
+  } catch (e) { apply(prev); showErr(e); }
+}
+
 // ---------------------------------------------------------------------
 // v1.11: 공감 (길게 누르기) · 답장 (옆으로 밀기)
 // ---------------------------------------------------------------------
@@ -1860,6 +1884,7 @@ async function catchUp() {
 
 function maybeNotify(m) {
   if (!S.entered || m.sender_id === S.uid || m.kind === 'system') return;
+  if (isMuted(m.room_id)) return;   // v1.15: 알림 꺼 둔 방
   const inRoom = S.room && S.room.id === m.room_id;
   if (inRoom && !document.hidden) return;
   const sender = profileOf(m.sender_id);
@@ -2398,6 +2423,8 @@ function showRoomMenu() {
   openSheet({
     title: roomName(R.info, roomOthers()),
     body: `<button class="menu-row invite bleed" data-x="invite" style="width:calc(100% + 40px)"><span class="circ">${ic('userplus', 22)}</span><span>대화상대 초대${R.info.is_group ? '' : '<span class="sub">새 단체방으로 만들어져요</span>'}</span></button>
+      <div class="card-line mute-line"><span class="label">${ic(isMuted(R.id) ? 'belloff' : 'bell', 20, 'flex:none;vertical-align:-4px;margin-right:8px')}이 채팅방 알림<span class="sub">끄면 새 메시지가 와도 알림이 울리지 않아요. 안 읽은 숫자는 그대로 보여요</span></span>
+        <button class="switch ${isMuted(R.id) ? '' : 'on'}" data-x="mute" role="switch" aria-checked="${!isMuted(R.id)}" aria-label="이 채팅방 알림"></button></div>
       <div class="sec" style="padding:12px 0 4px">참여자 ${members.length}</div>
       <div class="bleed">${members.map((p) => `<div class="menu-row mem"><button class="mem-main" data-x="profile" data-id="${esc(p.id)}">${av(p, 42)}<span style="font-size:15px">${esc(p.display_name)}</span>${p.id === S.uid ? '<span class="chip me">나</span>' : ''}${R.info.is_group && p.id === R.info.created_by ? '<span class="chip owner">방장</span>' : ''}</button>
         ${canKick && p.id !== S.uid ? `<button class="kick-btn" data-x="kick" data-id="${esc(p.id)}">내보내기</button>` : ''}</div>`).join('')}</div>
@@ -2407,6 +2434,12 @@ function showRoomMenu() {
       sheet.addEventListener('click', async (e) => {
         const x = e.target.closest('[data-x]'); if (!x) return;
         if (x.dataset.x === 'profile') { close(); showProfile(x.dataset.id); }
+        if (x.dataset.x === 'mute') {
+          const on = !isMuted(R.id);   // true → 끄기
+          x.classList.toggle('on', !on); x.setAttribute('aria-checked', String(!on));
+          toggleRoomMute(R.id, on);
+          return;
+        }
         if (x.dataset.x === 'invite') {
           close();
           if (R.info.is_group) {
@@ -2930,6 +2963,7 @@ app.addEventListener('click', async (e) => {
     }
     case 'pick-photo': $('#photoInput').click(); break;
     case 'attach': showAttach(); break;
+    case 'room-mute': if (S.room) toggleRoomMute(S.room.id, !isMuted(S.room.id)); break;
     case 'react': { const m = S.room && S.room.msgs.find((x) => String(x.id) === el.dataset.id); if (m) toggleReact(m, el.dataset.e); break; }
     case 'jump-reply': jumpTo(el.dataset.id); break;
     case 'cancel-reply': cancelReply(); break;

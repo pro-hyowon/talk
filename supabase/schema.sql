@@ -1,5 +1,5 @@
 -- =====================================================================
---  미니톡(MiniTalk) v1.14 — Supabase 데이터베이스 설정 스크립트
+--  미니톡(MiniTalk) v1.15 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -209,6 +209,17 @@ create table if not exists private.room_cleanup (
   primary key (room_id, user_id)
 );
 revoke all on private.room_cleanup from public, anon, authenticated;
+
+-- v1.15: 채팅방별 알림 끄기 (여기 있으면 그 방 새 메시지 알림을 보내지 않음, 방을 나가면 자동으로 지워짐)
+create schema if not exists private;
+create table if not exists private.room_mutes (
+  room_id    uuid not null,
+  user_id    uuid not null,
+  created_at timestamptz not null default now(),
+  primary key (room_id, user_id),
+  foreign key (room_id, user_id) references public.room_members(room_id, user_id) on delete cascade
+);
+revoke all on private.room_mutes from public, anon, authenticated;
 
 -- v1.14: 친구 초대 링크·QR 코드 (회원마다 하나, 새로 만들면 예전 링크는 더 이상 안 됨)
 create table if not exists private.invite_codes (
@@ -540,7 +551,9 @@ begin
     from push_subscriptions s
     join room_members m on m.user_id = s.user_id and m.room_id = new.room_id
     join profiles p on p.id = s.user_id and p.status = 'active'
-   where s.user_id <> new.sender_id;
+   where s.user_id <> new.sender_id
+     -- v1.15: 이 방 알림을 꺼 둔 사람은 빼기
+     and not exists (select 1 from private.room_mutes x where x.room_id = new.room_id and x.user_id = s.user_id);
   if v_subs is null then return new; end if;
 
   select display_name into v_name from profiles where id = new.sender_id;
@@ -786,7 +799,7 @@ drop function if exists public.my_rooms();
 create function public.my_rooms()
 returns table (
   room_id uuid, is_group boolean, is_notice boolean, title text, last_message text,
-  last_message_at timestamptz, unread integer, member_count integer, members jsonb
+  last_message_at timestamptz, unread integer, member_count integer, members jsonb, muted boolean
 )
 language sql stable security definer set search_path = public as $$
   select r.id, r.is_group, r.is_notice, r.title,
@@ -805,7 +818,8 @@ language sql stable security definer set search_path = public as $$
                      from (select p.id, p.display_name, p.avatar_url
                              from room_members x join profiles p on p.id = x.user_id
                             where x.room_id = r.id and x.user_id <> (select auth.uid())
-                            order by p.display_name limit 4) q), '[]'::jsonb) end
+                            order by p.display_name limit 4) q), '[]'::jsonb) end,
+         exists (select 1 from private.room_mutes x where x.room_id = r.id and x.user_id = me.user_id)
     from room_members me
     join rooms r on r.id = me.room_id
    where me.user_id = (select auth.uid()) and (select public.is_active())
@@ -1287,6 +1301,20 @@ exception when others then
 end;
 $$;
 
+-- v1.15: 채팅방 알림 켜기·끄기 (p_muted = true 면 끔)
+create or replace function public.set_room_muted(p_room uuid, p_muted boolean)
+returns boolean language plpgsql security definer set search_path = public, private as $$
+begin
+  if not public.is_room_member(p_room) then raise exception '이 방의 참여자가 아니에요'; end if;
+  if p_muted then
+    insert into private.room_mutes (room_id, user_id) values (p_room, auth.uid()) on conflict do nothing;
+  else
+    delete from private.room_mutes where room_id = p_room and user_id = auth.uid();
+  end if;
+  return p_muted;
+end;
+$$;
+
 -- v1.14: 내 초대 코드 (없으면 만듦)
 create or replace function public.my_invite_code()
 returns text language plpgsql security definer set search_path = public, private as $$
@@ -1572,7 +1600,7 @@ declare
     'get_my_phone()', 'set_my_phone(text, boolean)', 'set_phone_findable(boolean)',
     'match_contacts(text[], text[])', 'match_contacts_detail(text[], text[])', 'my_suggestions()', 'dismiss_suggestion(uuid)', 'admin_clear_phone(uuid)',
     'my_friend_requests()', 'dismiss_request(uuid)', 'kick_from_room(uuid, uuid)', 'delete_message(bigint)', 'react_message(bigint, text)',
-    'my_invite_code()', 'reset_invite_code()', 'invite_preview(text)', 'accept_invite(text)',
+    'my_invite_code()', 'reset_invite_code()', 'invite_preview(text)', 'accept_invite(text)', 'set_room_muted(uuid, boolean)',
     'admin_list_users(text)', 'admin_set_status(uuid, text)', 'admin_set_admin(uuid, boolean)',
     'admin_reset_password(uuid)', 'admin_delete_user(uuid)', 'admin_get_settings()',
     'admin_set_settings(boolean)', 'admin_broadcast(text)', 'admin_orphan_media()',

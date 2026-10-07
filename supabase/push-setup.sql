@@ -29,6 +29,17 @@ create policy "push_select_own" on public.push_subscriptions for select to authe
 grant select on public.push_subscriptions to authenticated;
 grant all on public.push_subscriptions to service_role;
 
+-- v1.15: 채팅방별 알림 끄기 (여기 있으면 그 방 새 메시지 알림을 보내지 않음, 방을 나가면 자동으로 지워짐)
+create schema if not exists private;
+create table if not exists private.room_mutes (
+  room_id    uuid not null,
+  user_id    uuid not null,
+  created_at timestamptz not null default now(),
+  primary key (room_id, user_id),
+  foreign key (room_id, user_id) references public.room_members(room_id, user_id) on delete cascade
+);
+revoke all on private.room_mutes from public, anon, authenticated;
+
 -- 이 기기로 알림 받기 (같은 기기에서 다른 아이디로 로그인하면 새 아이디로 넘어감)
 create or replace function public.save_push_subscription(
   p_endpoint text, p_p256dh text, p_auth text, p_user_agent text default null)
@@ -92,7 +103,9 @@ begin
     from push_subscriptions s
     join room_members m on m.user_id = s.user_id and m.room_id = new.room_id
     join profiles p on p.id = s.user_id and p.status = 'active'
-   where s.user_id <> new.sender_id;
+   where s.user_id <> new.sender_id
+     -- v1.15: 이 방 알림을 꺼 둔 사람은 빼기
+     and not exists (select 1 from private.room_mutes x where x.room_id = new.room_id and x.user_id = s.user_id);
   if v_subs is null then return new; end if;
 
   select display_name into v_name from profiles where id = new.sender_id;

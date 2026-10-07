@@ -741,3 +741,11 @@ button.item:active { background: var(--soft-bg); }
 .invite-accept p { font-size: 15px; line-height: 1.6; color: var(--ink2); margin: 14px 0 6px; }
 .invite-accept p b { color: var(--mint-text); }
 #invBtns { margin-top: 12px; }
+
+/* v1.15: 채팅방 알림 끄기 */
+.mute-ic { display: inline-flex; align-items: center; flex: none; color: var(--ink4); }
+#roomTitle .mute-ic { margin-left: 4px; }
+.badge.muted { background: #B6BEC8; }
+.card-line.mute-line { margin: 4px 0 6px; }
+#roomMuteBtn { color: var(--ink2); }
+#roomMuteBtn.off { color: var(--ink4); }
