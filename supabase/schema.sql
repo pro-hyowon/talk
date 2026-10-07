@@ -1,5 +1,5 @@
 -- =====================================================================
---  미니톡(MiniTalk) v1.12 — Supabase 데이터베이스 설정 스크립트
+--  미니톡(MiniTalk) v1.14 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -209,6 +209,14 @@ create table if not exists private.room_cleanup (
   primary key (room_id, user_id)
 );
 revoke all on private.room_cleanup from public, anon, authenticated;
+
+-- v1.14: 친구 초대 링크·QR 코드 (회원마다 하나, 새로 만들면 예전 링크는 더 이상 안 됨)
+create table if not exists private.invite_codes (
+  user_id    uuid primary key references public.profiles(id) on delete cascade,
+  code       text not null unique check (code ~ '^[a-z0-9]{10,20}$'),
+  created_at timestamptz not null default now()
+);
+revoke all on private.invite_codes from public, anon, authenticated;
 
 -- ---------------------------------------------------------------------
 -- 2. 보조 함수 (보안 정책에서 사용)
@@ -1237,6 +1245,166 @@ end;
 $$;
 
 -- 강제 탈퇴 (계정·친구·참여 정보 삭제, 보낸 메시지는 "(알 수 없음)"으로 남음)
+-- v1.13: 관리자가 연결해 준 친구 알림 (앱 화면 + 앱을 닫아도 오는 알림)
+drop function if exists public.notify_connected(uuid, uuid);
+create or replace function public.notify_connected(p_to uuid, p_friend uuid, p_via text default 'admin')
+returns void language plpgsql security definer set search_path = public, extensions as $$
+declare
+  v_name    text;
+  v_user    text;
+  v_url     text;
+  v_secret  text;
+  v_preview boolean;
+  v_subs    jsonb;
+begin
+  select display_name, username into v_name, v_user from profiles where id = p_friend;
+  if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null then
+    begin
+      perform realtime.send(jsonb_build_object('friend_id', p_friend, 'display_name', v_name, 'username', v_user, 'via', p_via),
+                            'connected', 'user:' || p_to::text, true);
+    exception when others then null;
+    end;
+  end if;
+  if to_regclass('private.push_config') is null then return; end if;
+  select function_url, secret, show_preview into v_url, v_secret, v_preview from private.push_config where id = 1;
+  if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return; end if;
+  select jsonb_agg(jsonb_build_object('endpoint', s.endpoint, 'p256dh', s.p256dh, 'auth', s.auth))
+    into v_subs
+    from push_subscriptions s join profiles p on p.id = s.user_id and p.status = 'active'
+   where s.user_id = p_to;
+  if v_subs is null then return; end if;
+  perform net.http_post(
+    url := v_url,
+    body := jsonb_build_object('subs', v_subs, 'title', case when p_via = 'invite' then '새 친구' else '친구 연결' end,
+              'body', case when not coalesce(v_preview, true) then '새 친구가 생겼어요.'
+                           when p_via = 'invite' then coalesce(v_name, '회원') || '님이 내 초대 링크로 친구가 됐어요. 이제 대화할 수 있어요.'
+                           else '관리자가 ' || coalesce(v_name, '회원') || '님과 친구로 연결해 줬어요. 이제 대화할 수 있어요.' end),
+    headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
+    timeout_milliseconds := 8000
+  );
+exception when others then
+  raise warning 'notify_connected 실패: %', sqlerrm;   -- 알림 문제로 연결이 막히면 안 됨
+end;
+$$;
+
+-- v1.14: 내 초대 코드 (없으면 만듦)
+create or replace function public.my_invite_code()
+returns text language plpgsql security definer set search_path = public, private as $$
+declare
+  v_code text;
+begin
+  if not public.is_active() then raise exception '사용할 수 없는 계정이에요'; end if;
+  select code into v_code from private.invite_codes where user_id = auth.uid();
+  if v_code is null then
+    v_code := substr(replace(gen_random_uuid()::text, '-', ''), 1, 12);
+    insert into private.invite_codes (user_id, code) values (auth.uid(), v_code)
+    on conflict (user_id) do nothing;
+    select code into v_code from private.invite_codes where user_id = auth.uid();
+  end if;
+  return v_code;
+end;
+$$;
+
+-- v1.14: 초대 링크 새로 만들기 (예전 링크·QR 은 더 이상 안 됨)
+create or replace function public.reset_invite_code()
+returns text language plpgsql security definer set search_path = public, private as $$
+declare
+  v_code text := substr(replace(gen_random_uuid()::text, '-', ''), 1, 12);
+begin
+  if not public.is_active() then raise exception '사용할 수 없는 계정이에요'; end if;
+  insert into private.invite_codes (user_id, code, created_at) values (auth.uid(), v_code, now())
+  on conflict (user_id) do update set code = excluded.code, created_at = excluded.created_at;
+  return v_code;
+end;
+$$;
+
+-- v1.14: 초대 링크 주인 보기 (로그인 전에도 "○○님이 초대했어요" 를 보여 주려고)
+create or replace function public.invite_preview(p_code text)
+returns table (id uuid, username text, display_name text, avatar_url text, status_message text)
+language sql stable security definer set search_path = public, private as $$
+  select p.id, p.username, p.display_name, p.avatar_url, p.status_message
+    from private.invite_codes c join profiles p on p.id = c.user_id
+   where c.code = lower(trim(p_code)) and p.status = 'active';
+$$;
+
+-- v1.14: 초대 링크로 친구 되기 (바로 서로 친구 + 초대한 사람에게 알림)
+create or replace function public.accept_invite(p_code text)
+returns table (id uuid, username text, display_name text, avatar_url text, status_message text, already boolean)
+language plpgsql security definer set search_path = public, private as $$
+#variable_conflict use_column
+declare
+  v_me    uuid := auth.uid();
+  v_owner uuid;
+  v_new   boolean;
+begin
+  if v_me is null then raise exception '로그인이 필요해요'; end if;
+  if not public.is_active() then raise exception '가입 승인 후에 친구를 추가할 수 있어요'; end if;
+  perform public.use_lookup_quota(1);   -- 코드를 마구 대입해 보는 것을 막음
+  select c.user_id into v_owner from private.invite_codes c join profiles p on p.id = c.user_id
+   where c.code = lower(trim(p_code)) and p.status = 'active';
+  if v_owner is null then raise exception '초대 링크가 바뀌었거나 사용할 수 없어요. 새 링크를 받아 주세요'; end if;
+  if v_owner = v_me then raise exception '내 초대 링크예요. 친구에게 보내 주세요'; end if;
+  v_new := not public.is_mutual_friend(v_me, v_owner);
+  -- 두 줄을 한 번에 넣어야 '친구 요청' 알림이 따로 가지 않음
+  insert into friends (user_id, friend_id) values (v_me, v_owner), (v_owner, v_me) on conflict do nothing;
+  if v_new then
+    delete from friend_suggestions
+     where (user_id = v_me and suggested_id = v_owner) or (user_id = v_owner and suggested_id = v_me);
+    perform public.notify_connected(v_owner, v_me, 'invite');
+  end if;
+  return query select p.id, p.username, p.display_name, p.avatar_url, p.status_message, not v_new
+                 from profiles p where p.id = v_owner;
+end;
+$$;
+
+-- v1.13: 관리자가 한 회원과 여러 회원을 서로 친구로 연결 (새로 연결된 수를 돌려줌)
+create or replace function public.admin_connect_friends(p_user uuid, p_others uuid[])
+returns integer language plpgsql security definer set search_path = public as $$
+declare
+  v_me  uuid := public.admin_guard();
+  v_o   uuid;
+  v_n   integer := 0;
+  v_new boolean;
+begin
+  if not exists (select 1 from profiles where id = p_user and status = 'active') then
+    raise exception '이용 중인 회원만 친구로 연결할 수 있어요';
+  end if;
+  if coalesce(cardinality(p_others), 0) = 0 then return 0; end if;
+  if cardinality(p_others) > 200 then raise exception '한 번에 200명까지 연결할 수 있어요'; end if;
+  for v_o in select distinct x from unnest(p_others) as x loop
+    continue when v_o is null or v_o = p_user
+               or not exists (select 1 from profiles where id = v_o and status = 'active');
+    v_new := not public.is_mutual_friend(p_user, v_o);
+    -- 두 줄을 한 번에 넣어야 '친구 요청' 알림이 따로 가지 않음
+    insert into friends (user_id, friend_id) values (p_user, v_o), (v_o, p_user)
+    on conflict do nothing;
+    if v_new then
+      v_n := v_n + 1;
+      delete from friend_suggestions
+       where (user_id = p_user and suggested_id = v_o) or (user_id = v_o and suggested_id = p_user);
+      perform public.notify_connected(p_user, v_o);
+      perform public.notify_connected(v_o, p_user);
+    end if;
+  end loop;
+  return v_n;
+end;
+$$;
+
+-- v1.13: 회원의 친구 관계 (관리자 친구 연결 화면용: 내가 추가함 / 상대가 추가함)
+create or replace function public.admin_user_friends(p_user uuid)
+returns table (id uuid, added boolean, added_me boolean)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  perform public.admin_guard();
+  return query
+    select x.id, bool_or(x.a), bool_or(x.b) from (
+      select f.friend_id as id, true as a, false as b from friends f where f.user_id = p_user
+      union all
+      select f.user_id, false, true from friends f where f.friend_id = p_user
+    ) x group by x.id;
+end;
+$$;
+
 -- v1.12: 없어진 방에 남은 사진·파일 목록 (관리자 화면의 '저장 공간 정리')
 create or replace function public.admin_orphan_media()
 returns table (bucket text, name text, size bigint)
@@ -1404,9 +1572,11 @@ declare
     'get_my_phone()', 'set_my_phone(text, boolean)', 'set_phone_findable(boolean)',
     'match_contacts(text[], text[])', 'match_contacts_detail(text[], text[])', 'my_suggestions()', 'dismiss_suggestion(uuid)', 'admin_clear_phone(uuid)',
     'my_friend_requests()', 'dismiss_request(uuid)', 'kick_from_room(uuid, uuid)', 'delete_message(bigint)', 'react_message(bigint, text)',
+    'my_invite_code()', 'reset_invite_code()', 'invite_preview(text)', 'accept_invite(text)',
     'admin_list_users(text)', 'admin_set_status(uuid, text)', 'admin_set_admin(uuid, boolean)',
     'admin_reset_password(uuid)', 'admin_delete_user(uuid)', 'admin_get_settings()',
-    'admin_set_settings(boolean)', 'admin_broadcast(text)', 'admin_orphan_media()'];
+    'admin_set_settings(boolean)', 'admin_broadcast(text)', 'admin_orphan_media()',
+    'admin_connect_friends(uuid, uuid[])', 'admin_user_friends(uuid)'];
   helper_fns text[] := array[
     'is_active()', 'is_active_user(uuid)', 'is_admin()', 'is_room_member(uuid)', 'is_room_member_text(text)',
     'shares_room_with(uuid)', 'is_notice_room(uuid)', 'admin_guard()',
@@ -1422,6 +1592,8 @@ begin
   execute 'revoke execute on function public.join_notice_room(uuid) from public, anon, authenticated';
   execute 'revoke execute on function public.use_lookup_quota(integer) from public, anon, authenticated';
   execute 'revoke execute on function public.notify_friend_request(uuid, uuid) from public, anon, authenticated';
+  execute 'revoke execute on function public.notify_connected(uuid, uuid, text) from public, anon, authenticated';
+  execute 'grant execute on function public.invite_preview(text) to anon';   -- 로그인 전 초대 화면용
 end;
 $$;
 

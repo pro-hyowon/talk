@@ -14,7 +14,7 @@ function friendly(error) {
   const map = [
     [/Invalid login credentials/i, '아이디 또는 비밀번호가 맞지 않아요'],
     [/banned/i, '이용이 정지된 계정이에요. 관리자에게 문의해 주세요'],
-    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found|'reply_to' column/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/already registered|already exists/i, '이미 사용 중인 아이디예요'],
     [/Database error saving new user/i, '가입할 수 없는 아이디예요. 영문 소문자·숫자·밑줄(_) 3~20자로 입력해 주세요'],
@@ -118,6 +118,11 @@ export function createApi() {
     },
     async listSuggestions() { return must(await sb.rpc('my_suggestions')); },
     async dismissSuggestion(id) { must(await sb.rpc('dismiss_suggestion', { p_user: id })); },
+    // v1.14: 친구 초대 링크
+    async myInviteCode() { return must(await sb.rpc('my_invite_code')); },
+    async resetInviteCode() { return must(await sb.rpc('reset_invite_code')); },
+    async invitePreview(code) { return (must(await sb.rpc('invite_preview', { p_code: code })) || [])[0] || null; },
+    async acceptInvite(code) { return (must(await sb.rpc('accept_invite', { p_code: code })) || [])[0] || null; },
     async listRequests() { return must(await sb.rpc('my_friend_requests')); },
     async dismissRequest(id) { must(await sb.rpc('dismiss_request', { p_user: id })); },
     async listFriends() { return must(await sb.rpc('my_friends')); },
@@ -240,6 +245,8 @@ export function createApi() {
     async touchLastSeen() { must(await sb.rpc('touch_last_seen')); },
 
     // ---------- 관리자 ----------
+    async adminConnectFriends(userId, ids) { return must(await sb.rpc('admin_connect_friends', { p_user: userId, p_others: ids })) || 0; },
+    async adminUserFriends(userId) { return must(await sb.rpc('admin_user_friends', { p_user: userId })) || []; },
     async adminOrphanMedia() { return must(await sb.rpc('admin_orphan_media')) || []; },
     async adminSettings() { return must(await sb.rpc('admin_get_settings'))[0]; },
     async adminSetApproval(on) { must(await sb.rpc('admin_set_settings', { p_require_approval: on })); },
@@ -266,7 +273,7 @@ export function createApi() {
     // 기본: 내 전용 비공개 채널(user:<내 ID>)로 내가 속한 방의 새 메시지만 받음 (Broadcast).
     //   → 접속자가 많아도 메시지 1건당 그 방 참여자에게만 전달돼 빠름.
     // 데이터베이스가 아직 v1.6 이 아니면(채널 권한 없음) 예전 방식(Postgres Changes)으로 자동 전환.
-    subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction }) {
+    subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected }) {
       let closed = false; let ch = null; let joined = false;
       const legacy = () => {
         rtMode = 'legacy';
@@ -287,6 +294,7 @@ export function createApi() {
           .on('broadcast', { event: 'kicked' }, ({ payload }) => payload && onKicked && onKicked(payload))
           .on('broadcast', { event: 'deleted' }, ({ payload }) => payload && onDeleted && onDeleted(payload))
           .on('broadcast', { event: 'reaction' }, ({ payload }) => payload && onReaction && onReaction(payload))
+          .on('broadcast', { event: 'connected' }, ({ payload }) => payload && onConnected && onConnected(payload))
           .subscribe((status) => {
             if (status === 'SUBSCRIBED') joined = true;
             if (!joined && status === 'CHANNEL_ERROR' && !closed) {

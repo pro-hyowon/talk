@@ -4,8 +4,9 @@
 import { CONFIG } from './config.js';
 import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
+import { qrSvg } from './qr.js';
 
-const VERSION = '1.12.0';
+const VERSION = '1.14.0';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 const APP = CONFIG.APP_NAME;
 const app = document.getElementById('app');
@@ -315,6 +316,7 @@ const splashHtml = () => `<div class="splash">${ic('appicon', 96)}<div class="sp
 
 async function boot() {
   document.title = APP;
+  captureInviteFromUrl();
   app.innerHTML = splashHtml();
   setOffline(!navigator.onLine);
   if (!api) return renderFatal('서버 연결 모듈을 불러오지 못했어요. 인터넷 연결을 확인한 뒤 새로고침해 주세요.');
@@ -385,6 +387,7 @@ function renderAuth(mode = 'login') {
     : '<div class="foot-note">비밀번호를 잊었다면 관리자에게 초기화를 요청하세요.</div>'}`);
 
   setOffline(!navigator.onLine);
+  showInviteBanner();
   $$('.seg button').forEach((b) => (b.onclick = () => renderAuth(b.dataset.mode)));
   const form = $('#authForm');
   form.addEventListener('input', (e) => { if (e.target.name) setFieldErr(form, e.target.name, ''); });
@@ -439,11 +442,12 @@ async function enterApp(id) {
   if (S.me.status && S.me.status !== 'active') { renderBlocked(S.me.status); return; }
   cacheProfile(S.me);
   buildShell();
-  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction });
+  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected });
   await Promise.all([loadFriends(), loadRooms()]).catch(showErr);
   loadSuggestions();
   loadRequests();
   route();
+  handlePendingInvite();
   touchLastSeen();
   enablePush({ silent: true }).then(() => { if (S.tab === 'more' && !S.room) renderMain(); }).catch((e) => console.warn('push', e));
 }
@@ -514,6 +518,7 @@ function buildShell() {
 // 화면 이동 (주소 #/friends, #/chats, #/more, #/admin, #/room/<id>)
 // ---------------------------------------------------------------------
 function route() {
+  if (captureInviteFromUrl() && S.entered && $('#main')) setTimeout(handlePendingInvite, 0);
   if (!S.entered || !$('#main')) return;
   const h = location.hash;
   const m = h.match(/^#\/room\/([0-9a-f-]{36})$/i);
@@ -622,6 +627,8 @@ function renderMain() {
       <button class="me-card me" data-act="profile" data-id="${esc(me.id)}">${av(me, 60)}
         <div class="meta"><div class="name">${esc(me.display_name)}</div><div class="desc">${esc(me.status_message || '상태메시지를 입력해 보세요')}</div></div>
         <span class="chip-mine">내 프로필</span></button>
+      <button class="find-card" data-act="invite"><span class="tile lav">${ic('share', 20)}</span>
+        <span class="meta"><span class="name">친구 초대 링크·QR</span><span class="desc">링크·QR만 보내면 바로 친구가 돼요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="find-card" data-act="contacts"><span class="tile mint">${ic('book', 20)}</span>
         <span class="meta"><span class="name">연락처로 친구 찾기</span><span class="desc">내 연락처에 있는 ${esc(APP)} 친구를 추천해 드려요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       ${S.requests.length ? `<div class="sec">받은 친구 요청 ${S.requests.length}</div>${S.requests.map((g) => `
@@ -639,7 +646,7 @@ function renderMain() {
           <div class="meta"><div class="name">${esc(f.display_name)}</div>${f.mutual === false ? '<div class="desc">아직 상대방이 나를 추가하지 않았어요</div>' : f.status_message ? `<div class="desc">${esc(f.status_message)}</div>` : ''}</div></button>`).join('')}`
     : (sugList().length || S.requests.length) ? '<div class="empty-line" style="padding-top:20px">아직 친구가 없어요. 받은 요청이나 추천 친구를 추가하거나 아이디·휴대폰 번호로 찾아보세요.</div>'
     : `<div class="empty-state" style="padding-top:28px"><div class="es-icon lav">${ic('logo', 64)}</div><b>아직 친구가 없어요</b><p>친구의 아이디나 휴대폰 번호로 찾아서 추가해 보세요.</p>
-        <button class="btn sm" data-act="add-friend">${ic('userplus', 20)}친구 추가하기</button></div>`}`;
+        <button class="btn sm" data-act="invite">${ic('share', 20)}친구 초대하기</button></div>`}`;
   } else if (S.tab === 'chats') {
     head.innerHTML = `<h1>채팅</h1><button class="ibtn" data-act="new-chat" aria-label="새 채팅">${ic('chatplus', 24)}</button>`;
     if (!S.roomsLoaded) { body.innerHTML = '<div class="spinner"></div>'; return; }
@@ -1934,12 +1941,16 @@ function showAddFriend() {
     body: `<form id="findForm" class="find-row"><div class="find-input" id="findBox">${ic('search', 20, 'flex:none;color:var(--ink3)')}<input name="q" placeholder="아이디 또는 휴대폰 번호" autocapitalize="off" spellcheck="false" autocomplete="off"></div>
         <button class="find-btn" type="submit">검색</button></form>
       <div id="findResult"><div class="idle-text">친구의 아이디나 휴대폰 번호로 찾아보세요.<br>내 아이디는 <b>@${esc(S.me.username)}</b> 이에요.</div>
-        <button class="btn soft" data-x="contacts" style="font-size:15px">${ic('book', 20)}연락처로 친구 찾기</button></div>`,
+        <div class="btn-col"><button class="btn soft" data-x="invite" style="font-size:15px">${ic('share', 20)}초대 링크·QR로 친구 추가</button>
+        <button class="btn line" data-x="contacts" style="font-size:15px">${ic('book', 20)}연락처로 친구 찾기</button></div></div>`,
     onMount(sheet, close) {
       const form = $('#findForm', sheet); const out = $('#findResult', sheet); const box = $('#findBox', sheet);
       setTimeout(() => form.q.focus(), 50);
       form.q.oninput = () => box.classList.remove('err');
-      sheet.addEventListener('click', (e) => { if (e.target.closest('[data-x=contacts]')) { close(); showContacts(); } });
+      sheet.addEventListener('click', (e) => {
+        if (e.target.closest('[data-x=contacts]')) { close(); showContacts(); }
+        if (e.target.closest('[data-x=invite]')) { close(); showInvite(); }
+      });
       form.onsubmit = async (e) => {
         e.preventDefault();
         const raw = form.q.value.trim();
@@ -2225,8 +2236,10 @@ function showContacts() {
 
 // 앱 주소 보내기 (친구 초대)
 async function shareApp() {
-  const url = new URL('./', location.href).href;   // 앱이 있는 폴더 주소
-  const text = `${APP}에서 같이 대화해요! 가입하고 휴대폰 번호를 등록하면 친구로 찾을 수 있어요.`;
+  // v1.14: 내 초대 링크를 보내면 상대가 가입하자마자 바로 친구가 됨
+  let url = new URL('./', location.href).href;   // 앱이 있는 폴더 주소
+  let text = `${APP}에서 같이 대화해요! 가입하고 휴대폰 번호를 등록하면 친구로 찾을 수 있어요.`;
+  try { const code = await api.myInviteCode(); url = inviteUrl(code); text = `${S.me.display_name}님이 ${APP}에 초대했어요. 링크를 누르고 가입하면 바로 친구가 돼요.`; } catch { /* 예전 데이터베이스면 앱 주소만 */ }
   try {
     if (navigator.share) { await navigator.share({ title: APP, text, url }); return; }
   } catch (e) { if (e && e.name === 'AbortError') return; }
@@ -2566,6 +2579,193 @@ function renderAdmin() {
   renderAdminList();
 }
 
+// ---------------------------------------------------------------------
+// v1.14: 친구 초대 링크·QR — 링크를 누르면(QR 을 찍으면) 바로 서로 친구
+// ---------------------------------------------------------------------
+const INVITE_KEY = 'minitalk-invite';
+const INVITE_RE = /^#\/add\/([a-z0-9]{10,20})$/i;
+const inviteUrl = (code) => new URL('./', location.href).href + '#/add/' + code;
+function savePendingInvite(code) { try { localStorage.setItem(INVITE_KEY, String(code).toLowerCase()); } catch { S.pendingInvite = String(code).toLowerCase(); } }
+function takePendingInvite() {
+  let c = S.pendingInvite || null;
+  try { c = localStorage.getItem(INVITE_KEY) || c; localStorage.removeItem(INVITE_KEY); } catch { /* 저장 안 됨 */ }
+  S.pendingInvite = null;
+  return c;
+}
+function peekPendingInvite() { try { return localStorage.getItem(INVITE_KEY) || S.pendingInvite; } catch { return S.pendingInvite; } }
+// 주소창에 초대 링크가 있으면 기억해 두고 주소는 정리 (로그인 전이어도)
+function captureInviteFromUrl() {
+  const m = location.hash.match(INVITE_RE);
+  if (!m) return false;
+  savePendingInvite(m[1]);
+  history.replaceState(null, '', location.pathname + location.search + '#/friends');
+  return true;
+}
+
+// 로그인 화면 위쪽: "○○님이 초대했어요"
+async function showInviteBanner() {
+  const code = peekPendingInvite(); if (!code) return;
+  let p = null;
+  try { p = await api.invitePreview(code); } catch { /* 무시 */ }
+  const card = $('.auth-card'); if (!card || $('#inviteBanner')) return;
+  card.insertAdjacentHTML('beforebegin', `<div class="invite-banner" id="inviteBanner">${p ? av(p, 44) : `<span class="tile mint">${ic('userplus', 22)}</span>`}
+    <div><b>${p ? `${esc(p.display_name)}님이 초대했어요` : '친구 초대 링크로 들어왔어요'}</b><span>가입하거나 로그인하면 바로 친구가 돼요</span></div></div>`);
+}
+
+// 로그인한 뒤 기억해 둔 초대 처리
+async function handlePendingInvite() {
+  const code = takePendingInvite(); if (!code || !S.entered) return;
+  let p = null;
+  try { p = await api.invitePreview(code); } catch (e) { showErr(e); return; }
+  if (!p) { toast('초대 링크가 바뀌었거나 사용할 수 없어요. 새 링크를 받아 주세요', { error: true, ms: 4000 }); return; }
+  if (p.id === S.uid) { toast('내 초대 링크예요. 친구에게 보내 주세요'); return; }
+  cacheProfile(p);
+  const already = S.friends.some((f) => f.id === p.id && f.mutual !== false);
+  openSheet({
+    title: '친구 초대', bare: true,
+    body: `<div class="invite-accept">${av(p, 84)}<b class="nm">${esc(p.display_name)}</b><span class="id">@${esc(p.username)}</span>
+        ${p.status_message ? `<span class="st">${esc(p.status_message)}</span>` : ''}
+        <p id="invMsg">${already ? '이미 서로 친구예요.' : `${esc(p.display_name)}님이 ${esc(APP)}에 초대했어요.<br>친구로 추가하면 바로 대화할 수 있어요.`}</p></div>
+      <div class="btn-col" id="invBtns">${already
+    ? `<button class="btn" data-x="chat">${ic('chat', 20)}1:1 대화하기</button><button class="btn text" data-close>닫기</button>`
+    : `<button class="btn" data-x="accept">${ic('userplus', 20)}친구 추가</button><button class="btn text" data-close>나중에</button>`}</div>`,
+    onMount(sheet, close) {
+      sheet.addEventListener('click', async (e) => {
+        const x = e.target.closest('[data-x]'); if (!x) return;
+        if (x.dataset.x === 'chat') {
+          x.disabled = true;
+          try { const rid = await api.openDM(p.id); close(); goRoom(rid); } catch (ex) { x.disabled = false; showErr(ex); }
+          return;
+        }
+        x.disabled = true; x.innerHTML = '<span class="spin-sm"></span>';
+        try {
+          await api.acceptInvite(code);
+          await loadFriends(); loadSuggestions(); loadRequests();
+          if (S.tab === 'friends' && !S.room) renderMain();
+          $('#invMsg', sheet).innerHTML = `${esc(p.display_name)}님과 이제 <b>서로 친구</b>예요.<br>바로 대화를 시작해 보세요.`;
+          $('#invBtns', sheet).innerHTML = `<button class="btn" data-x="chat">${ic('chat', 20)}1:1 대화하기</button><button class="btn text" data-close>닫기</button>`;
+        } catch (ex) { x.disabled = false; x.innerHTML = `${ic('userplus', 20)}친구 추가`; showErr(ex); }
+      });
+    },
+  });
+}
+
+// 내 초대 링크·QR 보여 주기
+async function showInvite() {
+  let code = null;
+  openSheet({
+    title: '친구 초대',
+    body: `<div class="sub-text">링크를 보내거나 QR 코드를 보여 주세요. 상대가 누르거나 찍으면 바로 서로 친구가 돼요.</div>
+      <div class="qr-box" id="qrBox"><div class="spinner"></div></div>
+      <div class="qr-link" id="qrLink"></div>
+      <div class="two" style="margin-top:14px"><button class="btn" data-x="share" disabled>${ic('share', 20)}링크 보내기</button><button class="btn soft" data-x="copy" disabled>${ic('copy', 20)}링크 복사</button></div>
+      <div class="invite-foot"><span>링크가 원치 않는 사람에게 퍼졌다면</span><button class="link-btn" data-x="reset">새 링크 만들기</button></div>`,
+    async onMount(sheet, close) {
+      const draw = () => {
+        const url = inviteUrl(code);
+        $('#qrBox', sheet).innerHTML = qrSvg(url, 208) + `<div class="qr-cap">${av(S.me, 28)}<b>${esc(S.me.display_name)}</b><span>@${esc(S.me.username)}</span></div>`;
+        $('#qrLink', sheet).textContent = url;
+        $$('[data-x=share], [data-x=copy]', sheet).forEach((b) => { b.disabled = false; });
+      };
+      sheet.addEventListener('click', async (e) => {
+        const x = e.target.closest('[data-x]'); if (!x || !code) return;
+        const url = inviteUrl(code);
+        const text = `${S.me.display_name}님이 ${APP}에 초대했어요. 링크를 누르면 바로 친구가 돼요.`;
+        if (x.dataset.x === 'share') {
+          try { if (navigator.share) { await navigator.share({ title: `${APP} 친구 초대`, text, url }); return; } } catch (ex) { if (ex && ex.name === 'AbortError') return; }
+          try { await navigator.clipboard.writeText(`${text}\n${url}`); toast('초대 링크를 복사했어요. 카톡·문자에 붙여 넣어 보내세요'); } catch { toast('링크를 길게 눌러 복사해 주세요', { error: true }); }
+        }
+        if (x.dataset.x === 'copy') {
+          try { await navigator.clipboard.writeText(url); toast('초대 링크를 복사했어요'); } catch { toast('링크를 길게 눌러 복사해 주세요', { error: true }); }
+        }
+        if (x.dataset.x === 'reset') {
+          close();
+          if (!(await ask('새 초대 링크를 만들까요?', '지금까지 보낸 링크와 QR 코드는 더 이상 쓸 수 없어요. 이미 친구가 된 사람은 그대로예요.', '새로 만들기'))) return;
+          try { await api.resetInviteCode(); toast('새 초대 링크를 만들었어요'); showInvite(); } catch (ex) { showErr(ex); }
+        }
+      });
+      try { code = await api.myInviteCode(); if (sheet.isConnected) draw(); }
+      catch (ex) { const b = $('#qrBox', sheet); if (b) b.innerHTML = `<div class="empty-line">${esc(ex.message || '불러오지 못했어요')}</div>`; }
+    },
+  });
+}
+
+// v1.13: 관리자가 회원끼리 친구로 연결
+async function showConnectFriends(u) {
+  let rel;
+  try { rel = await api.adminUserFriends(u.id); } catch (e) { showErr(e); return; }
+  const relMap = new Map((rel || []).map((r) => [r.id, r]));
+  const people = S.admin.users.filter((x) => x.id !== u.id && x.status === 'active')
+    .sort((a, b) => {
+      const ra = relMap.get(a.id); const rb = relMap.get(b.id);
+      const k = (r) => (r && r.added && r.added_me ? 2 : 0);   // 이미 친구는 아래로
+      return k(ra) - k(rb) || a.display_name.localeCompare(b.display_name, 'ko');
+    });
+  const sel = [];
+  const state = (x) => { const r = relMap.get(x.id); return r && r.added && r.added_me ? 'mutual' : r && (r.added || r.added_me) ? 'oneway' : ''; };
+  openSheet({
+    title: `${u.display_name}님과 친구 연결`,
+    body: `<div class="sub-text">고른 회원과 ${esc(u.display_name)}님을 <b>서로 친구</b>로 바로 연결해요. 양쪽 모두에게 알림이 가고, 바로 대화할 수 있어요.</div>
+      <label class="search" style="margin:0 0 10px">${ic('search', 20, 'flex:none')}<input id="cnSearch" placeholder="이름·아이디 검색" autocapitalize="off" spellcheck="false"></label>
+      <div class="sel-chips" id="cnChips" hidden></div>
+      <div class="pick-list bleed" id="cnList" style="max-height:320px"></div>
+      <button class="btn" id="cnOk" disabled style="margin-top:14px">연결할 회원을 고르세요</button>`,
+    onMount(sheet, close) {
+      const list = $('#cnList', sheet); const chips = $('#cnChips', sheet); const ok = $('#cnOk', sheet); const q = $('#cnSearch', sheet);
+      const draw = () => {
+        const t = q.value.trim().toLowerCase().replace(/^@/, '');
+        const shown = people.filter((x) => !t || x.display_name.toLowerCase().includes(t) || x.username.includes(t));
+        list.innerHTML = shown.length ? shown.map((x) => {
+          const st = state(x); const on = sel.includes(x.id);
+          return `<button class="pick ${on ? 'on' : ''} ${st === 'mutual' ? 'done' : ''}" data-cn="${esc(x.id)}" role="checkbox" aria-checked="${on}" ${st === 'mutual' ? 'disabled' : ''}>${av(x, 44)}
+            <span class="nm"><span class="cn-n">${esc(x.display_name)}</span><span class="cn-d">@${esc(x.username)}${st === 'oneway' ? ' · 한쪽만 추가된 상태' : ''}</span></span>
+            ${st === 'mutual' ? '<span class="cres-tag">이미 친구</span>' : `<span class="ck">${ic('check', 16)}</span>`}</button>`;
+        }).join('') : '<div class="empty-line">연결할 수 있는 회원이 없어요</div>';
+        chips.hidden = !sel.length;
+        chips.innerHTML = sel.map((id) => { const x = people.find((p) => p.id === id); return `<button class="sel-chip" data-uncn="${esc(id)}" aria-label="${esc(x.display_name)} 선택 해제">${av(x, 32)}${esc(x.display_name)}${ic('x', 14)}</button>`; }).join('');
+        ok.disabled = !sel.length;
+        ok.textContent = sel.length ? `${sel.length}명과 친구로 연결` : '연결할 회원을 고르세요';
+      };
+      q.oninput = draw;
+      sheet.addEventListener('click', async (e) => {
+        const b = e.target.closest('[data-cn]'); const c = e.target.closest('[data-uncn]');
+        const id = b ? b.dataset.cn : c ? c.dataset.uncn : null;
+        if (id && !(b && b.disabled)) { const i = sel.indexOf(id); if (i >= 0) sel.splice(i, 1); else if (b) sel.push(id); draw(); return; }
+        if (e.target.closest('#cnOk') && sel.length) {
+          ok.disabled = true; ok.innerHTML = '<span class="spin-sm"></span>';
+          try {
+            const n = await api.adminConnectFriends(u.id, sel);
+            close();
+            toast(n ? `${u.display_name}님과 ${n}명을 서로 친구로 연결했어요` : '이미 모두 친구예요', { ms: 3200 });
+            if (u.id === S.uid || sel.includes(S.uid)) { loadFriends().then(() => { if (S.tab === 'friends' && !S.room) renderMain(); }).catch(() => {}); }
+            loadAdmin();
+          } catch (ex) { draw(); showErr(ex); }
+        }
+      });
+      draw();
+    },
+  });
+}
+
+// 관리자가 나를 누군가와 친구로 연결해 줬을 때
+function onConnected(p) {
+  cacheProfile({ id: p.friend_id, display_name: p.display_name, username: p.username });
+  loadFriends().then(() => { if (S.tab === 'friends' && !S.room && $('#main')) renderMain(); }).catch(() => {});
+  loadSuggestions(); loadRequests();
+  const person = { id: p.friend_id, display_name: p.display_name || '회원' };
+  const invite = p.via === 'invite';
+  const text = invite ? `${person.display_name}님이 내 초대 링크로 친구가 됐어요. 이제 대화할 수 있어요`
+    : `관리자가 ${person.display_name}님과 친구로 연결해 줬어요. 이제 대화할 수 있어요`;
+  if (document.hidden) {
+    if (S.pushOn) return;   // 서버 알림이 대신 보여 줌
+    if ('Notification' in window && Notification.permission === 'granted' && navigator.serviceWorker) {
+      navigator.serviceWorker.ready.then((reg) => reg.showNotification(invite ? '새 친구' : '친구 연결', { body: text, tag: 'conn-' + p.friend_id, icon: './icons/icon-192.png', badge: './icons/badge-72.png', data: { url: './#/friends' } })).catch(() => {});
+    }
+    return;
+  }
+  toastMsg({ person, title: invite ? '새 친구' : '친구 연결', body: text, onClick: () => showProfile(p.friend_id) });
+}
+
 function showAdminUser(id) {
   const u = S.admin && S.admin.users.find((x) => x.id === id);
   if (!u) return;
@@ -2579,6 +2779,7 @@ function showAdminUser(id) {
     admin: [B('관리자 해제', 'admin', 'line'), B('비밀번호 초기화', 'reset', 'line')],
   }[s];
   if (u.phone) btns.splice(btns.length - (s === 'admin' ? 0 : 1), 0, `<button class="btn md line" data-x="clearphone">휴대폰 번호 삭제</button>`);
+  if (s === 'active' || s === 'admin') btns.unshift(`<button class="btn md soft" data-x="connect">${ic('userplus', 18)}친구 연결</button>`);   // v1.13
   openSheet({
     title: '회원 정보',
     body: `<div class="m-head">${av(u, 64)}<div class="meta" style="gap:6px"><div class="nm"><b>${esc(u.display_name)}</b>${stChip(u)}</div><span class="desc">@${esc(u.username)}</span></div></div>
@@ -2597,6 +2798,7 @@ function showAdminUser(id) {
         const act = x.dataset.x;
         const n = u.display_name;
         try {
+          if (act === 'connect') { close(); showConnectFriends(u); return; }
           if (act === 'approve') {
             await api.adminSetStatus(u.id, 'active'); close(); toast(`${n}님의 가입을 승인했어요`);
           } else if (act === 'unsuspend') {
@@ -2697,6 +2899,7 @@ app.addEventListener('click', async (e) => {
     case 'pick-sticker': pickSticker(el.dataset.id); break;
     case 'unpick-sticker': unpickSticker(); break;
     case 'contacts': showContacts(); break;
+    case 'invite': showInvite(); break;
     case 'phone': showPhone(); break;
     case 'sug-add': {
       const g = S.suggestions.find((x) => x.id === el.dataset.id);
