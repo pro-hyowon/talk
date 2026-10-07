@@ -14,7 +14,7 @@ function friendly(error) {
   const map = [
     [/Invalid login credentials/i, '아이디 또는 비밀번호가 맞지 않아요'],
     [/banned/i, '이용이 정지된 계정이에요. 관리자에게 문의해 주세요'],
-    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found|'reply_to' column/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/already registered|already exists/i, '이미 사용 중인 아이디예요'],
     [/Database error saving new user/i, '가입할 수 없는 아이디예요. 영문 소문자·숫자·밑줄(_) 3~20자로 입력해 주세요'],
@@ -134,7 +134,25 @@ export function createApi() {
     async openDM(otherId) { return must(await sb.rpc('get_or_create_dm', { p_other: otherId })); },
     async createGroup(title, ids) { return must(await sb.rpc('create_group', { p_title: title, p_members: ids })); },
     async inviteToRoom(roomId, ids) { must(await sb.rpc('invite_to_room', { p_room: roomId, p_members: ids })); },
-    async leaveRoom(roomId) { must(await sb.rpc('leave_room', { p_room: roomId })); },
+    // v1.12: 마지막으로 나가면 서버가 그 방의 사진·파일 목록을 돌려줌 → 저장 공간에서도 지움
+    async leaveRoom(roomId) {
+      const r = must(await sb.rpc('leave_room', { p_room: roomId })) || {};
+      if (Array.isArray(r.files) && r.files.length) r.removed = await api.removeMedia(r.files.map((f) => ({ bucket: f.b, name: f.n })));
+      return r;
+    },
+    async removeMedia(list) {
+      let removed = 0;
+      for (const b of ['chat-images', 'chat-files']) {
+        const names = list.filter((x) => x.bucket === b).map((x) => x.name);
+        for (let i = 0; i < names.length; i += 100) {
+          try {
+            const { data, error } = await sb.storage.from(b).remove(names.slice(i, i + 100));
+            if (!error) removed += (data || []).length;
+          } catch { /* 남은 파일은 관리자 화면에서 정리 */ }
+        }
+      }
+      return removed;
+    },
     async kickFromRoom(roomId, userId) { must(await sb.rpc('kick_from_room', { p_room: roomId, p_user: userId })); },
     async markRead(roomId) { must(await sb.rpc('mark_read', { p_room: roomId })); },
     async getRoom(roomId) {
@@ -222,6 +240,7 @@ export function createApi() {
     async touchLastSeen() { must(await sb.rpc('touch_last_seen')); },
 
     // ---------- 관리자 ----------
+    async adminOrphanMedia() { return must(await sb.rpc('admin_orphan_media')) || []; },
     async adminSettings() { return must(await sb.rpc('admin_get_settings'))[0]; },
     async adminSetApproval(on) { must(await sb.rpc('admin_set_settings', { p_require_approval: on })); },
     async adminListUsers(q) { return must(await sb.rpc('admin_list_users', { p_query: q || '' })); },

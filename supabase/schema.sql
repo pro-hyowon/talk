@@ -1,5 +1,5 @@
 -- =====================================================================
---  미니톡(MiniTalk) v1.11 — Supabase 데이터베이스 설정 스크립트
+--  미니톡(MiniTalk) v1.12 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -64,6 +64,9 @@ create table if not exists public.room_members (
   primary key (room_id, user_id)
 );
 create index if not exists room_members_user_idx on public.room_members(user_id);
+-- v1.12: 이 번호보다 큰 메시지만 보임 (나갔다가 다시 들어오거나 나중에 초대된 사람은 들어온 뒤의 대화만)
+--        -1 = 처음부터 전부 (기존 참여자·공지방)
+alter table public.room_members add column if not exists history_from bigint not null default -1;
 
 -- 메시지 (kind: text=글, image=사진, sticker=이모티콘, file=파일, contact=연락처, system=입장·퇴장 안내)
 create table if not exists public.messages (
@@ -140,10 +143,15 @@ create index if not exists message_reactions_room_idx on public.message_reaction
 create index if not exists message_reactions_user_idx on public.message_reactions(user_id);
 
 alter table public.messages drop constraint if exists messages_file_check;
+drop index if exists public.messages_media_idx;
 alter table public.messages add constraint messages_file_check check (
   case when kind = 'file' then public.valid_file_msg(content, room_id, sender_id)
        when kind = 'contact' then public.valid_contact_msg(content)
        else true end);
+-- v1.12: 사진·파일 권한 확인을 빠르게 (메시지에 담긴 파일 경로로 찾기)
+create index if not exists messages_media_idx on public.messages
+  (room_id, (case when kind = 'file' then content::jsonb ->> 'path' else content end))
+  where kind in ('image', 'file');
 
 -- v1.5 추가: 휴대폰 번호 (본인과 관리자만 볼 수 있음. findable = 번호로 나를 찾을 수 있게 허용)
 create table if not exists public.user_phones (
@@ -193,6 +201,15 @@ create table if not exists private.friend_request_log (
 );
 revoke all on private.friend_request_log from public, anon, authenticated;
 
+-- v1.12: 마지막 사람이 나가 없어진 방의 사진·파일을 그 사람이 지울 수 있게 잠깐(10분) 허락
+create table if not exists private.room_cleanup (
+  room_id uuid not null,
+  user_id uuid not null,
+  at      timestamptz not null default now(),
+  primary key (room_id, user_id)
+);
+revoke all on private.room_cleanup from public, anon, authenticated;
+
 -- ---------------------------------------------------------------------
 -- 2. 보조 함수 (보안 정책에서 사용)
 -- ---------------------------------------------------------------------
@@ -231,6 +248,48 @@ returns boolean language sql stable security definer set search_path = public as
     select 1 from room_members m join profiles p on p.id = m.user_id
      where m.room_id::text = p_room and m.user_id = auth.uid() and p.status = 'active'
   );
+$$;
+
+-- v1.12: 이 메시지를 볼 수 있나? (참여자이고, 내가 들어온 뒤의 메시지)
+create or replace function public.can_see_message(p_room uuid, p_id bigint)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from room_members m join profiles p on p.id = m.user_id
+     where m.room_id = p_room and m.user_id = auth.uid() and p.status = 'active' and p_id > m.history_from
+  );
+$$;
+
+-- v1.12: 채팅 사진·파일을 볼 수 있나? (내가 볼 수 있는 메시지에 담긴 파일이거나, 내가 올린 파일)
+create or replace function public.can_read_chat_object(p_name text)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from room_members m
+      join profiles p on p.id = m.user_id and p.status = 'active'
+      join messages g on g.room_id = m.room_id
+     where m.user_id = auth.uid()
+       and m.room_id::text = split_part(p_name, '/', 1)
+       and g.kind in ('image', 'file')
+       and (case when g.kind = 'file' then g.content::jsonb ->> 'path' else g.content end) = p_name
+       and g.id > m.history_from
+  ) or (
+    split_part(p_name, '/', 2) like auth.uid()::text || '-%'
+    and public.is_room_member_text(split_part(p_name, '/', 1))
+  );
+$$;
+
+-- v1.12: 내가 방금 비운 방의 파일인가? (마지막으로 나간 사람이 10분 안에 정리)
+create or replace function public.can_cleanup_folder(p_folder text)
+returns boolean language sql stable security definer set search_path = public, private as $$
+  select exists (
+    select 1 from private.room_cleanup c
+     where c.room_id::text = p_folder and c.user_id = auth.uid() and c.at > now() - interval '10 minutes'
+  ) and not exists (select 1 from rooms r where r.id::text = p_folder);
+$$;
+
+-- v1.12: 없어진 방에 남은 파일인가? (관리자 정리용)
+create or replace function public.is_orphan_folder(p_folder text)
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.is_admin() and not exists (select 1 from rooms r where r.id::text = p_folder);
 $$;
 
 -- 이 사람과 같은 방에 있는가?
@@ -363,8 +422,8 @@ begin
   end if;
 
   if v_dm_key is not null then
-    insert into room_members (room_id, user_id, last_read_id)
-    select new.room_id, x::uuid, new.id - 1
+    insert into room_members (room_id, user_id, last_read_id, history_from)
+    select new.room_id, x::uuid, new.id - 1, new.id - 1   -- 다시 들어온 사람은 이 메시지부터 보임
       from unnest(string_to_array(v_dm_key, ':')) as x
      where exists (select 1 from profiles p where p.id::text = x)
     on conflict (room_id, user_id) do nothing;
@@ -722,7 +781,10 @@ returns table (
   last_message_at timestamptz, unread integer, member_count integer, members jsonb
 )
 language sql stable security definer set search_path = public as $$
-  select r.id, r.is_group, r.is_notice, r.title, r.last_message, r.last_message_at,
+  select r.id, r.is_group, r.is_notice, r.title,
+         -- 다시 들어오기 전의 마지막 대화는 미리보기에도 안 보임
+         case when me.history_from >= 0 and r.last_message_at < me.joined_at then null else r.last_message end,
+         r.last_message_at,
          (select count(*)::int from (
             select 1 from messages m
              where m.room_id = r.id and m.id > me.last_read_id
@@ -866,21 +928,35 @@ end;
 $$;
 
 -- 채팅방 나가기
-create or replace function public.leave_room(p_room uuid)
-returns void language plpgsql security definer set search_path = public as $$
+drop function if exists public.leave_room(uuid);
+create function public.leave_room(p_room uuid)
+returns jsonb language plpgsql security definer set search_path = public as $$
 declare
   v_me    uuid := auth.uid();
   v_group boolean;
   v_mine  text;
+  v_files jsonb := '[]'::jsonb;
 begin
   if public.is_notice_room(p_room) then raise exception '공지사항 방은 나갈 수 없어요'; end if;
 
   delete from room_members where room_id = p_room and user_id = v_me;
-  if not found then return; end if;
+  if not found then return jsonb_build_object('left', false); end if;
 
   if not exists (select 1 from room_members where room_id = p_room) then
-    delete from rooms where id = p_room;   -- 아무도 없으면 방과 메시지 삭제
-    return;
+    -- 아무도 없으면 방과 메시지·공감 삭제 + 사진·파일 목록을 돌려줘서 앱이 저장 공간에서도 지움
+    begin
+      select coalesce(jsonb_agg(jsonb_build_object('b', o.bucket_id, 'n', o.name)), '[]'::jsonb) into v_files
+        from storage.objects o
+       where o.bucket_id in ('chat-images', 'chat-files') and o.name like p_room::text || '/%';
+      if jsonb_array_length(v_files) > 0 then
+        insert into private.room_cleanup (room_id, user_id, at) values (p_room, v_me, now())
+        on conflict (room_id, user_id) do update set at = excluded.at;
+      end if;
+      delete from private.room_cleanup where at < now() - interval '1 day';
+    exception when others then v_files := '[]'::jsonb;
+    end;
+    delete from rooms where id = p_room;
+    return jsonb_build_object('left', true, 'room_deleted', true, 'files', v_files);
   end if;
 
   select is_group into v_group from rooms where id = p_room;
@@ -893,6 +969,7 @@ begin
     insert into messages (room_id, sender_id, kind, content)
     values (p_room, null, 'system', v_mine || '님이 나갔어요.');
   end if;
+  return jsonb_build_object('left', true, 'room_deleted', false);
 end;
 $$;
 
@@ -943,12 +1020,28 @@ returns void language sql security definer set search_path = public as $$
 $$;
 
 -- v1.8: 내가 보낸 메시지 삭제 → 모든 사람 화면에 "삭제된 메시지예요" 로 남음
+-- v1.12: 이미 대화가 있는 방에 들어오면(다시 들어오기·나중에 초대) 그 뒤의 대화만 보이게
+--        공지방은 지난 공지도 모두 보임. 값을 직접 넣은 경우(1:1 방 자동 복귀)는 그대로 둠
+create or replace function public.set_history_from()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.history_from < 0 and not public.is_notice_room(new.room_id) then
+    select coalesce(max(id), 0) into new.history_from from messages where room_id = new.room_id;
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists room_members_history on public.room_members;
+create trigger room_members_history before insert on public.room_members
+  for each row execute function public.set_history_from();
+
 -- v1.11: 답장은 같은 방의 글에만 (다른 방 메시지를 가리키면 답장 표시 없이 저장)
 create or replace function public.check_reply_to()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
   if new.reply_to is not null and (new.kind <> 'text' or not exists (
-       select 1 from messages where id = new.reply_to and room_id = new.room_id and kind <> 'system')) then
+       select 1 from messages g join room_members m on m.room_id = g.room_id and m.user_id = new.sender_id
+        where g.id = new.reply_to and g.room_id = new.room_id and g.kind <> 'system' and g.id > m.history_from)) then
     new.reply_to := null;
   end if;
   return new;
@@ -971,7 +1064,7 @@ begin
     raise exception '지원하지 않는 공감이에요';
   end if;
   select * into v_m from messages where id = p_id;
-  if not found or not public.is_room_member(v_m.room_id) then raise exception '메시지를 찾을 수 없어요'; end if;
+  if not found or not public.can_see_message(v_m.room_id, p_id) then raise exception '메시지를 찾을 수 없어요'; end if;
   if v_m.kind in ('system', 'deleted') then raise exception '공감할 수 없는 메시지예요'; end if;
   if not public.is_notice_room(v_m.room_id) and not public.can_post(v_m.room_id) then
     raise exception '서로 친구여야 공감할 수 있어요';
@@ -1013,6 +1106,7 @@ begin
   if not found then raise exception '메시지를 찾을 수 없어요'; end if;
   if v_m.sender_id is distinct from auth.uid() then raise exception '내가 보낸 메시지만 삭제할 수 있어요'; end if;
   if not public.is_room_member(v_m.room_id) then raise exception '이 방의 참여자가 아니에요'; end if;
+  if not public.can_see_message(v_m.room_id, p_id) then raise exception '메시지를 찾을 수 없어요'; end if;
   if v_m.kind = 'deleted' then return; end if;
 
   update messages set kind = 'deleted', content = '-', deleted_at = now() where id = p_id;
@@ -1143,6 +1237,22 @@ end;
 $$;
 
 -- 강제 탈퇴 (계정·친구·참여 정보 삭제, 보낸 메시지는 "(알 수 없음)"으로 남음)
+-- v1.12: 없어진 방에 남은 사진·파일 목록 (관리자 화면의 '저장 공간 정리')
+create or replace function public.admin_orphan_media()
+returns table (bucket text, name text, size bigint)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  perform public.admin_guard();
+  return query
+    select o.bucket_id::text, o.name::text, coalesce((o.metadata ->> 'size')::bigint, 0)
+      from storage.objects o
+     where o.bucket_id in ('chat-images', 'chat-files')
+       and not exists (select 1 from rooms r where r.id::text = split_part(o.name, '/', 1))
+     order by o.name
+     limit 3000;
+end;
+$$;
+
 create or replace function public.admin_delete_user(p_user uuid)
 returns void language plpgsql security definer set search_path = public as $$
 declare
@@ -1256,7 +1366,7 @@ create policy "room_members_select" on public.room_members for select to authent
 
 drop policy if exists "messages_select_member" on public.messages;
 create policy "messages_select_member" on public.messages for select to authenticated
-  using (public.is_room_member(room_id));
+  using (public.can_see_message(room_id, id));
 
 drop policy if exists "messages_insert_member" on public.messages;
 create policy "messages_insert_member" on public.messages for insert to authenticated
@@ -1281,7 +1391,7 @@ revoke all on public.message_reactions from anon, authenticated;
 grant select on public.message_reactions to authenticated;
 drop policy if exists "reactions_select_member" on public.message_reactions;
 create policy "reactions_select_member" on public.message_reactions for select to authenticated
-  using (public.is_room_member(room_id));
+  using (public.can_see_message(room_id, message_id));
 revoke all on public.user_phones, public.friend_suggestions from anon, authenticated;
 
 do $$
@@ -1296,12 +1406,13 @@ declare
     'my_friend_requests()', 'dismiss_request(uuid)', 'kick_from_room(uuid, uuid)', 'delete_message(bigint)', 'react_message(bigint, text)',
     'admin_list_users(text)', 'admin_set_status(uuid, text)', 'admin_set_admin(uuid, boolean)',
     'admin_reset_password(uuid)', 'admin_delete_user(uuid)', 'admin_get_settings()',
-    'admin_set_settings(boolean)', 'admin_broadcast(text)'];
+    'admin_set_settings(boolean)', 'admin_broadcast(text)', 'admin_orphan_media()'];
   helper_fns text[] := array[
     'is_active()', 'is_active_user(uuid)', 'is_admin()', 'is_room_member(uuid)', 'is_room_member_text(text)',
     'shares_room_with(uuid)', 'is_notice_room(uuid)', 'admin_guard()',
     'is_mutual_friend(uuid, uuid)', 'can_post(uuid)', 'can_post_text(text)',
-    'valid_file_msg(text, uuid, uuid)', 'valid_contact_msg(text)'];
+    'valid_file_msg(text, uuid, uuid)', 'valid_contact_msg(text)',
+    'can_see_message(uuid, bigint)', 'can_read_chat_object(text)', 'can_cleanup_folder(text)', 'is_orphan_folder(text)'];
 begin
   foreach f in array user_fns || helper_fns loop
     execute format('revoke execute on function public.%s from public, anon', f);
@@ -1347,11 +1458,17 @@ create policy "minitalk_chat_insert" on storage.objects for insert to authentica
 -- v1.8: 내가 올린 채팅 사진·파일은 삭제 가능 (파일 이름이 내 회원ID로 시작)
 drop policy if exists "minitalk_chat_delete" on storage.objects;
 create policy "minitalk_chat_delete" on storage.objects for delete to authenticated
-  using (bucket_id in ('chat-images', 'chat-files') and split_part(name, '/', 2) like (select auth.uid())::text || '-%');
+  using (bucket_id in ('chat-images', 'chat-files') and (
+    split_part(name, '/', 2) like (select auth.uid())::text || '-%'
+    or public.can_cleanup_folder(split_part(name, '/', 1))     -- v1.12: 마지막으로 나간 사람의 정리
+    or public.is_orphan_folder(split_part(name, '/', 1))));    -- v1.12: 관리자의 남은 파일 정리
 
 drop policy if exists "minitalk_chat_select" on storage.objects;
 create policy "minitalk_chat_select" on storage.objects for select to authenticated
-  using (bucket_id in ('chat-images', 'chat-files') and public.is_room_member_text((storage.foldername(name))[1]));
+  using (bucket_id in ('chat-images', 'chat-files') and (
+    public.can_read_chat_object(name)                          -- v1.12: 내가 볼 수 있는 메시지의 파일만
+    or public.can_cleanup_folder(split_part(name, '/', 1))
+    or public.is_orphan_folder(split_part(name, '/', 1))));
 
 -- ---------------------------------------------------------------------
 -- 9. 실시간(Realtime) 전달 — v1.6: Broadcast 방식

@@ -5,7 +5,7 @@ import { CONFIG } from './config.js';
 import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 
-const VERSION = '1.11.0';
+const VERSION = '1.12.0';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 const APP = CONFIG.APP_NAME;
 const app = document.getElementById('app');
@@ -2418,16 +2418,19 @@ function showRoomMenu() {
         }
         if (x.dataset.x === 'leave') {
           close();
-          const ok = await ask('채팅방을 나갈까요?', R.info.is_group ? '나가면 대화 내용이 목록에서 사라지고, 다시 초대받기 전까지 들어올 수 없어요.' : '나가면 이 대화방이 목록에서 사라져요. 상대가 새 메시지를 보내면 다시 나타나요.', '나가기', true);
+          const last = R.members.length <= 1;
+          const ok = await ask('채팅방을 나갈까요?', last ? '마지막 참여자라서 나가면 이 방의 대화와 사진·파일이 서버에서 모두 삭제돼요. 되돌릴 수 없어요.'
+            : R.info.is_group ? '나가면 대화 내용이 목록에서 사라져요. 다시 초대받아도 나가기 전의 대화는 볼 수 없어요.'
+              : '나가면 이 대화방이 목록에서 사라져요. 상대가 새 메시지를 보내면 다시 나타나지만, 나가기 전의 대화는 볼 수 없어요.', '나가기', true);
           if (!ok) return;
           try {
-            await api.leaveRoom(R.id);
+            const res = await api.leaveRoom(R.id);
             S.rooms = S.rooms.filter((x2) => x2.room_id !== R.id);
             updateBadges();
             S.fromList = false;
             S.tab = 'chats';
             location.replace('#/chats');
-            toast('채팅방에서 나왔어요');
+            toast(res && res.room_deleted ? '채팅방에서 나왔어요. 마지막 참여자라 대화와 사진·파일을 모두 삭제했어요' : '채팅방에서 나왔어요', { ms: res && res.room_deleted ? 3600 : undefined });
           } catch (ex) { showErr(ex); }
         }
       });
@@ -2493,6 +2496,19 @@ async function openAdmin() {
     <div class="scroll" id="adminBody"><div class="spinner"></div></div>`;
   await loadAdmin();
 }
+// v1.12: 없어진 방에 남은 사진·파일 정리 (quiet = 회원 탈퇴 뒤 자동으로, 묻지 않고)
+async function cleanOrphans(quiet, btn) {
+  try {
+    if (btn) btn.disabled = true;
+    const list = await api.adminOrphanMedia();
+    if (!list.length) { if (!quiet) toast('정리할 사진·파일이 없어요'); return; }
+    const total = list.reduce((a, x) => a + (Number(x.size) || 0), 0);
+    if (!quiet && !(await ask(`남은 사진·파일 ${list.length}개를 지울까요?`, `없어진 대화방에 남아 있던 파일이에요 (약 ${fmtSize(total)}). 아무도 볼 수 없는 파일이라 지워도 대화에는 영향이 없어요.`, '지우기', true))) return;
+    const n = await api.removeMedia(list);
+    if (!quiet || n) toast(n ? `사진·파일 ${n}개를 지웠어요 (약 ${fmtSize(total)})` : '지우지 못했어요. 잠시 후 다시 해 주세요', { error: !n });
+  } catch (e) { if (!quiet) showErr(e); }
+  finally { if (btn && btn.isConnected) btn.disabled = false; }
+}
 function closeAdmin() {
   const el = $('#admin');
   if (el && !el.hidden) { el.hidden = true; el.innerHTML = ''; }
@@ -2539,6 +2555,7 @@ function renderAdmin() {
       <div class="item" style="padding-top:14px;padding-bottom:14px"><span class="label">가입 승인제<span class="sub">${st.require_approval ? '켜져 있어요 · 새 회원은 관리자 승인 후 이용할 수 있어요' : '꺼져 있어요 · 가입하면 바로 이용할 수 있어요'}</span></span>
         <button class="switch ${st.require_approval ? 'on' : ''}" data-act="admin-approval" role="switch" aria-checked="${st.require_approval}" aria-label="가입 승인제"></button></div>
       <button class="item" data-act="admin-notice"><span class="tile mint">${ic('mega', 19)}</span><span class="label">전체 공지 보내기</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <button class="item" data-act="admin-clean" style="padding-top:14px;padding-bottom:14px"><span class="tile sky">${ic('file', 19)}</span><span class="label">남은 사진·파일 정리<span class="sub">없어진 대화방에 남아 있는 사진·파일을 저장 공간에서 지워요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
     </div>
     <label class="search">${ic('search', 20, 'flex:none')}<input id="adminSearch" placeholder="이름·아이디·휴대폰 번호 검색" value="${esc(A.q)}" autocapitalize="off" spellcheck="false"></label>
     <div class="filters">${[['all', '전체'], ['pending', `승인 대기 ${cnt('pending')}`], ['suspended', `정지 ${cnt('suspended')}`], ['admin', `관리자 ${cnt('admin')}`]]
@@ -2604,6 +2621,7 @@ function showAdminUser(id) {
             close();
             if (!(await ask(`${n}님을 강제 탈퇴시킬까요?`, '계정과 친구·대화방 정보가 삭제되고 되돌릴 수 없어요. 보낸 메시지는 "(알 수 없음)"으로 남아요.', '강제 탈퇴', true))) return;
             await api.adminDeleteUser(u.id); toast(`${n}님을 탈퇴 처리했어요`);
+            cleanOrphans(true);   // 아무도 없게 된 방의 사진·파일도 정리
           }
           await loadAdmin();
         } catch (ex) { showErr(ex); }
@@ -2738,6 +2756,7 @@ app.addEventListener('click', async (e) => {
       break;
     case 'admin-user': showAdminUser(el.dataset.id); break;
     case 'admin-notice': showBroadcast(); break;
+    case 'admin-clean': cleanOrphans(false, el); break;
     case 'admin-approval': {
       if (!S.admin || !S.admin.settings) break;
       const on = !S.admin.settings.require_approval;
