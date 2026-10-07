@@ -5,7 +5,7 @@ import { CONFIG } from './config.js';
 import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 
-const VERSION = '1.10.0';
+const VERSION = '1.11.0';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 const APP = CONFIG.APP_NAME;
 const app = document.getElementById('app');
@@ -439,7 +439,7 @@ async function enterApp(id) {
   if (S.me.status && S.me.status !== 'active') { renderBlocked(S.me.status); return; }
   cacheProfile(S.me);
   buildShell();
-  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted });
+  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction });
   await Promise.all([loadFriends(), loadRooms()]).catch(showErr);
   loadSuggestions();
   loadRequests();
@@ -782,7 +782,7 @@ function showInstall() {
 async function openRoom(id) {
   closeAllSheets();
   const token = ++S.roomToken;
-  S.room = { id, info: null, members: [], msgs: [], hasMore: true, loadingOlder: false, atBottom: true };
+  S.room = { id, info: null, members: [], msgs: [], hasMore: true, loadingOlder: false, atBottom: true, reacts: new Map(), refs: new Map(), replyTo: null };
   const el = $('#room');
   el.hidden = false;
   el.innerHTML = `
@@ -821,6 +821,7 @@ async function openRoom(id) {
     scrollBottom();
     markReadSoon();
     watchReads();
+    if (msgs.length) loadReactions(S.room, msgs[0].id);
   } catch (e) {
     if (token !== S.roomToken) return;
     $('#msgs').innerHTML = `<div class="empty-state"><b>불러오지 못했어요</b><p>${esc(e.message || '')}</p></div>`;
@@ -896,7 +897,7 @@ function msgHtml(m, prev, next) {
     : m.kind === 'sticker' ? `<button class="bubble sticker" data-act="replay-sticker" aria-label="이모티콘 다시 움직이기">${stickerSvg(m.content, 120)}</button>`
     : m.kind === 'file' ? fileBubble(m)
     : m.kind === 'contact' ? contactBubble(m)
-      : `<div class="bubble">${notice ? noticeText(m.content) : linkify(m.content)}</div>`;
+      : `<div class="bubble">${m.reply_to && !notice ? quoteHtml(m) : ''}${notice ? noticeText(m.content) : linkify(m.content)}</div>`;
   const showMeta = !m.pending && !m.failed;
   const metaCol = showMeta ? `<div class="meta-col"><span class="unread" data-unread="${esc(m.id)}"></span><span class="tm">${fmtTime(m.created_at)}</span></div>` : '';
   const cls = `msg ${mine ? 'mine' : ''} ${first ? 'first' : ''} ${m.pending ? 'pending' : ''} ${m.failed ? 'failed' : ''}`;
@@ -904,14 +905,14 @@ function msgHtml(m, prev, next) {
   if (mine) {
     const state = m.pending ? '<span class="spin-sm" aria-label="전송 중"></span>'
       : m.failed ? `<button class="retry-btn" data-act="retry" data-id="${esc(m.id)}" aria-label="다시 보내기">${ic('retry', 14)}다시 보내기</button>` : '';
-    return out + `<div class="${cls}"><div class="line">${state}${metaCol}${content}</div></div>`;
+    return out + `<div class="${cls}"><div class="line">${state}${metaCol}${content}</div></div>${isNum(m.id) ? reactsHtml(m, true) : ''}`;
   }
   const head = first
     ? (notice ? `<div class="mega-av">${ic('mega', 20)}</div>` : `<button data-act="profile" data-id="${esc(m.sender_id || '')}" aria-label="프로필">${av(p || { id: m.sender_id, display_name: '?' }, 40)}</button>`)
     : '';
   const senderName = notice ? `${APP} 운영팀` : (p ? p.display_name : '(알 수 없음)');
   return out + `<div class="${cls}"><div class="avs">${head}</div>
-    <div class="col">${first ? `<div class="sender">${esc(senderName)}</div>` : ''}<div class="line">${content}${metaCol}</div></div></div>`;
+    <div class="col">${first ? `<div class="sender">${esc(senderName)}</div>` : ''}<div class="line">${content}${metaCol}</div></div></div>${isNum(m.id) ? reactsHtml(m, false) : ''}`;
 }
 
 function renderMsgs() {
@@ -921,6 +922,7 @@ function renderMsgs() {
     box.innerHTML = `<div class="empty-state" style="padding-top:22%"><div class="es-icon lav">${ic('logo', 64)}</div><b>대화를 시작해 보세요</b><p>첫 메시지를 보내면 상대방 채팅 목록에 나타나요.</p></div>`;
     return;
   }
+  S.room.byId = new Map(ms.map((m) => [String(m.id), m]));
   const items = S.room.hasMore ? [['more', '<div class="load-more">위로 올리면 이전 대화를 불러와요</div>']] : [];
   const notLast = new Set();
   for (let i = 0; i < ms.length; i++) {
@@ -1055,6 +1057,7 @@ async function loadOlder() {
     R.msgs = older.filter((m) => !have.has(m.id)).concat(R.msgs);
     renderMsgs();
     box.scrollTop = box.scrollHeight - prevH + prevTop;
+    if (older.length) loadReactions(R, older[0].id);
   } catch (e) { showErr(e); }
   finally { R.loadingOlder = false; }
 }
@@ -1142,6 +1145,7 @@ function wireComposer() {
   ta.addEventListener('keydown', (e) => {
     const touch = matchMedia('(pointer: coarse)').matches;
     if (e.key === 'Enter' && !e.shiftKey && !touch && !e.isComposing) { e.preventDefault(); sendComposer(); }
+    if (e.key === 'Escape' && S.room && S.room.replyTo) { e.preventDefault(); cancelReply(); }
   });
   box.addEventListener('scroll', () => {
     if (!S.room) return;
@@ -1154,6 +1158,8 @@ function wireComposer() {
   let lp = null;
   const msgOf = (el) => { const w = el.closest('.mw'); return w && S.room ? S.room.msgs.find((x) => String(x.id) === w.dataset.k) : null; };
   const cancelLp = () => { if (lp) { clearTimeout(lp.t); lp = null; } };
+  // 새로 누르기 시작하면 '길게 누른 뒤 클릭 무시' 표시를 지움 (안 그러면 다음 누르기가 먹힘)
+  box.addEventListener('pointerdown', () => { if (S.room) S.room.suppressClick = false; }, true);
   box.addEventListener('pointerdown', (e) => {
     const b = e.target.closest('.bubble'); if (!b || e.button > 0) return;
     const m = msgOf(b); if (!m) return;
@@ -1168,6 +1174,7 @@ function wireComposer() {
     const m = msgOf(b); if (!m) return;
     e.preventDefault(); cancelLp(); showMsgMenu(m);
   });
+  wireSwipeReply(box, cancelLp, msgOf);
   // 길게 누른 뒤 손을 뗄 때 생기는 클릭(사진 열기 등)은 무시
   box.addEventListener('click', (e) => { if (S.room && S.room.suppressClick) { S.room.suppressClick = false; e.stopPropagation(); e.preventDefault(); } }, true);
   $('#photoInput').onchange = async (e) => {
@@ -1193,7 +1200,9 @@ async function sendText(retryMsg) {
   if (!retryMsg) { ta.value = ''; ta.style.height = '22px'; $('#sendBtn').disabled = true; ta.focus(); }
   const R = S.room;
   const notice = R.info && R.info.is_notice;
-  const tmp = retryMsg || { id: 'tmp-' + (++S.tmpSeq), room_id: R.id, sender_id: S.uid, kind: 'text', content: text, created_at: new Date().toISOString() };
+  const replyTo = retryMsg ? retryMsg.reply_to || null : (!notice && R.replyTo) || null;
+  if (!retryMsg && R.replyTo) cancelReply();
+  const tmp = retryMsg || { id: 'tmp-' + (++S.tmpSeq), room_id: R.id, sender_id: S.uid, kind: 'text', content: text, reply_to: replyTo, created_at: new Date().toISOString() };
   tmp.pending = true; tmp.failed = false;
   if (!retryMsg) R.msgs.push(tmp);
   renderMsgs(); scrollBottom();
@@ -1206,7 +1215,7 @@ async function sendText(retryMsg) {
       if (S.room === R) { addMessages(fresh, { forceBottom: true }); renderMsgs(); scrollBottom(); }
       return;
     }
-    const real = await api.sendText(R.id, text);
+    const real = await api.sendText(R.id, text, replyTo);
     R.msgs = R.msgs.filter((m) => m !== tmp);
     applyToList(real);
     if (S.room === R) { addMessages([real], { forceBottom: true }); renderMsgs(); scrollBottom(); }
@@ -1228,19 +1237,26 @@ function showMsgMenu(m) {
   const mineMsg = m.sender_id === S.uid;
   const local = !isNum(m.id);   // 아직 안 보내졌거나 실패한 메시지
   const items = [];
+  const canReact = !local;
+  if (!local && !isNoticeRoom() && $('#msgInput')) items.push(['reply', ic('reply', 22), '답장']);
   if (m.kind === 'text') items.push(['copy', ic('copy', 22), '복사']);
   if (m.kind === 'contact' && contactOf(m)) items.push(['copy', ic('copy', 22), '이름·번호 복사']);
   if (m.kind === 'file' && isNum(m.id)) items.push(['save', ic('download', 22), '저장']);
   if (mineMsg) items.push(['delete', ic('ban', 22), local ? '보내기 취소' : '삭제']);
-  if (!items.length) return;
+  if (!items.length && !canReact) return;
+  const my = canReact && R.reacts && R.reacts.get(m.id) ? R.reacts.get(m.id).get(S.uid) : null;
   openSheet({
     title: '메시지', bare: true,
-    body: `<div class="msg-menu">${items.map(([k, i, l]) => `<button class="menu-row ${k === 'delete' ? 'leave' : ''}" data-x="${k}">${i}<span>${l}</span></button>`).join('')}</div>
+    body: `${canReact ? `<div class="rx-bar" role="group" aria-label="공감">${REACTS.map(([k, c, l]) => `<button class="${my === k ? 'on' : ''}" data-rx="${k}" aria-label="${l}${my === k ? ' (누르면 취소)' : ''}">${c}</button>`).join('')}</div>${reactWhoHtml(m)}` : ''}
+      <div class="msg-menu">${items.map(([k, i, l]) => `<button class="menu-row ${k === 'delete' ? 'leave' : ''}" data-x="${k}">${i}<span>${l}</span></button>`).join('')}</div>
       <button class="btn gray" data-close style="margin-top:8px">닫기</button>`,
     onMount(sheet, close) {
       sheet.addEventListener('click', async (e) => {
+        const rx = e.target.closest('[data-rx]');
+        if (rx) { close(); toggleReact(m, rx.dataset.rx); return; }
         const x = e.target.closest('[data-x]'); if (!x) return;
         close();
+        if (x.dataset.x === 'reply') startReply(m);
         if (x.dataset.x === 'copy') {
           const c = m.kind === 'contact' ? contactOf(m) : null;
           const text = c ? `${c.name} ${c.phones.map(fmtTel).join(', ')}` : m.content;
@@ -1261,9 +1277,15 @@ function showMsgMenu(m) {
   });
 }
 function markDeleted(roomId, id) {
-  if (S.room && S.room.id === roomId) {
-    const m = S.room.msgs.find((x) => x.id === id);
-    if (m && m.kind !== 'deleted') { m.kind = 'deleted'; m.content = '-'; renderMsgs(); }
+  const R = S.room;
+  if (R && R.id === roomId) {
+    const m = R.msgs.find((x) => x.id === id);
+    const ref = R.refs && R.refs.get(Number(id));
+    let changed = false;
+    for (const x of [m, ref]) if (x && x.kind !== 'deleted') { x.kind = 'deleted'; x.content = '-'; changed = true; }
+    if (R.reacts && R.reacts.delete(Number(id))) changed = true;
+    if (R.replyTo === id) cancelReply();
+    if (changed) renderMsgs();
   }
   refreshRoomsSoon();   // 목록 미리보기 갱신
 }
@@ -1591,6 +1613,197 @@ async function sendContactMsg(c, retryMsg) {
 }
 
 // ---------------------------------------------------------------------
+// v1.11: 공감 (길게 누르기) · 답장 (옆으로 밀기)
+// ---------------------------------------------------------------------
+const REACTS = [['heart', '❤️', '하트'], ['like', '👍', '좋아요'], ['laugh', '😂', '웃음'], ['wow', '😮', '놀람'], ['sad', '😢', '슬픔'], ['check', '✅', '확인']];
+
+function reactsHtml(m, mine) {
+  const R = S.room;
+  const r = R && R.reacts && R.reacts.get(m.id);
+  if (!r || !r.size || m.kind === 'deleted') return '';
+  const counts = new Map();
+  for (const e of r.values()) counts.set(e, (counts.get(e) || 0) + 1);
+  const my = r.get(S.uid);
+  const chips = REACTS.filter(([k]) => counts.has(k)).map(([k, c, l]) => `<button class="rx ${my === k ? 'on' : ''}" data-act="react" data-id="${esc(m.id)}" data-e="${k}" aria-label="${l} ${counts.get(k)}명${my === k ? ', 내가 누름' : ''}"><span class="e">${c}</span>${counts.get(k)}</button>`).join('');
+  return `<div class="rx-row ${mine ? 'mine' : ''}">${chips}</div>`;
+}
+
+// 방을 열 때·이전 대화를 불러올 때·다시 연결될 때 공감 불러오기 (fromId 이후 것만 새로 맞춤)
+async function loadReactions(R, fromId) {
+  try {
+    const rows = await api.getReactions(R.id, fromId);
+    if (S.room !== R) return;
+    if (!R.reacts) R.reacts = new Map();
+    for (const id of [...R.reacts.keys()]) if (!fromId || id >= fromId) R.reacts.delete(id);
+    for (const x of rows) {
+      const id = Number(x.message_id);
+      let mp = R.reacts.get(id); if (!mp) R.reacts.set(id, (mp = new Map()));
+      mp.set(x.user_id, x.emoji);
+    }
+    renderMsgs();
+  } catch (e) { console.warn('reactions', e); }
+}
+
+function onReaction(p) {
+  const R = S.room;
+  if (!R || R.id !== p.room_id) return;
+  if (!R.reacts) R.reacts = new Map();
+  const id = Number(p.message_id);
+  let mp = R.reacts.get(id); if (!mp) R.reacts.set(id, (mp = new Map()));
+  if (p.emoji) mp.set(p.user_id, p.emoji); else mp.delete(p.user_id);
+  clearTimeout(R.rxTimer);
+  R.rxTimer = setTimeout(() => { if (S.room === R) renderMsgs(); }, 60);
+}
+
+async function toggleReact(m, key) {
+  const R = S.room;
+  if (!R || !isNum(m.id) || m.kind === 'deleted' || m.kind === 'system') return;
+  if (!R.reacts) R.reacts = new Map();
+  let mp = R.reacts.get(m.id); if (!mp) R.reacts.set(m.id, (mp = new Map()));
+  const prev = mp.get(S.uid) || null;
+  const next = prev === key ? null : key;
+  if (next) mp.set(S.uid, next); else mp.delete(S.uid);
+  renderMsgs();
+  try { await api.react(m.id, next); }
+  catch (e) {
+    if (prev) mp.set(S.uid, prev); else mp.delete(S.uid);
+    if (S.room === R) renderMsgs();
+    showErr(e);
+  }
+}
+
+// 공감한 사람 (길게 눌렀을 때 메뉴에 보여 줌)
+function reactWhoHtml(m) {
+  const r = S.room && S.room.reacts && S.room.reacts.get(m.id);
+  if (!r || !r.size) return '';
+  const name = (u) => (u === S.uid ? '나' : (profileOf(u) || {}).display_name || '(알 수 없음)');
+  const parts = REACTS.map(([k, c]) => { const who = [...r].filter(([, e]) => e === k).map(([u]) => name(u)); return who.length ? `<span class="w"><span class="e">${c}</span>${esc(who.join(', '))}</span>` : ''; }).filter(Boolean);
+  return `<div class="rx-who">${parts.join('')}</div>`;
+}
+
+// ---------- 답장 ----------
+function snippetOf(m) {
+  if (!m) return '';
+  if (m.missing) return '원본 메시지를 볼 수 없어요';
+  if (m.kind === 'deleted') return '삭제된 메시지예요';
+  if (m.kind === 'image') return '사진';
+  if (m.kind === 'sticker') return '이모티콘';
+  if (m.kind === 'file') { const f = fileOf(m); return f ? `파일: ${f.name}` : '파일'; }
+  if (m.kind === 'contact') { const c = contactOf(m); return c ? `연락처: ${c.name}` : '연락처'; }
+  return String(m.content || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+}
+function senderLabel(m) {
+  if (!m || m.missing) return '답장';
+  if (isNoticeRoom()) return `${APP} 운영팀`;
+  if (m.sender_id === S.uid) return '나';
+  const p = profileOf(m.sender_id);
+  return p ? p.display_name : '(알 수 없음)';
+}
+function findMsg(id) {
+  const R = S.room; if (!R || id == null) return null;
+  return (R.byId && R.byId.get(String(id))) || R.msgs.find((x) => String(x.id) === String(id)) || (R.refs && R.refs.get(Number(id))) || null;
+}
+// 화면에 없는 원본은 모아서 한 번에 불러옴
+function needRef(id) {
+  const R = S.room; if (!R) return;
+  id = Number(id);
+  R.refs = R.refs || new Map(); R.refWant = R.refWant || new Set();
+  if (R.refs.has(id) || R.refWant.has(id)) return;
+  R.refWant.add(id);
+  clearTimeout(R.refTimer);
+  R.refTimer = setTimeout(async () => {
+    const ids = [...R.refWant].filter((x) => !R.refs.has(x)).slice(0, 100);
+    try {
+      const rows = await api.getMessagesByIds(R.id, ids);
+      rows.forEach((r) => R.refs.set(Number(r.id), r));
+      ids.forEach((x) => { if (!R.refs.has(x)) R.refs.set(x, { id: x, missing: true }); });
+    } catch (e) { console.warn('reply refs', e); }
+    R.refWant.clear();
+    if (S.room === R) renderMsgs();
+  }, 30);
+}
+function quoteHtml(m) {
+  const o = findMsg(m.reply_to);
+  if (!o) { needRef(m.reply_to); return `<span class="quote" data-act="jump-reply" data-id="${esc(m.reply_to)}"><b>답장</b><span>원본 메시지를 불러오는 중이에요</span></span>`; }
+  return `<span class="quote ${o.kind === 'deleted' || o.missing ? 'gone' : ''}" data-act="jump-reply" data-id="${esc(o.id)}"><b>${esc(senderLabel(o))}</b><span>${esc(snippetOf(o))}</span></span>`;
+}
+function jumpTo(id) {
+  const el = $(`#msgs .mw[data-k="${CSS.escape(String(id))}"]`);
+  if (!el) { toast('위로 올려 이전 대화를 더 불러오면 원본을 볼 수 있어요'); return; }
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+  setTimeout(() => el.classList.remove('flash'), 1600);
+}
+
+function startReply(m) {
+  const R = S.room;
+  if (!R || !m || !isNum(m.id) || m.kind === 'deleted' || m.kind === 'system' || isNoticeRoom() || !$('#msgInput')) return;
+  const wasBottom = R.atBottom;
+  R.replyTo = m.id;
+  renderReplyBar();
+  if (wasBottom) requestAnimationFrame(() => scrollBottom());   // 답장 줄이 생겨도 맨 아래 유지
+  const ta = $('#msgInput'); if (ta) ta.focus();
+}
+function renderReplyBar() {
+  const comp = $('#composer'); if (!comp) return;
+  const R = S.room;
+  const m = R && R.replyTo ? findMsg(R.replyTo) : null;
+  let bar = $('#replyBar');
+  if (!m || m.kind === 'deleted') { if (R) R.replyTo = null; if (bar) bar.remove(); return; }
+  const who = senderLabel(m);
+  if (!bar) { comp.insertAdjacentHTML('afterbegin', '<div class="reply-bar" id="replyBar"></div>'); bar = $('#replyBar'); }
+  bar.innerHTML = `<span class="rb-ic">${ic('reply', 18)}</span><div class="rb-t"><b>${esc(who === '나' ? '나에게 답장' : `${who}님에게 답장`)}</b><span>${esc(snippetOf(m))}</span></div>
+    <button class="ibtn sm" data-act="cancel-reply" aria-label="답장 취소">${ic('x', 18)}</button>`;
+}
+function cancelReply() { if (S.room) S.room.replyTo = null; renderReplyBar(); }
+
+// 옆으로 밀어서 답장 (상대 글은 오른쪽으로, 내 글은 왼쪽으로)
+function wireSwipeReply(box, cancelLp, msgOf) {
+  let sw = null;
+  const reset = (s) => {
+    s.el.classList.remove('swiping'); s.el.style.transform = '';
+    s.mw.style.removeProperty('--sw'); s.mw.classList.remove('sw-on', 'sw-mine');
+    const icn = $('.sw-ic', s.mw); if (icn) icn.remove();
+  };
+  box.addEventListener('pointerdown', (e) => {
+    if (e.button > 0 || isNoticeRoom() || !$('#msgInput')) return;
+    const el = e.target.closest('.msg'); if (!el) return;
+    const m = msgOf(el);
+    if (!m || !isNum(m.id) || m.kind === 'deleted' || m.kind === 'system') return;
+    sw = { x: e.clientX, y: e.clientY, el, mw: el.closest('.mw'), m, dir: el.classList.contains('mine') ? -1 : 1, on: false, d: 0, pid: e.pointerId };
+  });
+  box.addEventListener('pointermove', (e) => {
+    if (!sw || e.pointerId !== sw.pid) return;
+    const dx = (e.clientX - sw.x) * sw.dir; const dy = e.clientY - sw.y;
+    if (!sw.on) {
+      if ($('.sheet-back')) { sw = null; return; }   // 길게 눌러 메뉴가 열렸으면 밀기 안 함
+      if (Math.abs(dy) > 12 && Math.abs(dy) >= Math.abs(dx)) { sw = null; return; }
+      if (!(dx > 12 && dx > Math.abs(dy) * 1.4)) return;
+      sw.on = true; cancelLp();
+      sw.el.classList.add('swiping');
+      sw.mw.classList.add('sw-on'); if (sw.dir < 0) sw.mw.classList.add('sw-mine');
+      sw.mw.insertAdjacentHTML('beforeend', `<span class="sw-ic">${ic('reply', 18)}</span>`);
+      try { sw.el.setPointerCapture(e.pointerId); } catch { /* 없음 */ }
+    }
+    const d = Math.max(0, Math.min(dx - 12, 84));
+    sw.d = d;
+    sw.el.style.transform = `translateX(${d * sw.dir}px)`;
+    sw.mw.style.setProperty('--sw', Math.min(1, d / 56).toFixed(2));
+    if (!sw.buzz && d >= 56) { sw.buzz = true; try { navigator.vibrate?.(10); } catch { /* 없음 */ } }
+  });
+  const end = () => {
+    if (!sw) return;
+    const s = sw; sw = null;
+    if (!s.on) return;
+    reset(s);
+    if (S.room) { S.room.suppressClick = true; setTimeout(() => { if (S.room) S.room.suppressClick = false; }, 400); }
+    if (s.d >= 56) startReply(s.m);
+  };
+  box.addEventListener('pointerup', end);
+  box.addEventListener('pointercancel', end);
+}
+
+// ---------------------------------------------------------------------
 // 실시간 이벤트
 // ---------------------------------------------------------------------
 function onMessage(m) {
@@ -1630,7 +1843,10 @@ async function catchUp() {
     const lastReal = [...R.msgs].reverse().find((m) => isNum(m.id));
     try {
       const fresh = await api.getMessagesAfter(R.id, lastReal ? lastReal.id : 0);
-      if (S.room === R) { addMessages(fresh); refreshMembers(); markReadSoon(); }
+      if (S.room === R) {
+        addMessages(fresh); refreshMembers(); markReadSoon();
+        const first = R.msgs.find((m) => isNum(m.id)); if (first) loadReactions(R, first.id);
+      }
     } catch (e) { console.warn(e); }
   }
 }
@@ -2493,6 +2709,9 @@ app.addEventListener('click', async (e) => {
     }
     case 'pick-photo': $('#photoInput').click(); break;
     case 'attach': showAttach(); break;
+    case 'react': { const m = S.room && S.room.msgs.find((x) => String(x.id) === el.dataset.id); if (m) toggleReact(m, el.dataset.e); break; }
+    case 'jump-reply': jumpTo(el.dataset.id); break;
+    case 'cancel-reply': cancelReply(); break;
     case 'open-file': { const m = S.room && S.room.msgs.find((x) => String(x.id) === el.dataset.id); if (m) openFile(m); break; }
     case 'save-contact': { const m = S.room && S.room.msgs.find((x) => String(x.id) === el.dataset.id); if (m) saveContact(m); break; }
     case 'view-img': showImage(el); break;

@@ -14,8 +14,8 @@ function friendly(error) {
   const map = [
     [/Invalid login credentials/i, '아이디 또는 비밀번호가 맞지 않아요'],
     [/banned/i, '이용이 정지된 계정이에요. 관리자에게 문의해 주세요'],
-    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
-    [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found|'reply_to' column/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/already registered|already exists/i, '이미 사용 중인 아이디예요'],
     [/Database error saving new user/i, '가입할 수 없는 아이디예요. 영문 소문자·숫자·밑줄(_) 3~20자로 입력해 주세요'],
     [/Password should be at least/i, '비밀번호는 6자 이상이어야 해요'],
@@ -156,9 +156,25 @@ export function createApi() {
       return must(await sb.from('messages').select('*').eq('room_id', roomId)
         .gt('id', afterId || 0).order('id', { ascending: true }).limit(200));
     },
-    async sendText(roomId, text) {
-      return must(await sb.from('messages').insert({ room_id: roomId, kind: 'text', content: text }).select().single());
+    async sendText(roomId, text, replyTo) {
+      const row = { room_id: roomId, kind: 'text', content: text };
+      if (replyTo) row.reply_to = replyTo;   // v1.11: 답장
+      return must(await sb.from('messages').insert(row).select().single());
     },
+    // 답장의 원본처럼 화면에 없는 메시지 몇 개 불러오기
+    async getMessagesByIds(roomId, ids) {
+      if (!ids.length) return [];
+      return must(await sb.from('messages').select('*').eq('room_id', roomId).in('id', ids));
+    },
+    // v1.11: 공감
+    async getReactions(roomId, fromId) {
+      let q = sb.from('message_reactions').select('message_id,user_id,emoji').eq('room_id', roomId);
+      if (fromId) q = q.gte('message_id', fromId);
+      const { data, error } = await q.limit(5000);
+      if (error) { console.warn('reactions', error.message); return []; }   // 데이터베이스가 예전 버전이면 공감 없이
+      return data || [];
+    },
+    async react(messageId, emoji) { return must(await sb.rpc('react_message', { p_id: messageId, p_emoji: emoji || null })); },
     // 내 메시지 삭제 (사진이면 파일도 지움)
     async deleteMessage(m) {
       must(await sb.rpc('delete_message', { p_id: m.id }));
@@ -231,7 +247,7 @@ export function createApi() {
     // 기본: 내 전용 비공개 채널(user:<내 ID>)로 내가 속한 방의 새 메시지만 받음 (Broadcast).
     //   → 접속자가 많아도 메시지 1건당 그 방 참여자에게만 전달돼 빠름.
     // 데이터베이스가 아직 v1.6 이 아니면(채널 권한 없음) 예전 방식(Postgres Changes)으로 자동 전환.
-    subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted }) {
+    subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction }) {
       let closed = false; let ch = null; let joined = false;
       const legacy = () => {
         rtMode = 'legacy';
@@ -251,6 +267,7 @@ export function createApi() {
           .on('broadcast', { event: 'friend' }, ({ payload }) => payload && onFriend && onFriend(payload))
           .on('broadcast', { event: 'kicked' }, ({ payload }) => payload && onKicked && onKicked(payload))
           .on('broadcast', { event: 'deleted' }, ({ payload }) => payload && onDeleted && onDeleted(payload))
+          .on('broadcast', { event: 'reaction' }, ({ payload }) => payload && onReaction && onReaction(payload))
           .subscribe((status) => {
             if (status === 'SUBSCRIBED') joined = true;
             if (!joined && status === 'CHANNEL_ERROR' && !closed) {

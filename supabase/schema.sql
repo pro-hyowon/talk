@@ -1,5 +1,5 @@
 -- =====================================================================
---  미니톡(MiniTalk) v1.10 — Supabase 데이터베이스 설정 스크립트
+--  미니톡(MiniTalk) v1.11 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -123,6 +123,21 @@ exception when others then
   return false;
 end;
 $$;
+
+-- v1.11: 답장 (어느 메시지에 대한 답장인지)
+alter table public.messages add column if not exists reply_to bigint references public.messages(id) on delete set null;
+
+-- v1.11: 공감 (메시지마다 한 사람당 하나: 하트·좋아요·웃음·놀람·슬픔·체크)
+create table if not exists public.message_reactions (
+  message_id bigint not null references public.messages(id) on delete cascade,
+  room_id    uuid not null references public.rooms(id) on delete cascade,
+  user_id    uuid not null references public.profiles(id) on delete cascade,
+  emoji      text not null check (emoji in ('heart', 'like', 'laugh', 'wow', 'sad', 'check')),
+  created_at timestamptz not null default now(),
+  primary key (message_id, user_id)
+);
+create index if not exists message_reactions_room_idx on public.message_reactions(room_id, message_id);
+create index if not exists message_reactions_user_idx on public.message_reactions(user_id);
 
 alter table public.messages drop constraint if exists messages_file_check;
 alter table public.messages add constraint messages_file_check check (
@@ -928,6 +943,66 @@ returns void language sql security definer set search_path = public as $$
 $$;
 
 -- v1.8: 내가 보낸 메시지 삭제 → 모든 사람 화면에 "삭제된 메시지예요" 로 남음
+-- v1.11: 답장은 같은 방의 글에만 (다른 방 메시지를 가리키면 답장 표시 없이 저장)
+create or replace function public.check_reply_to()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.reply_to is not null and (new.kind <> 'text' or not exists (
+       select 1 from messages where id = new.reply_to and room_id = new.room_id and kind <> 'system')) then
+    new.reply_to := null;
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists messages_reply_check on public.messages;
+create trigger messages_reply_check before insert on public.messages
+  for each row execute function public.check_reply_to();
+
+-- v1.11: 공감 누르기 (같은 걸 다시 누르거나 p_emoji 가 null 이면 취소, 다른 걸 누르면 바꿈)
+create or replace function public.react_message(p_id bigint, p_emoji text)
+returns text language plpgsql security definer set search_path = public as $$
+declare
+  v_m   messages%rowtype;
+  v_cur text;
+  v_new text;
+begin
+  if not public.is_active() then raise exception '사용할 수 없는 계정이에요'; end if;
+  if p_emoji is not null and p_emoji not in ('heart', 'like', 'laugh', 'wow', 'sad', 'check') then
+    raise exception '지원하지 않는 공감이에요';
+  end if;
+  select * into v_m from messages where id = p_id;
+  if not found or not public.is_room_member(v_m.room_id) then raise exception '메시지를 찾을 수 없어요'; end if;
+  if v_m.kind in ('system', 'deleted') then raise exception '공감할 수 없는 메시지예요'; end if;
+  if not public.is_notice_room(v_m.room_id) and not public.can_post(v_m.room_id) then
+    raise exception '서로 친구여야 공감할 수 있어요';
+  end if;
+
+  select emoji into v_cur from message_reactions where message_id = p_id and user_id = auth.uid();
+  if p_emoji is null or p_emoji = v_cur then
+    delete from message_reactions where message_id = p_id and user_id = auth.uid();
+    v_new := null;
+  else
+    insert into message_reactions (message_id, room_id, user_id, emoji)
+    values (p_id, v_m.room_id, auth.uid(), p_emoji)
+    on conflict (message_id, user_id) do update set emoji = excluded.emoji, created_at = now();
+    v_new := p_emoji;
+  end if;
+
+  -- 참여자 화면에 바로 반영 (회원이 아주 많은 공지방은 화면을 열 때 불러옴)
+  if v_new is distinct from v_cur and to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null
+     and not (public.is_notice_room(v_m.room_id)
+              and (select count(*) from (select 1 from room_members where room_id = v_m.room_id limit 101) x) > 100) then
+    begin
+      perform realtime.send(jsonb_build_object('message_id', p_id, 'room_id', v_m.room_id, 'user_id', auth.uid(), 'emoji', v_new),
+                            'reaction', 'user:' || m.user_id::text, true)
+         from room_members m where m.room_id = v_m.room_id;
+    exception when others then null;
+    end;
+  end if;
+  return v_new;
+end;
+$$;
+
 create or replace function public.delete_message(p_id bigint)
 returns void language plpgsql security definer set search_path = public as $$
 declare
@@ -941,6 +1016,7 @@ begin
   if v_m.kind = 'deleted' then return; end if;
 
   update messages set kind = 'deleted', content = '-', deleted_at = now() where id = p_id;
+  delete from message_reactions where message_id = p_id;
 
   -- 방의 마지막 메시지였다면 목록 미리보기도 바꿈
   select max(id) into v_last from messages where room_id = v_m.room_id and kind <> 'system';
@@ -1199,6 +1275,13 @@ grant select, insert, delete on public.friends to authenticated;
 grant select on public.rooms to authenticated;
 grant select on public.room_members to authenticated;
 grant select, insert on public.messages to authenticated;
+-- v1.11: 공감은 보기만 직접, 누르기는 react_message() 로만
+alter table public.message_reactions enable row level security;
+revoke all on public.message_reactions from anon, authenticated;
+grant select on public.message_reactions to authenticated;
+drop policy if exists "reactions_select_member" on public.message_reactions;
+create policy "reactions_select_member" on public.message_reactions for select to authenticated
+  using (public.is_room_member(room_id));
 revoke all on public.user_phones, public.friend_suggestions from anon, authenticated;
 
 do $$
@@ -1210,7 +1293,7 @@ declare
     'mark_read(uuid)', 'touch_last_seen()',
     'get_my_phone()', 'set_my_phone(text, boolean)', 'set_phone_findable(boolean)',
     'match_contacts(text[], text[])', 'match_contacts_detail(text[], text[])', 'my_suggestions()', 'dismiss_suggestion(uuid)', 'admin_clear_phone(uuid)',
-    'my_friend_requests()', 'dismiss_request(uuid)', 'kick_from_room(uuid, uuid)', 'delete_message(bigint)',
+    'my_friend_requests()', 'dismiss_request(uuid)', 'kick_from_room(uuid, uuid)', 'delete_message(bigint)', 'react_message(bigint, text)',
     'admin_list_users(text)', 'admin_set_status(uuid, text)', 'admin_set_admin(uuid, boolean)',
     'admin_reset_password(uuid)', 'admin_delete_user(uuid)', 'admin_get_settings()',
     'admin_set_settings(boolean)', 'admin_broadcast(text)'];
@@ -1287,7 +1370,8 @@ begin
     return new;
   end if;
   v_payload := jsonb_build_object('id', new.id, 'room_id', new.room_id, 'sender_id', new.sender_id,
-                                  'kind', new.kind, 'content', new.content, 'created_at', new.created_at);
+                                  'kind', new.kind, 'content', new.content, 'created_at', new.created_at,
+                                  'reply_to', new.reply_to);
   perform realtime.send(v_payload, 'message', 'user:' || m.user_id::text, true)
      from room_members m where m.room_id = new.room_id;
   return new;
