@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.15.1';
+const VERSION = '1.15.2';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 const APP = CONFIG.APP_NAME;
 const app = document.getElementById('app');
@@ -380,7 +380,7 @@ function renderAuth(mode = 'login') {
         ${fieldHtml('username', '아이디', { ph: signup ? '영문 소문자·숫자' : '아이디', help: signup ? '영문 소문자·숫자·밑줄(_) 3~20자' : '', auto: 'username', max: 20 })}
         ${fieldHtml('password', '비밀번호', { type: 'password', ph: signup ? '6자 이상' : '비밀번호', auto: signup ? 'new-password' : 'current-password' })}
         ${signup ? fieldHtml('password2', '비밀번호 확인', { type: 'password', ph: '한 번 더 입력', auto: 'new-password' }) : ''}
-        ${signup ? fieldHtml('phone', '휴대폰 번호 (선택)', { type: 'tel', ph: '010-1234-5678', help: '연락처로 친구를 찾을 때 쓰여요. 다른 사람에게는 보이지 않아요', auto: 'tel', max: 16 }) : ''}
+        ${signup ? fieldHtml('phone', '휴대폰 번호 (선택)', { type: 'tel', ph: '010-1234-5678', help: '친구가 휴대폰 번호로 나를 찾을 때 쓰여요. 다른 사람에게는 보이지 않아요', auto: 'tel', max: 16 }) : ''}
       </div>
       <button class="btn" type="submit" id="authBtn">${signup ? '가입 신청하기' : '로그인'}</button>
     </form>
@@ -687,7 +687,6 @@ function renderMore(head, body) {
     <div class="card">
       <div class="card-head">친구 추가</div>
       <button class="item" data-act="invite"><span class="tile lav">${ic('share', 19)}</span><span class="label">친구 초대 링크·QR<span class="sub">링크·QR만 보내면 바로 서로 친구가 돼요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      <button class="item" data-act="contacts"><span class="tile mint">${ic('book', 19)}</span><span class="label">연락처로 친구 찾기<span class="sub">내 연락처에 있는 ${esc(APP)} 회원 찾기</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="add-friend"><span class="tile sky">${ic('search', 19)}</span><span class="label">아이디·휴대폰 번호로 찾기</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
     </div>
     <div class="card">
@@ -1967,14 +1966,12 @@ function showAddFriend() {
     body: `<form id="findForm" class="find-row"><div class="find-input" id="findBox">${ic('search', 20, 'flex:none;color:var(--ink3)')}<input name="q" placeholder="아이디 또는 휴대폰 번호" autocapitalize="off" spellcheck="false" autocomplete="off"></div>
         <button class="find-btn" type="submit">검색</button></form>
       <div id="findResult"><div class="idle-text">친구의 아이디나 휴대폰 번호로 찾아보세요.<br>내 아이디는 <b>@${esc(S.me.username)}</b> 이에요.</div>
-        <div class="btn-col"><button class="btn soft" data-x="invite" style="font-size:15px">${ic('share', 20)}초대 링크·QR로 친구 추가</button>
-        <button class="btn line" data-x="contacts" style="font-size:15px">${ic('book', 20)}연락처로 친구 찾기</button></div></div>`,
+        <button class="btn soft" data-x="invite" style="font-size:15px">${ic('share', 20)}초대 링크·QR로 친구 추가</button></div>`,
     onMount(sheet, close) {
       const form = $('#findForm', sheet); const out = $('#findResult', sheet); const box = $('#findBox', sheet);
       setTimeout(() => form.q.focus(), 50);
       form.q.oninput = () => box.classList.remove('err');
       sheet.addEventListener('click', (e) => {
-        if (e.target.closest('[data-x=contacts]')) { close(); showContacts(); }
         if (e.target.closest('[data-x=invite]')) { close(); showInvite(); }
       });
       form.onsubmit = async (e) => {
@@ -2015,263 +2012,8 @@ function showAddFriend() {
   });
 }
 
-// ---------- 연락처로 친구 찾기 ----------
-// vCard(.vcf) 파일에서 이름·번호 읽기 (아이폰·PC용)
-function decodeQP(str, charset) {
-  const bytes = [];
-  for (let i = 0; i < str.length; i++) {
-    const c = str[i];
-    if (c === '=' && /^[0-9A-Fa-f]{2}$/.test(str.substr(i + 1, 2))) { bytes.push(parseInt(str.substr(i + 1, 2), 16)); i += 2; }
-    else bytes.push(c.charCodeAt(0) & 0xff);
-  }
-  try { return new TextDecoder(charset || 'utf-8').decode(new Uint8Array(bytes)); }
-  catch { return new TextDecoder('utf-8').decode(new Uint8Array(bytes)); }
-}
-function parseVcf(text) {
-  const lines = String(text).replace(/\r\n?/g, '\n').replace(/\n[ \t]/g, '').split('\n');
-  const out = []; let cur = null;
-  const unesc = (v) => v.replace(/\\([,;\\])/g, '$1').replace(/\\n/gi, ' ').trim();
-  for (let i = 0; i < lines.length; i++) {
-    let line = lines[i].trim();
-    if (!line) continue;
-    const up = line.toUpperCase();
-    if (up === 'BEGIN:VCARD') { cur = { name: '', tels: [] }; continue; }
-    if (up === 'END:VCARD') { if (cur) out.push(cur); cur = null; continue; }
-    if (!cur) continue;
-    const at = line.indexOf(':'); if (at < 0) continue;
-    const key = line.slice(0, at);
-    let val = line.slice(at + 1);
-    const qp = /ENCODING=QUOTED-PRINTABLE/i.test(key);
-    if (qp) { while (val.endsWith('=') && i + 1 < lines.length) { val = val.slice(0, -1) + lines[++i].trim(); } }
-    const cs = (key.match(/CHARSET=([^;:]+)/i) || [])[1];
-    if (qp) val = decodeQP(val, cs);
-    const prop = key.split(';')[0].split('.').pop().toUpperCase();
-    if (prop === 'TEL') cur.tels.push(val);
-    else if (prop === 'FN' && val.trim()) cur.name = unesc(val);
-    else if (prop === 'N' && !cur.name) {
-      const parts = val.split(';').map(unesc);
-      cur.name = /[가-힣]/.test(parts.join('')) ? (parts[0] || '') + (parts[1] || '') : [parts[1], parts[0]].filter(Boolean).join(' ');
-    }
-  }
-  return out;
-}
+// 휴대폰 연락처 고르기 지원 여부 (연락처 보내기에서 사용)
 const pickerSupported = () => 'contacts' in navigator && 'ContactsManager' in window && typeof navigator.contacts.select === 'function';
-
-// 연락처 목록 [{ name, tels | tel }] → [{ name, phones: [휴대폰 번호(숫자만)], hasTel }]
-function contactEntries(list) {
-  return (list || []).map((c) => {
-    const name = String((Array.isArray(c.name) ? c.name.find((x) => String(x || '').trim()) : c.name) || '').trim().slice(0, 40);
-    const tels = ((Array.isArray(c.tels) ? c.tels : c.tel) || []).filter((t) => String(t || '').trim());
-    return { name, phones: [...new Set(tels.map(normPhone).filter(Boolean))], hasTel: tels.length > 0 };
-  });
-}
-
-// 서버에서 가입한 회원 확인 (번호는 저장하지 않음)
-async function checkContacts(entries) {
-  const mine = (S.phone && S.phone.phone) || null;
-  const seen = new Map();
-  for (const c of entries) for (const d of c.phones) if (d !== mine && !seen.has(d)) seen.set(d, c.name);
-  let all = [...seen.entries()];
-  const over = all.length > 3000;
-  if (over) all = all.slice(0, 3000);
-  const hits = new Map(); let legacy = false; let legacyFound = 0;
-  for (let i = 0; i < all.length; i += 1000) {
-    const part = all.slice(i, i + 1000);
-    const r = await api.matchContactsDetail(part.map((x) => x[0]), part.map((x) => x[1] || null));
-    if (r.rows) {
-      for (const m of r.rows) {
-        hits.set(m.phone, m);
-        cacheProfile({ id: m.id, username: m.username, display_name: m.display_name, status_message: m.status_message, avatar_url: m.avatar_url });
-      }
-    } else { legacy = true; legacyFound += r.count || 0; }
-  }
-  await loadSuggestions();
-  return { hits, checked: new Set(all.map((x) => x[0])), count: all.length, over, mine, legacy, legacyFound };
-}
-
-// 연락처 한 사람의 확인 결과
-function contactStatus(c, res, added) {
-  if (!c.phones.length) return { kind: c.hasTel ? 'nomobile' : 'notel' };
-  if (res.mine && c.phones.every((p) => p === res.mine)) return { kind: 'me' };
-  if (!res.done) return { kind: 'checking', phone: c.phones[0] };
-  const phone = c.phones.find((p) => res.hits.has(p));
-  if (phone) {
-    const m = res.hits.get(phone);
-    if (added.has(m.id)) return { kind: 'added', m, phone };
-    if (m.is_friend || S.friends.some((f) => f.id === m.id)) return { kind: 'friend', m, phone };
-    return { kind: 'member', m, phone };
-  }
-  if (c.phones.every((p) => p === res.mine || !res.checked.has(p))) return { kind: 'skipped', phone: c.phones[0] };
-  return { kind: 'none', phone: c.phones[0] };
-}
-const CONTACT_RANK = { member: 0, added: 0, friend: 1, checking: 2, none: 3, skipped: 4, me: 5, nomobile: 6, notel: 6 };
-
-function showContacts() {
-  const picker = pickerSupported();
-  const ios = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  const myPhone = () => (S.phone === undefined ? '<div class="spinner" style="margin:6px auto"></div>'
-    : S.phone ? `<div class="kv-line">${ic('phone', 18, 'flex:none')}<span>내 번호 <b>${esc(maskPhone(S.phone.phone))}</b> · ${S.phone.findable ? '친구가 번호로 나를 찾을 수 있어요' : '번호로 나를 찾을 수 없게 해 뒀어요'}</span><button class="link-btn" data-x="phone">변경</button></div>`
-      : `<div class="kv-line warn">${ic('phone', 18, 'flex:none')}<span>내 번호를 등록하면 친구의 연락처에서도 내가 추천돼요</span><button class="link-btn" data-x="phone">등록</button></div>`);
-  openSheet({
-    title: '연락처로 친구 찾기',
-    body: `<div id="ctStart"><div class="sub-text">내 연락처의 휴대폰 번호와 일치하는 ${esc(APP)} 회원을 찾아 바로 보여 드려요.</div>
-      <div id="myPhoneBox">${myPhone()}</div>
-      <div class="btn-col" style="margin-top:14px">
-        ${picker ? `<button class="btn" data-x="pick">${ic('book', 20)}연락처에서 고르기</button>` : ''}
-        <button class="btn ${picker ? 'line' : ''}" data-x="file">${ic('download', 20)}연락처 파일(.vcf) 불러오기</button>
-      </div>
-      ${picker ? '' : `<details class="howto" ${ios ? 'open' : ''}><summary>아이폰에서 연락처 파일 만드는 법</summary><ol>
-        <li>‘연락처’ 앱을 열고 왼쪽 위 <b>목록</b>을 눌러요</li>
-        <li><b>모든 연락처</b>를 길게 누르고 <b>내보내기</b>를 골라요</li>
-        <li><b>완료</b>를 누른 뒤 <b>파일에 저장</b>을 골라요</li>
-        <li>여기서 ‘연락처 파일 불러오기’를 눌러 저장한 파일을 골라요</li></ol>
-        <p>안드로이드는 ‘연락처’ 앱 설정의 <b>연락처 내보내기</b>로 만들 수 있어요.</p></details>`}
-      <div class="note-mint" style="margin-top:14px">${ic('lock', 18)}<span>연락처의 번호는 가입한 친구를 확인하는 데에만 쓰이고 서버에 저장되지 않아요. 번호를 등록하지 않았거나 검색을 꺼 둔 회원은 찾지 않아요.</span></div></div>
-      <div id="ctResult" hidden></div>
-      <input type="file" id="vcfInput" accept=".vcf,.vcard,text/vcard,text/x-vcard" hidden>`,
-    onMount(sheet, close) {
-      if (S.phone === undefined) loadPhone().then(() => { const b = $('#myPhoneBox', sheet); if (b) b.innerHTML = myPhone(); });
-      const startEl = $('#ctStart', sheet); const out = $('#ctResult', sheet);
-      let cur = null;   // { mode, entries, res, added }
-      onSheetGone(sheet, () => { if (S.tab === 'friends' && !S.room) renderMain(); });
-
-      const showStart = () => { cur = null; out.hidden = true; out.innerHTML = ''; startEl.hidden = false; };
-      const draw = () => {
-        if (!cur) return;
-        const { mode, entries, res, added } = cur;
-        const rows = entries.map((c, i) => ({ c, i, st: contactStatus(c, res, added) }));
-        const isHit = (r) => r.st.kind === 'member' || r.st.kind === 'added' || r.st.kind === 'friend';
-        const members = new Set(rows.filter(isHit).map((r) => r.st.m.id));
-        // 직접 고른 연락처는 모두 보여 주고, 연락처 파일처럼 많으면 가입한 사람만
-        const showAll = mode === 'pick' && entries.length <= 300;
-        let list = showAll ? rows : rows.filter(isHit);
-        if (!showAll) { const once = new Set(); list = list.filter((r) => !once.has(r.st.m.id) && once.add(r.st.m.id)); }
-        list.sort((a, b) => (CONTACT_RANK[a.st.kind] - CONTACT_RANK[b.st.kind]) || (a.i - b.i));
-        const n = members.size;
-        let sum;
-        if (!res.done) sum = `<span class="spin-sm"></span><span>${mode === 'pick' ? `고른 연락처 <b>${entries.length}명</b>을 확인하고 있어요` : `연락처 <b>${entries.length.toLocaleString()}개</b>를 확인하고 있어요`}</span>`;
-        else if (res.legacy) sum = `<span>${res.legacyFound ? `연락처에서 친구 <b>${res.legacyFound}명</b>을 찾아 추천 친구에 넣었어요` : '연락처와 일치하는 새 친구가 없어요'}</span>`;
-        else if (mode === 'pick') sum = `<span>${n ? `고른 연락처 ${entries.length}명 중 <b>${n}명</b>이 ${esc(APP)} 회원이에요` : `고른 연락처 ${entries.length}명 중 ${esc(APP)}에서 찾을 수 있는 사람이 없어요`}</span>`;
-        else sum = `<span>연락처 ${entries.length.toLocaleString()}개를 확인했어요 · ${esc(APP)} 회원 <b>${n}명</b></span>`;
-
-        const desc = (st, c) => {
-          const ph = st.phone ? fmtPhone(st.phone) : '';
-          switch (st.kind) {
-            case 'checking': return `<span class="desc">${c.name ? esc(ph) : '확인하고 있어요'}</span>`;
-            case 'member': case 'added': case 'friend':
-              return `<span class="desc hit">${esc(st.m.display_name)} @${esc(st.m.username)}${st.kind === 'member' && st.m.added_me ? ' · 나를 추가했어요' : ''}</span>`;
-            case 'none': return `<span class="desc">${c.name ? `${esc(ph)} · ` : ''}${esc(APP)}에서 찾을 수 없어요</span>`;
-            case 'skipped': return `<span class="desc">${c.name ? `${esc(ph)} · ` : ''}너무 많아 확인하지 못했어요</span>`;
-            case 'me': return '<span class="desc">내 번호예요</span>';
-            case 'nomobile': return '<span class="desc">휴대폰 번호가 없어요 (집·회사 번호만 있어요)</span>';
-            default: return '<span class="desc">번호가 없어요</span>';
-          }
-        };
-        const action = (st) => {
-          switch (st.kind) {
-            case 'checking': return '<span class="spin-sm"></span>';
-            case 'member': return `<button class="mini-btn" data-add="${esc(st.m.id)}">추가</button>`;
-            case 'added': return `<span class="cres-tag ok">${ic('check', 14)}추가했어요</span>`;
-            case 'friend': return '<span class="cres-tag">친구</span>';
-            default: return '';
-          }
-        };
-        const face = (st, c) => (st.m ? av(st.m, 44)
-          : `<span class="av cav" style="width:44px;height:44px;font-size:13px">${c.name ? esc(initials(c.name)) : ic('user', 20)}</span>`);
-        const rowsHtml = list.map(({ c, st }) => `<div class="row cres ${st.m ? '' : 'dim'}" data-k="${st.kind}">${face(st, c)}
-            <span class="meta"><span class="name">${esc(c.name || (st.phone ? fmtPhone(st.phone) : '이름 없음'))}</span>${desc(st, c)}</span>${action(st)}</div>`).join('');
-        const anyNone = res.done && !res.legacy && rows.some((r) => r.st.kind === 'none');
-        const legacyList = res.done && res.legacy ? sugList() : [];
-        out.innerHTML = `<div class="cres-sum">${sum}</div>
-          ${res.legacy ? (legacyList.length ? `<div class="cres-list">${legacyList.map((g) => `<div class="row cres">${av(g, 44)}<span class="meta"><span class="name">${esc(g.display_name)}</span><span class="desc hit">${esc(g.contact_name ? `내 연락처: ${g.contact_name}` : '내 연락처에 있는 친구')}</span></span>${added.has(g.id) ? `<span class="cres-tag ok">${ic('check', 14)}추가했어요</span>` : `<button class="mini-btn" data-add="${esc(g.id)}">추가</button>`}</div>`).join('')}</div>` : '')
-            + '<div class="cres-help">데이터베이스를 업데이트(schema.sql 다시 실행)하면 고른 사람마다 결과를 볼 수 있어요.</div>'
-          : `${rowsHtml ? `<div class="cres-list">${rowsHtml}</div>` : res.done ? `<div class="empty-line" style="padding:20px 8px">연락처에서 ${esc(APP)} 회원을 찾지 못했어요</div>` : ''}`}
-          ${anyNone || (res.done && !res.legacy && !n) ? `<div class="cres-help">찾을 수 없는 사람은 아직 ${esc(APP)}에 가입하지 않았거나, 휴대폰 번호를 등록하지 않았거나, ‘번호로 나를 찾을 수 있게’를 꺼 둔 경우예요. 아이디로 찾거나 앱 주소를 보내 초대해 보세요.
-            <div class="cres-help-btns"><button class="link-btn" data-x="invite">${ic('share', 15)}앱 주소 보내기</button><button class="link-btn" data-x="search">${ic('search', 15)}아이디로 찾기</button></div></div>` : ''}
-          ${res.done && res.over ? '<div class="cres-help">연락처가 많아 앞쪽 3,000개만 확인했어요.</div>' : ''}
-          <div class="two" style="margin-top:18px"><button class="btn gray" data-x="again" ${res.done ? '' : 'disabled'}>${mode === 'pick' ? '다시 고르기' : '다른 파일'}</button><button class="btn" data-x="done">완료</button></div>`;
-      };
-
-      const begin = async (mode, btn, getList) => {
-        if (btn) { btn.disabled = true; btn.dataset.label = btn.innerHTML; btn.innerHTML = '<span class="spin-sm"></span>'; }
-        try {
-          const list = await getList();
-          if (!list) return;
-          const entries = contactEntries(list);
-          if (mode === 'file' && !entries.some((c) => c.phones.length)) { toast('연락처 파일에 휴대폰 번호가 없어요', { error: true }); return; }
-          const added = cur && cur.added ? cur.added : new Set();
-          cur = { mode, entries, res: { done: false, hits: new Map(), checked: new Set(), mine: (S.phone && S.phone.phone) || null }, added };
-          startEl.hidden = true; out.hidden = false; draw();
-          sheet.scrollTop = 0;
-          const mineCur = cur;
-          let res;
-          try { res = entries.some((c) => c.phones.length) ? await checkContacts(entries) : { hits: new Map(), checked: new Set(), count: 0, mine: mineCur.res.mine }; }
-          catch (e) { if (cur === mineCur) showStart(); throw e; }
-          if (cur !== mineCur || !sheet.isConnected) return;
-          cur.res = { ...res, done: true };
-          draw();
-        } catch (e) {
-          if (e && (e.name === 'AbortError' || e.name === 'InvalidStateError')) return;
-          showErr(e);
-        } finally { if (btn && btn.isConnected && btn.dataset.label) { btn.disabled = false; btn.innerHTML = btn.dataset.label; delete btn.dataset.label; } }
-      };
-      const pick = (btn) => begin('pick', btn, async () => {
-        const sel = await navigator.contacts.select(['name', 'tel'], { multiple: true });
-        if (!sel || !sel.length) { toast('고른 연락처가 없어요'); return null; }
-        return sel;
-      });
-
-      sheet.addEventListener('click', async (e) => {
-        const add = e.target.closest('[data-add]');
-        if (add && cur) {
-          const id = add.dataset.add; add.disabled = true; add.innerHTML = '<span class="spin-sm"></span>';
-          try {
-            await api.addFriend(id);
-            cur.added.add(id);
-            await loadFriends(); loadSuggestions(); loadRequests();
-            const p = S.profiles.get(id) || {};
-            friendAddedToast(id, p.display_name || '친구');
-            draw();
-          } catch (ex) { add.disabled = false; add.textContent = '추가'; showErr(ex); }
-          return;
-        }
-        const x = e.target.closest('[data-x]'); if (!x) return;
-        const act = x.dataset.x;
-        if (act === 'phone') { close(); showPhone(); }
-        if (act === 'pick') pick(x);
-        if (act === 'file') $('#vcfInput', sheet).click();
-        if (act === 'again') { if (cur && cur.mode === 'pick') pick(x); else $('#vcfInput', sheet).click(); }
-        if (act === 'done') { close(); if (S.tab !== 'friends' || S.room) go('#/friends'); else renderMain(); }
-        if (act === 'search') { close(); showAddFriend(); }
-        if (act === 'invite') shareApp();
-      });
-      $('#vcfInput', sheet).onchange = (e) => {
-        const file = e.target.files[0]; e.target.value = '';
-        if (!file) return;
-        if (file.size > 30 * 1024 * 1024) { toast('파일이 너무 커요 (최대 30MB)', { error: true }); return; }
-        const btn = cur ? $('[data-x=again]', sheet) : $('[data-x=file]', sheet);
-        begin('file', btn, async () => {
-          const list = parseVcf(await file.text());
-          if (!list.length) throw new Error('연락처 파일(.vcf)이 아니거나 비어 있어요');
-          return list;
-        });
-      };
-    },
-  });
-}
-
-// 앱 주소 보내기 (친구 초대)
-async function shareApp() {
-  // v1.14: 내 초대 링크를 보내면 상대가 가입하자마자 바로 친구가 됨
-  let url = new URL('./', location.href).href;   // 앱이 있는 폴더 주소
-  let text = `${APP}에서 같이 대화해요! 가입하고 휴대폰 번호를 등록하면 친구로 찾을 수 있어요.`;
-  try { const code = await api.myInviteCode(); url = inviteUrl(code); text = `${S.me.display_name}님이 ${APP}에 초대했어요. 링크를 누르고 가입하면 바로 친구가 돼요.`; } catch { /* 예전 데이터베이스면 앱 주소만 */ }
-  try {
-    if (navigator.share) { await navigator.share({ title: APP, text, url }); return; }
-  } catch (e) { if (e && e.name === 'AbortError') return; }
-  try { await navigator.clipboard.writeText(`${text}\n${url}`); toast('앱 주소를 복사했어요. 메시지에 붙여 넣어 보내세요'); }
-  catch { toast(url, { ms: 6000 }); }
-}
 
 // ---------- 내 휴대폰 번호 ----------
 function showPhone() {
@@ -2279,9 +2021,9 @@ function showPhone() {
   let findable = cur ? cur.findable !== false : true;
   openSheet({
     title: '휴대폰 번호',
-    body: `<div class="sub-text">번호를 등록하면 내 번호를 저장해 둔 친구에게 추천 친구로 보여요.</div>
+    body: `<div class="sub-text">번호를 등록하면 친구가 휴대폰 번호로 나를 찾아 추가할 수 있어요.</div>
       <div class="auth-fields">${fieldHtml('phone', '휴대폰 번호', { type: 'tel', ph: '010-1234-5678', auto: 'tel', max: 16 })}</div>
-      <div class="card-line"><span class="label">번호로 나를 찾을 수 있게<span class="sub">끄면 번호 검색과 연락처 추천에 내가 나오지 않아요</span></span>
+      <div class="card-line"><span class="label">번호로 나를 찾을 수 있게<span class="sub">끄면 휴대폰 번호로 검색해도 내가 나오지 않아요</span></span>
         <button class="switch ${findable ? 'on' : ''}" data-x="find" role="switch" aria-checked="${findable}" aria-label="번호로 나를 찾을 수 있게"></button></div>
       <button class="btn" data-x="save" style="margin-top:18px">저장</button>
       ${cur ? '<button class="btn text" data-x="remove" style="margin-top:4px">번호 삭제</button>' : ''}
@@ -2932,7 +2674,6 @@ app.addEventListener('click', async (e) => {
       break;
     case 'pick-sticker': pickSticker(el.dataset.id); break;
     case 'unpick-sticker': unpickSticker(); break;
-    case 'contacts': showContacts(); break;
     case 'invite': showInvite(); break;
     case 'phone': showPhone(); break;
     case 'sug-add': {
