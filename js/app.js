@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.15.0';
+const VERSION = '1.15.1';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 const APP = CONFIG.APP_NAME;
 const app = document.getElementById('app');
@@ -631,10 +631,6 @@ function renderMain() {
       <button class="me-card me" data-act="profile" data-id="${esc(me.id)}">${av(me, 60)}
         <div class="meta"><div class="name">${esc(me.display_name)}</div><div class="desc">${esc(me.status_message || '상태메시지를 입력해 보세요')}</div></div>
         <span class="chip-mine">내 프로필</span></button>
-      <button class="find-card" data-act="invite"><span class="tile lav">${ic('share', 20)}</span>
-        <span class="meta"><span class="name">친구 초대 링크·QR</span><span class="desc">링크·QR만 보내면 바로 친구가 돼요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      <button class="find-card" data-act="contacts"><span class="tile mint">${ic('book', 20)}</span>
-        <span class="meta"><span class="name">연락처로 친구 찾기</span><span class="desc">내 연락처에 있는 ${esc(APP)} 친구를 추천해 드려요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       ${S.requests.length ? `<div class="sec">받은 친구 요청 ${S.requests.length}</div>${S.requests.map((g) => `
         <div class="row sug req"><button class="sug-main" data-act="profile" data-id="${esc(g.id)}">${av(g, 48)}
           <span class="meta"><span class="name">${esc(g.display_name)}</span><span class="desc">@${esc(g.username)} · 나를 친구로 추가했어요</span></span></button>
@@ -689,10 +685,15 @@ function renderMore(head, body) {
       <div class="meta"><div class="name">${esc(me.display_name)}</div><div class="desc">${esc(me.status_message || '상태메시지가 없어요')}</div></div>
       <button class="edit-btn" data-act="edit-profile">${ic('pencil', 16)}편집</button></div>
     <div class="card">
+      <div class="card-head">친구 추가</div>
+      <button class="item" data-act="invite"><span class="tile lav">${ic('share', 19)}</span><span class="label">친구 초대 링크·QR<span class="sub">링크·QR만 보내면 바로 서로 친구가 돼요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <button class="item" data-act="contacts"><span class="tile mint">${ic('book', 19)}</span><span class="label">연락처로 친구 찾기<span class="sub">내 연락처에 있는 ${esc(APP)} 회원 찾기</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <button class="item" data-act="add-friend"><span class="tile sky">${ic('search', 19)}</span><span class="label">아이디·휴대폰 번호로 찾기</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+    </div>
+    <div class="card">
       <div class="item" style="padding-right:8px"><span class="tile sky">${ic('user', 19)}</span><span class="label">내 아이디</span><span class="val">@${esc(me.username)}</span>
         <button class="ibtn" data-act="copy-id" aria-label="아이디 복사" style="border-radius:12px;color:var(--ink3)">${ic('copy', 18)}</button></div>
       <button class="item" data-act="phone"><span class="tile sky">${ic('phone', 19)}</span><span class="label">휴대폰 번호</span><span class="val" id="phoneVal">${S.phone === undefined ? '' : S.phone ? esc(maskPhone(S.phone.phone)) : '등록하기'}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      <button class="item" data-act="contacts"><span class="tile mint">${ic('book', 19)}</span><span class="label">연락처로 친구 찾기</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="change-password"><span class="tile lav">${ic('lock', 19)}</span><span class="label">비밀번호 변경</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <div class="item"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림</span>
         <button class="switch ${on ? 'on' : ''}" data-act="notif" role="switch" aria-checked="${on}" aria-label="새 메시지 알림"></button></div>

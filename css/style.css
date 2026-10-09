@@ -749,3 +749,7 @@ button.item:active { background: var(--soft-bg); }
 .card-line.mute-line { margin: 4px 0 6px; }
 #roomMuteBtn { color: var(--ink2); }
 #roomMuteBtn.off { color: var(--ink4); }
+
+/* v1.15.1: 더보기의 친구 추가 묶음 */
+.card-head { padding: 14px 16px 2px; font-size: 13px; font-weight: 700; color: var(--ink3); }
+.item:has(.sub) { padding-top: 10px; padding-bottom: 10px; }
