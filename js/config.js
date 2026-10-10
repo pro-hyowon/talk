@@ -12,7 +12,7 @@ export const CONFIG = {
   SUPABASE_ANON_KEY: 'sb_publishable_5BWMz_Dcb2i_SmN__qQuQA_DutMv-Bt',
 
   // 화면에 표시될 앱 이름
-  APP_NAME: '미니톡',
+  APP_NAME: '끼리톡',
 
   // 아이디 로그인을 위한 내부용 주소 (실제 메일은 발송되지 않음). 바꿀 필요 없습니다.
   //  ※ 이미 가입자가 있는 상태에서 바꾸면 기존 회원이 로그인할 수 없습니다.
