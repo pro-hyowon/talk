@@ -1,5 +1,5 @@
 -- =====================================================================
---  미니톡(MiniTalk) v1.16.1 — Supabase 데이터베이스 설정 스크립트
+--  끼리톡(Kkiri Talk) v1.17 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -242,6 +242,70 @@ create table if not exists private.invite_codes (
 );
 revoke all on private.invite_codes from public, anon, authenticated;
 
+-- v1.17: 스토어 등록 준비 — 이용약관 동의, 차단, 신고, 금칙어
+alter table public.profiles add column if not exists terms_agreed_at timestamptz;   -- 이용약관·개인정보처리방침 동의 시각
+
+-- 차단 (차단한 사람과는 1:1 대화·친구 요청·알림이 막히고, 단체방에서는 그 사람 메시지가 내 화면에서 가려짐)
+create table if not exists private.blocks (
+  user_id    uuid not null references public.profiles(id) on delete cascade,
+  blocked_id uuid not null references public.profiles(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (user_id, blocked_id),
+  check (user_id <> blocked_id)
+);
+create index if not exists blocks_blocked_idx on private.blocks(blocked_id);
+revoke all on private.blocks from public, anon, authenticated;
+
+-- 신고 (관리자만 봄. snapshot = 신고 당시 메시지 내용)
+create table if not exists private.reports (
+  id          bigint generated always as identity primary key,
+  reporter_id uuid references public.profiles(id) on delete set null,
+  target_id   uuid references public.profiles(id) on delete set null,
+  room_id     uuid,
+  message_id  bigint,
+  reason      text not null check (reason in ('spam', 'abuse', 'sexual', 'illegal', 'other')),
+  detail      text not null default '' check (char_length(detail) <= 300),
+  snapshot    text not null default '' check (char_length(snapshot) <= 2000),
+  status      text not null default 'open' check (status in ('open', 'done')),
+  action      text,
+  created_at  timestamptz not null default now(),
+  handled_at  timestamptz,
+  handled_by  uuid references public.profiles(id) on delete set null
+);
+create index if not exists reports_status_idx on private.reports(status, id desc);
+create index if not exists reports_reporter_idx on private.reports(reporter_id, created_at);
+create index if not exists reports_target_idx on private.reports(target_id);
+create index if not exists reports_handled_idx on private.reports(handled_at) where status = 'done';
+create unique index if not exists reports_once on private.reports(reporter_id, message_id) where message_id is not null;
+revoke all on private.reports from public, anon, authenticated;
+
+-- 금칙어 (메시지·이름·상태메시지·방 이름에서 * 로 가려짐. 관리자 화면에서 고칠 수 있음)
+create table if not exists private.banned_words (
+  word text primary key check (char_length(word) between 1 and 30 and position('*' in word) = 0 and word = btrim(word))
+);
+revoke all on private.banned_words from public, anon, authenticated;
+
+-- 관리자가 강제 탈퇴 직전 그 회원의 사진·파일을 지울 수 있게 잠깐(10분) 허락
+create table if not exists private.purge_grants (
+  user_id  uuid not null,
+  admin_id uuid not null,
+  at       timestamptz not null default now(),
+  primary key (user_id, admin_id)
+);
+revoke all on private.purge_grants from public, anon, authenticated;
+alter table private.app_settings add column if not exists words_seeded boolean not null default false;
+do $$
+begin
+  if not coalesce((select words_seeded from private.app_settings where id = 1), true) then
+    insert into private.banned_words (word)
+    select unnest(array['씨발', '시발', '씨바', '씨팔', 'ㅅㅂ', 'ㅆㅂ', '병신', 'ㅄ', '븅신', '개새끼', '개새기', '개색기', '개세끼',
+                        '좆', '존나', '지랄', 'ㅈㄹ', '염병', '썅', '느금마', '니애미', '니미럴', '미친놈', '미친년', '창녀', '걸레년',
+                        'fuck', 'shit', 'bitch', 'asshole'])
+    on conflict do nothing;
+    update private.app_settings set words_seeded = true where id = 1;
+  end if;
+end $$;
+
 -- ---------------------------------------------------------------------
 -- 2. 보조 함수 (보안 정책에서 사용)
 -- ---------------------------------------------------------------------
@@ -419,8 +483,9 @@ declare
   v_status   text := case when coalesce((select require_approval from private.app_settings where id = 1), false)
                           then 'pending' else 'active' end;
 begin
-  insert into public.profiles (id, username, display_name, status)
-  values (new.id, v_username, left(v_name, 20), v_status);
+  insert into public.profiles (id, username, display_name, status, terms_agreed_at)
+  values (new.id, v_username, left(v_name, 20), v_status,
+          case when new.raw_user_meta_data->>'agree_terms' = 'yes' then now() end);   -- v1.17: 가입 때 약관 동의
   if v_status = 'active' then perform public.join_notice_room(new.id); end if;
   return new;
 end;
@@ -476,7 +541,8 @@ create or replace function public.on_friend_insert()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
   delete from friend_suggestions where user_id = new.user_id and suggested_id = new.friend_id;
-  if not exists (select 1 from friends where user_id = new.friend_id and friend_id = new.user_id) then
+  if not exists (select 1 from friends where user_id = new.friend_id and friend_id = new.user_id)
+     and not exists (select 1 from private.blocks b where b.user_id = new.friend_id and b.blocked_id = new.user_id) then   -- v1.17: 나를 차단한 사람에겐 요청 알림 없음
     perform public.notify_friend_request(new.user_id, new.friend_id);
   end if;
   return new;
@@ -566,18 +632,20 @@ begin
     join profiles p on p.id = s.user_id and p.status = 'active'
    where s.user_id <> new.sender_id
      -- v1.15: 이 방 알림을 꺼 둔 사람은 빼기
-     and not exists (select 1 from private.room_mutes x where x.room_id = new.room_id and x.user_id = s.user_id);
+     and not exists (select 1 from private.room_mutes x where x.room_id = new.room_id and x.user_id = s.user_id)
+     -- v1.17: 보낸 사람을 차단한 사람은 빼기
+     and not exists (select 1 from private.blocks b where b.user_id = s.user_id and b.blocked_id = new.sender_id);
   if v_subs is null then return new; end if;
 
   select display_name into v_name from profiles where id = new.sender_id;
   select * into v_room from rooms where id = new.room_id;
 
   v_title := coalesce(v_name, '새 메시지');
-  if v_room.is_notice then v_title := '미니톡 공지사항';
+  if v_room.is_notice then v_title := '끼리톡 공지사항';
   elsif v_room.is_group then v_title := v_title || ' · ' || coalesce(v_room.title, '단체방'); end if;
 
   if not coalesce(v_preview, true) then
-    v_title := '미니톡';
+    v_title := '끼리톡';
     v_body  := '새 메시지가 도착했어요.';
   elsif new.kind = 'image' then
     v_body := '사진을 보냈어요.';
@@ -793,6 +861,7 @@ language sql stable security definer set search_path = public as $$
      and not exists (select 1 from friends m where m.user_id = auth.uid() and m.friend_id = p.id)
      and not exists (select 1 from friend_suggestions s
                       where s.user_id = auth.uid() and s.suggested_id = p.id and s.dismissed)
+     and not exists (select 1 from private.blocks b where b.user_id = auth.uid() and b.blocked_id = p.id)   -- v1.17
    order by f.created_at desc
    limit 200;
 $$;
@@ -823,6 +892,7 @@ language sql stable security definer set search_path = public as $$
             select 1 from messages m
              where m.room_id = r.id and m.id > me.last_read_id
                and m.kind not in ('system', 'deleted') and m.sender_id is distinct from (select auth.uid())
+               and not exists (select 1 from private.blocks b where b.user_id = me.user_id and b.blocked_id = m.sender_id)   -- v1.17
              limit 300) u),
          (select count(*)::int from room_members x where x.room_id = r.id),
          case when r.is_notice then '[]'::jsonb else
@@ -1134,40 +1204,28 @@ $$;
 create or replace function public.delete_message(p_id bigint)
 returns void language plpgsql security definer set search_path = public as $$
 declare
-  v_m    messages%rowtype;
-  v_last bigint;
+  v_m messages%rowtype;
 begin
   select * into v_m from messages where id = p_id;
   if not found then raise exception '메시지를 찾을 수 없어요'; end if;
   if v_m.sender_id is distinct from auth.uid() then raise exception '내가 보낸 메시지만 삭제할 수 있어요'; end if;
   if not public.is_room_member(v_m.room_id) then raise exception '이 방의 참여자가 아니에요'; end if;
   if not public.can_see_message(v_m.room_id, p_id) then raise exception '메시지를 찾을 수 없어요'; end if;
-  if v_m.kind = 'deleted' then return; end if;
-
-  update messages set kind = 'deleted', content = '-', deleted_at = now() where id = p_id;
-  delete from message_reactions where message_id = p_id;
-
-  -- 방의 마지막 메시지였다면 목록 미리보기도 바꿈
-  select max(id) into v_last from messages where room_id = v_m.room_id and kind <> 'system';
-  if v_last = p_id then
-    update rooms set last_message = '삭제된 메시지예요' where id = v_m.room_id;
-  end if;
-
-  -- 참여자 화면에 바로 반영 (실시간)
-  if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null then
-    begin
-      perform realtime.send(jsonb_build_object('id', p_id, 'room_id', v_m.room_id), 'deleted', 'user:' || m.user_id::text, true)
-         from room_members m where m.room_id = v_m.room_id;
-    exception when others then null;
-    end;
-  end if;
+  perform public.erase_message(p_id);   -- v1.17: 삭제 처리는 관리자 신고 처리와 같은 함수로
 end;
 $$;
 
 -- 최근 접속 시각 기록 (앱을 열 때 호출)
-create or replace function public.touch_last_seen()
-returns void language sql security definer set search_path = public as $$
+drop function if exists public.touch_last_seen();
+create function public.touch_last_seen()
+returns void language plpgsql security definer set search_path = public as $$
+begin
   update profiles set last_seen_at = now() where id = auth.uid();
+  -- v1.17: 처리한 지 1년 지난 신고 기록 삭제 (앱을 여는 김에 정리 — 따로 예약 작업이 필요 없게)
+  if to_regclass('private.reports') is not null then
+    execute 'delete from private.reports where status = ''done'' and handled_at < now() - interval ''1 year''';
+  end if;
+end;
 $$;
 
 -- ---------------------------------------------------------------------
@@ -1447,6 +1505,9 @@ begin
    where c.code = lower(trim(p_code)) and p.status = 'active';
   if v_owner is null then raise exception '초대 링크가 바뀌었거나 사용할 수 없어요. 새 링크를 받아 주세요'; end if;
   if v_owner = v_me then raise exception '내 초대 링크예요. 친구에게 보내 주세요'; end if;
+  if exists (select 1 from private.blocks b where b.user_id = v_owner and b.blocked_id = v_me) then   -- v1.17
+    raise exception '초대 링크가 바뀌었거나 사용할 수 없어요. 새 링크를 받아 주세요';
+  end if;
   v_new := not public.is_mutual_friend(v_me, v_owner);
   -- 두 줄을 한 번에 넣어야 '친구 요청' 알림이 따로 가지 않음
   insert into friends (user_id, friend_id) values (v_me, v_owner), (v_owner, v_me) on conflict do nothing;
@@ -1476,7 +1537,9 @@ begin
   if cardinality(p_others) > 200 then raise exception '한 번에 200명까지 연결할 수 있어요'; end if;
   for v_o in select distinct x from unnest(p_others) as x loop
     continue when v_o is null or v_o = p_user
-               or not exists (select 1 from profiles where id = v_o and status = 'active');
+               or not exists (select 1 from profiles where id = v_o and status = 'active')
+               or exists (select 1 from private.blocks b                      -- v1.17: 한쪽이 차단했으면 연결 안 함
+                           where (b.user_id = p_user and b.blocked_id = v_o) or (b.user_id = v_o and b.blocked_id = p_user));
     v_new := not public.is_mutual_friend(p_user, v_o);
     -- 두 줄을 한 번에 넣어야 '친구 요청' 알림이 따로 가지 않음
     insert into friends (user_id, friend_id) values (p_user, v_o), (v_o, p_user)
@@ -1524,19 +1587,52 @@ begin
 end;
 $$;
 
-create or replace function public.admin_delete_user(p_user uuid)
+-- v1.17: p_wipe = 그 회원이 보낸 메시지도 모두 '삭제된 메시지' 로 (이메일 탈퇴 요청 처리용)
+drop function if exists public.admin_delete_user(uuid);
+create or replace function public.admin_delete_user(p_user uuid, p_wipe boolean default false)
 returns void language plpgsql security definer set search_path = public as $$
 declare
   v_me uuid := public.admin_guard();
 begin
   if p_user = v_me then raise exception '내 계정은 삭제할 수 없어요'; end if;
-  begin  -- 올린 사진 파일의 소유자 표시 해제 (파일은 남음)
+  if not exists (select 1 from profiles where id = p_user) then raise exception '회원을 찾을 수 없어요'; end if;
+  if coalesce(p_wipe, false) then
+    update rooms r set last_message = '삭제된 메시지예요'
+     where exists (select 1 from messages g
+                    where g.room_id = r.id and g.sender_id = p_user and g.kind not in ('system', 'deleted')
+                      and g.id = (select max(x.id) from messages x where x.room_id = r.id and x.kind <> 'system'));
+    update messages set kind = 'deleted', content = '-', deleted_at = now()
+     where sender_id = p_user and kind not in ('system', 'deleted');
+  end if;
+  delete from private.friend_request_log where from_id = p_user or to_id = p_user;
+  delete from private.lookup_quota where user_id = p_user;
+  delete from private.room_cleanup where user_id = p_user;
+  begin  -- 올린 사진 파일의 소유자 표시 해제 (파일은 앱이 저장 공간에서 지움)
     execute 'update storage.objects set owner = null where owner = $1' using p_user;
   exception when others then null;
   end;
   delete from auth.users where id = p_user;
   if not found then raise exception '회원을 찾을 수 없어요'; end if;
   delete from rooms r where not exists (select 1 from room_members m where m.room_id = r.id) and not r.is_notice;
+end;
+$$;
+
+-- v1.17: 관리자: 회원이 올린 사진·파일·프로필 사진 목록 (강제 탈퇴 전에 앱이 저장 공간에서 지움)
+create or replace function public.admin_user_media(p_user uuid)
+returns table (bucket text, name text)
+language plpgsql security definer set search_path = public as $$
+declare
+  v_me uuid := public.admin_guard();
+begin
+  insert into private.purge_grants (user_id, admin_id, at) values (p_user, v_me, now())
+  on conflict (user_id, admin_id) do update set at = excluded.at;
+  delete from private.purge_grants where at < now() - interval '1 day';
+  return query
+  select o.bucket_id::text, o.name::text
+    from storage.objects o
+   where (o.bucket_id in ('chat-images', 'chat-files') and split_part(o.name, '/', 2) like p_user::text || '-%')
+      or (o.bucket_id = 'avatars' and split_part(o.name, '/', 1) = p_user::text)
+   limit 5000;
 end;
 $$;
 
@@ -1587,6 +1683,379 @@ begin
   insert into messages (room_id, sender_id, kind, content)
   values (v_room, v_me, 'text', left(trim(p_text), 2000));
   return v_room;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- 6-2. v1.17: 스토어 등록 준비 — 금칙어 · 차단 · 신고 · 회원 탈퇴 · 약관 동의
+-- ---------------------------------------------------------------------
+
+-- 금칙어를 * 로 가림 (대소문자 구분 없이)
+create or replace function public.mask_banned(p text)
+returns text language plpgsql stable security definer set search_path = public as $$
+declare
+  w text;
+  v text := p;
+  i integer;
+  n integer := 0;
+begin
+  if v is null or v = '' then return v; end if;
+  for w in select word from private.banned_words order by char_length(word) desc loop
+    loop
+      i := position(lower(w) in lower(v));
+      exit when i = 0 or n > 500;
+      v := overlay(v placing repeat('*', char_length(w)) from i for char_length(w));
+      n := n + 1;
+    end loop;
+  end loop;
+  return v;
+end;
+$$;
+
+create or replace function public.mask_message_words()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.kind = 'text' then new.content := public.mask_banned(new.content); end if;
+  return new;
+end;
+$$;
+drop trigger if exists messages_mask_words on public.messages;
+create trigger messages_mask_words before insert on public.messages
+  for each row execute function public.mask_message_words();
+
+create or replace function public.mask_profile_words()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  new.display_name := public.mask_banned(new.display_name);
+  new.status_message := public.mask_banned(new.status_message);
+  return new;
+end;
+$$;
+drop trigger if exists profiles_mask_words on public.profiles;
+create trigger profiles_mask_words before insert or update of display_name, status_message on public.profiles
+  for each row execute function public.mask_profile_words();
+
+create or replace function public.mask_room_words()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.title is not null then new.title := public.mask_banned(new.title); end if;
+  return new;
+end;
+$$;
+drop trigger if exists rooms_mask_words on public.rooms;
+create trigger rooms_mask_words before insert or update of title on public.rooms
+  for each row execute function public.mask_room_words();
+
+-- 관리자: 금칙어 목록 보기 / 바꾸기 (통째로 바꿈)
+create or replace function public.admin_get_banned_words()
+returns text[] language plpgsql stable security definer set search_path = public as $$
+begin
+  perform public.admin_guard();
+  return coalesce((select array_agg(word order by word) from private.banned_words), '{}');
+end;
+$$;
+
+create or replace function public.admin_set_banned_words(p_words text[])
+returns integer language plpgsql security definer set search_path = public as $$
+declare
+  v_n integer;
+begin
+  perform public.admin_guard();
+  if coalesce(cardinality(p_words), 0) > 1000 then raise exception '금칙어는 1000개까지 등록할 수 있어요'; end if;
+  if exists (select 1 from unnest(coalesce(p_words, '{}')) w
+              where btrim(w) <> '' and (char_length(btrim(w)) > 30 or position('*' in w) > 0)) then
+    raise exception '금칙어는 한 개에 30자까지, * 없이 입력해 주세요';
+  end if;
+  delete from private.banned_words;
+  insert into private.banned_words (word)
+  select distinct btrim(w) from unnest(coalesce(p_words, '{}')) w where btrim(w) <> ''
+  on conflict do nothing;
+  get diagnostics v_n = row_count;
+  return v_n;
+end;
+$$;
+
+-- 차단하기 (친구에서도 빠짐 → 1:1 대화가 막힘. 상대에게는 알리지 않음)
+create or replace function public.block_user(p_user uuid)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_me uuid := auth.uid();
+begin
+  if v_me is null or not public.is_active() then raise exception '사용할 수 없는 계정이에요'; end if;
+  if p_user is null or p_user = v_me then raise exception '나 자신은 차단할 수 없어요'; end if;
+  if not exists (select 1 from profiles where id = p_user) then raise exception '회원을 찾을 수 없어요'; end if;
+  insert into private.blocks (user_id, blocked_id) values (v_me, p_user) on conflict do nothing;
+  delete from friends where user_id = v_me and friend_id = p_user;
+  delete from friend_suggestions where user_id = v_me and suggested_id = p_user and not dismissed;
+end;
+$$;
+
+-- 차단 풀기 (친구로 다시 추가하려면 따로 추가)
+create or replace function public.unblock_user(p_user uuid)
+returns void language sql security definer set search_path = public as $$
+  delete from private.blocks where user_id = auth.uid() and blocked_id = p_user;
+$$;
+
+-- 내가 차단한 사람
+create or replace function public.my_blocks()
+returns table (id uuid, username text, display_name text, avatar_url text, blocked_at timestamptz)
+language sql stable security definer set search_path = public as $$
+  select p.id, p.username, p.display_name, p.avatar_url, b.created_at
+    from private.blocks b join profiles p on p.id = b.blocked_id
+   where b.user_id = auth.uid()
+   order by b.created_at desc;
+$$;
+
+-- 친구 추가 전 확인: 차단한 사람을 내가 직접 추가하면 차단이 풀림. 다른 경로(초대 링크·관리자 연결)로는 추가 안 됨
+create or replace function public.friend_block_check()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if exists (select 1 from private.blocks where user_id = new.user_id and blocked_id = new.friend_id) then
+    if auth.uid() = new.user_id then
+      delete from private.blocks where user_id = new.user_id and blocked_id = new.friend_id;
+    else
+      return null;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists friends_block_check on public.friends;
+create trigger friends_block_check before insert on public.friends
+  for each row execute function public.friend_block_check();
+
+-- 메시지를 '삭제된 메시지' 로 바꾸고 참여자 화면에 알림 (내부용)
+create or replace function public.erase_message(p_id bigint)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_m    messages%rowtype;
+  v_last bigint;
+begin
+  select * into v_m from messages where id = p_id;
+  if not found or v_m.kind = 'deleted' then return; end if;
+  update messages set kind = 'deleted', content = '-', deleted_at = now() where id = p_id;
+  delete from message_reactions where message_id = p_id;
+  -- 방의 마지막 메시지였다면 목록 미리보기도 바꿈
+  select max(id) into v_last from messages where room_id = v_m.room_id and kind <> 'system';
+  if v_last = p_id then
+    update rooms set last_message = '삭제된 메시지예요' where id = v_m.room_id;
+  end if;
+  if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null then
+    begin
+      perform realtime.send(jsonb_build_object('id', p_id, 'room_id', v_m.room_id), 'deleted', 'user:' || m.user_id::text, true)
+         from room_members m where m.room_id = v_m.room_id;
+    exception when others then null;
+    end;
+  end if;
+end;
+$$;
+
+-- 신고하기 (메시지 신고: p_message, 사람 신고: p_target)
+create or replace function public.report_content(p_target uuid, p_message bigint, p_reason text, p_detail text default '')
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_me     uuid := auth.uid();
+  v_m      messages%rowtype;
+  v_target uuid := p_target;
+  v_room   uuid;
+  v_snap   text := '';
+begin
+  if v_me is null or not public.is_active() then raise exception '사용할 수 없는 계정이에요'; end if;
+  if p_reason is null or p_reason not in ('spam', 'abuse', 'sexual', 'illegal', 'other') then raise exception '신고 사유를 골라 주세요'; end if;
+  if (select count(*) from private.reports where reporter_id = v_me and created_at > now() - interval '1 day') >= 30 then
+    raise exception '오늘은 더 신고할 수 없어요. 내일 다시 시도해 주세요';
+  end if;
+  if p_message is not null then
+    select * into v_m from messages where id = p_message;
+    if not found or not public.can_see_message(v_m.room_id, p_message) then raise exception '메시지를 찾을 수 없어요'; end if;
+    if v_m.sender_id is null or v_m.kind = 'system' then raise exception '신고할 수 없는 메시지예요'; end if;
+    if v_m.sender_id = v_me then raise exception '내 메시지는 신고할 수 없어요'; end if;
+    if exists (select 1 from private.reports where reporter_id = v_me and message_id = p_message) then return; end if;
+    v_target := v_m.sender_id;
+    v_room := v_m.room_id;
+    v_snap := case v_m.kind
+      when 'text' then v_m.content
+      when 'image' then v_m.content
+      when 'file' then coalesce(v_m.content::jsonb ->> 'name', '파일')
+      when 'sticker' then '이모티콘'
+      when 'contact' then '연락처'
+      else '삭제된 메시지' end;
+  else
+    if v_target is null or v_target = v_me or not exists (select 1 from profiles where id = v_target) then
+      raise exception '회원을 찾을 수 없어요';
+    end if;
+  end if;
+  insert into private.reports (reporter_id, target_id, room_id, message_id, reason, detail, snapshot)
+  values (v_me, v_target, v_room, p_message, p_reason, left(btrim(coalesce(p_detail, '')), 300), left(coalesce(v_snap, ''), 2000));
+  perform public.notify_admins_report();
+end;
+$$;
+
+-- 신고가 들어오면 관리자에게 알림 (앱이 열려 있으면 바로, 닫혀 있으면 앱을 닫아도 오는 알림 — 10분에 한 번만)
+create or replace function public.notify_admins_report()
+returns void language plpgsql security definer set search_path = public, extensions as $$
+declare
+  v_url    text;
+  v_secret text;
+  v_subs   jsonb;
+  v_open   integer;
+begin
+  if (select count(*) from private.reports where created_at > now() - interval '10 minutes') > 1 then return; end if;
+  select count(*) into v_open from private.reports where status = 'open';
+  if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null then
+    begin
+      perform realtime.send(jsonb_build_object('open', v_open), 'report', 'user:' || p.id::text, true)
+         from profiles p where p.is_admin and p.status = 'active';
+    exception when others then null;
+    end;
+  end if;
+  if to_regclass('private.push_config') is null then return; end if;
+  execute 'select function_url, secret from private.push_config where id = 1' into v_url, v_secret;
+  if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return; end if;
+  execute 'select jsonb_agg(jsonb_build_object(''endpoint'', s.endpoint, ''p256dh'', s.p256dh, ''auth'', s.auth))
+             from push_subscriptions s join profiles p on p.id = s.user_id and p.is_admin and p.status = ''active'''
+     into v_subs;
+  if v_subs is null then return; end if;
+  perform net.http_post(
+    url := v_url,
+    body := jsonb_build_object('subs', v_subs, 'title', '새 신고', 'body', '처리할 신고가 ' || v_open || '건 있어요. 회원 관리 → 신고 내역에서 확인해 주세요.'),
+    headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
+    timeout_milliseconds := 8000
+  );
+exception when others then
+  raise warning 'notify_admins_report 실패: %', sqlerrm;   -- 알림 문제로 신고가 막히면 안 됨
+end;
+$$;
+
+-- 관리자: 처리할 신고 수
+create or replace function public.admin_open_reports()
+returns integer language plpgsql stable security definer set search_path = public as $$
+begin
+  perform public.admin_guard();
+  return (select count(*)::int from private.reports where status = 'open');
+end;
+$$;
+
+-- 관리자: 신고 목록 (p_status: open / done / all)
+drop function if exists public.admin_list_reports(text);
+create function public.admin_list_reports(p_status text default 'open')
+returns table (
+  id bigint, created_at timestamptz, reason text, detail text, snapshot text,
+  message_id bigint, message_kind text, message_gone boolean, media_path text, room_id uuid,
+  reporter_id uuid, reporter_name text, target_id uuid, target_name text, target_username text,
+  target_status text, status text, action text, target_reports integer
+)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  perform public.admin_guard();
+  return query
+  select r.id, r.created_at, r.reason, r.detail, r.snapshot,
+         r.message_id, m.kind, (r.message_id is not null and (m.id is null or m.kind = 'deleted')),
+         case m.kind when 'image' then m.content when 'file' then m.content::jsonb ->> 'path' end, r.room_id,
+         r.reporter_id, rp.display_name, r.target_id, tp.display_name, tp.username,
+         tp.status, r.status, r.action,
+         (select count(*)::int from private.reports x where x.target_id = r.target_id)
+    from private.reports r
+    left join messages m on m.id = r.message_id
+    left join profiles rp on rp.id = r.reporter_id
+    left join profiles tp on tp.id = r.target_id
+   where coalesce(p_status, 'open') = 'all' or r.status = coalesce(p_status, 'open')
+   order by r.id desc
+   limit 300;
+end;
+$$;
+
+-- 관리자: 신고 처리 (dismiss=문제 없음, delete=메시지 삭제, suspend=이용 정지, both=삭제+정지)
+--   같은 메시지에 들어온 다른 신고도 함께 처리됨
+create or replace function public.admin_resolve_report(p_id bigint, p_action text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_me uuid := public.admin_guard();
+  v_r  private.reports%rowtype;
+begin
+  if p_action not in ('dismiss', 'delete', 'suspend', 'both') then raise exception '잘못된 처리 방법이에요'; end if;
+  select * into v_r from private.reports where id = p_id;
+  if not found then raise exception '신고를 찾을 수 없어요'; end if;
+  if p_action in ('delete', 'both') and v_r.message_id is not null then
+    perform public.erase_message(v_r.message_id);
+  end if;
+  if p_action in ('suspend', 'both') then
+    if v_r.target_id is null then raise exception '이미 탈퇴한 회원이에요'; end if;
+    if v_r.target_id = v_me then raise exception '내 계정은 정지할 수 없어요'; end if;
+    if exists (select 1 from profiles where id = v_r.target_id and status <> 'suspended') then
+      perform public.admin_set_status(v_r.target_id, 'suspended');
+    end if;
+  end if;
+  update private.reports
+     set status = 'done', action = p_action, handled_at = now(), handled_by = v_me
+   where id = p_id or (v_r.message_id is not null and message_id = v_r.message_id and status = 'open');
+end;
+$$;
+
+-- 관리자가 신고된 사진·파일을 볼 수 있나? (신고 처리 판단·삭제용)
+create or replace function public.admin_can_view_reported(p_name text)
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.is_admin() and exists (
+    select 1 from private.reports r join messages g on g.id = r.message_id
+     where g.kind in ('image', 'file')
+       and (case when g.kind = 'file' then g.content::jsonb ->> 'path' else g.content end) = p_name);
+$$;
+
+-- 관리자가 지금 지울 수 있는 탈퇴 회원 파일인가? (admin_user_media 를 부른 뒤 10분 안)
+create or replace function public.admin_can_purge(p_name text)
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.is_admin() and exists (
+    select 1 from private.purge_grants g
+     where g.admin_id = auth.uid() and g.at > now() - interval '10 minutes'
+       and (split_part(p_name, '/', 2) like g.user_id::text || '-%' or split_part(p_name, '/', 1) = g.user_id::text));
+$$;
+
+-- 이용약관 동의 (가입할 때 동의하지 않은 기존 회원용)
+create or replace function public.agree_terms()
+returns void language sql security definer set search_path = public as $$
+  update profiles set terms_agreed_at = now() where id = auth.uid() and terms_agreed_at is null;
+$$;
+
+-- 회원 탈퇴 전: 내가 올린 사진·파일·프로필 사진 목록 (앱이 저장 공간에서 지움)
+create or replace function public.my_media_files()
+returns table (bucket text, name text)
+language sql stable security definer set search_path = public as $$
+  select o.bucket_id::text, o.name::text
+    from storage.objects o
+   where auth.uid() is not null and (
+         (o.bucket_id in ('chat-images', 'chat-files') and split_part(o.name, '/', 2) like auth.uid()::text || '-%')
+      or (o.bucket_id = 'avatars' and split_part(o.name, '/', 1) = auth.uid()::text))
+   limit 5000;
+$$;
+
+-- 회원 탈퇴 (p_wipe = 내가 보낸 메시지도 모두 '삭제된 메시지' 로 바꿈)
+create or replace function public.delete_my_account(p_wipe boolean default false)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_me uuid := auth.uid();
+begin
+  if v_me is null then raise exception '로그인이 필요해요'; end if;
+  if exists (select 1 from profiles where id = v_me and is_admin)
+     and not exists (select 1 from profiles where is_admin and id <> v_me and status = 'active') then
+    raise exception '마지막 관리자는 탈퇴할 수 없어요. 다른 회원을 관리자로 지정한 뒤 탈퇴해 주세요';
+  end if;
+  if coalesce(p_wipe, false) then
+    update rooms r set last_message = '삭제된 메시지예요'
+     where exists (select 1 from messages g
+                    where g.room_id = r.id and g.sender_id = v_me and g.kind not in ('system', 'deleted')
+                      and g.id = (select max(x.id) from messages x where x.room_id = r.id and x.kind <> 'system'));
+    update messages set kind = 'deleted', content = '-', deleted_at = now()
+     where sender_id = v_me and kind not in ('system', 'deleted');
+  end if;
+  delete from private.friend_request_log where from_id = v_me or to_id = v_me;
+  delete from private.lookup_quota where user_id = v_me;
+  delete from private.room_cleanup where user_id = v_me;
+  begin  -- 남은 파일의 소유자 표시 해제
+    execute 'update storage.objects set owner = null where owner = $1' using v_me;
+  exception when others then null;
+  end;
+  delete from auth.users where id = v_me;
+  delete from rooms r where not exists (select 1 from room_members m where m.room_id = r.id) and not r.is_notice;
 end;
 $$;
 
@@ -1685,16 +2154,21 @@ declare
     'my_friend_requests()', 'dismiss_request(uuid)', 'kick_from_room(uuid, uuid)', 'delete_message(bigint)', 'react_message(bigint, text)',
     'my_invite_code()', 'reset_invite_code()', 'invite_preview(text)', 'accept_invite(text)', 'set_room_muted(uuid, boolean)',
     'admin_list_users(text)', 'admin_set_status(uuid, text)', 'admin_set_admin(uuid, boolean)',
-    'admin_reset_password(uuid)', 'admin_delete_user(uuid)', 'admin_get_settings()',
+    'admin_reset_password(uuid)', 'admin_delete_user(uuid, boolean)', 'admin_user_media(uuid)', 'admin_get_settings()',
     'admin_set_settings(boolean)', 'admin_broadcast(text)', 'admin_orphan_media()',
     'admin_connect_friends(uuid, uuid[])', 'admin_user_friends(uuid)',
-    'admin_save_ad(bigint, text, text, text, boolean)', 'admin_delete_ad(bigint)', 'admin_move_ad(bigint, integer)', 'ad_click(bigint)'];
+    'admin_save_ad(bigint, text, text, text, boolean)', 'admin_delete_ad(bigint)', 'admin_move_ad(bigint, integer)', 'ad_click(bigint)',
+    'block_user(uuid)', 'unblock_user(uuid)', 'my_blocks()', 'report_content(uuid, bigint, text, text)',
+    'admin_open_reports()', 'admin_list_reports(text)', 'admin_resolve_report(bigint, text)',
+    'admin_get_banned_words()', 'admin_set_banned_words(text[])',
+    'agree_terms()', 'my_media_files()', 'delete_my_account(boolean)'];
   helper_fns text[] := array[
     'is_active()', 'is_active_user(uuid)', 'is_admin()', 'is_room_member(uuid)', 'is_room_member_text(text)',
     'shares_room_with(uuid)', 'is_notice_room(uuid)', 'admin_guard()',
     'is_mutual_friend(uuid, uuid)', 'can_post(uuid)', 'can_post_text(text)',
     'valid_file_msg(text, uuid, uuid)', 'valid_contact_msg(text)',
-    'can_see_message(uuid, bigint)', 'can_read_chat_object(text)', 'can_cleanup_folder(text)', 'is_orphan_folder(text)'];
+    'can_see_message(uuid, bigint)', 'can_read_chat_object(text)', 'can_cleanup_folder(text)', 'is_orphan_folder(text)',
+    'admin_can_view_reported(text)', 'admin_can_purge(text)'];
 begin
   foreach f in array user_fns || helper_fns loop
     execute format('revoke execute on function public.%s from public, anon', f);
@@ -1705,6 +2179,9 @@ begin
   execute 'revoke execute on function public.use_lookup_quota(integer) from public, anon, authenticated';
   execute 'revoke execute on function public.notify_friend_request(uuid, uuid) from public, anon, authenticated';
   execute 'revoke execute on function public.notify_connected(uuid, uuid, text) from public, anon, authenticated';
+  execute 'revoke execute on function public.erase_message(bigint) from public, anon, authenticated';   -- v1.17 내부용
+  execute 'revoke execute on function public.mask_banned(text) from public, anon, authenticated';
+  execute 'revoke execute on function public.notify_admins_report() from public, anon, authenticated';
   execute 'grant execute on function public.invite_preview(text) to anon';   -- 로그인 전 초대 화면용
 end;
 $$;
@@ -1745,7 +2222,14 @@ create policy "minitalk_avatar_insert" on storage.objects for insert to authenti
 
 drop policy if exists "minitalk_avatar_delete" on storage.objects;
 create policy "minitalk_avatar_delete" on storage.objects for delete to authenticated
-  using (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
+  using (bucket_id = 'avatars' and ((storage.foldername(name))[1] = auth.uid()::text
+                                    or public.admin_can_purge(name)));   -- v1.17: 관리자의 탈퇴 처리
+
+-- v1.17: 지우려면 '보기' 권한도 필요 → 내 폴더(와 관리자의 탈퇴 처리)만 (사진 자체는 공개 주소로 보임)
+drop policy if exists "minitalk_avatar_select" on storage.objects;
+create policy "minitalk_avatar_select" on storage.objects for select to authenticated
+  using (bucket_id = 'avatars' and ((storage.foldername(name))[1] = auth.uid()::text
+                                    or public.admin_can_purge(name)));
 
 drop policy if exists "minitalk_chat_insert" on storage.objects;
 create policy "minitalk_chat_insert" on storage.objects for insert to authenticated
@@ -1759,14 +2243,19 @@ create policy "minitalk_chat_delete" on storage.objects for delete to authentica
   using (bucket_id in ('chat-images', 'chat-files') and (
     split_part(name, '/', 2) like (select auth.uid())::text || '-%'
     or public.can_cleanup_folder(split_part(name, '/', 1))     -- v1.12: 마지막으로 나간 사람의 정리
-    or public.is_orphan_folder(split_part(name, '/', 1))));    -- v1.12: 관리자의 남은 파일 정리
+    or public.is_orphan_folder(split_part(name, '/', 1))       -- v1.12: 관리자의 남은 파일 정리
+    or public.admin_can_view_reported(name)                    -- v1.17: 관리자의 신고된 사진·파일 삭제
+    or public.admin_can_purge(name)));                         -- v1.17: 관리자의 탈퇴 처리
 
 drop policy if exists "minitalk_chat_select" on storage.objects;
 create policy "minitalk_chat_select" on storage.objects for select to authenticated
   using (bucket_id in ('chat-images', 'chat-files') and (
     public.can_read_chat_object(name)                          -- v1.12: 내가 볼 수 있는 메시지의 파일만
     or public.can_cleanup_folder(split_part(name, '/', 1))
-    or public.is_orphan_folder(split_part(name, '/', 1))));
+    or public.is_orphan_folder(split_part(name, '/', 1))
+    or public.admin_can_view_reported(name)                    -- v1.17: 관리자가 신고된 사진 확인
+    or public.admin_can_purge(name)                            -- v1.17: 관리자의 탈퇴 처리 (지우려면 보기 권한 필요)
+    or split_part(name, '/', 2) like (select auth.uid())::text || '-%'));   -- v1.17: 내가 올린 파일 (나간 방이어도 탈퇴 때 지울 수 있게)
 
 -- ---------------------------------------------------------------------
 -- 9. 실시간(Realtime) 전달 — v1.6: Broadcast 방식

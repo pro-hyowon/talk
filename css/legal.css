@@ -1,0 +1,35 @@
+/* 끼리톡 — 이용약관 · 개인정보처리방침 · 탈퇴 안내 · 라이선스 페이지 */
+:root { --ink: #1E2633; --ink2: #4A5463; --ink3: #7A8494; --line: #E6EAEE; --mint: #4FD1AE; --mint-text: #127A5E; --bg: #F6FBF9; --card: #FFFFFF; --warn: #C2334F; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --ink: #E9EEF2; --ink2: #C3CBD4; --ink3: #95A0AC; --line: #2C343E; --mint-text: #6FE0C0; --bg: #12171C; --card: #1A2027; --warn: #FF8099; }
+}
+:root[data-theme="dark"] { --ink: #E9EEF2; --ink2: #C3CBD4; --ink3: #95A0AC; --line: #2C343E; --mint-text: #6FE0C0; --bg: #12171C; --card: #1A2027; --warn: #FF8099; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.75 -apple-system, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', sans-serif; word-break: keep-all; overflow-wrap: anywhere; }
+main { max-width: 760px; margin: 0 auto; padding: 28px 16px 64px; }
+header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+header .logo { width: 40px; height: 40px; border-radius: 12px; background: var(--mint); display: flex; align-items: center; justify-content: center; flex: none; }
+header .app { font-weight: 800; font-size: 15px; color: var(--mint-text); }
+h1 { font-size: 26px; line-height: 1.35; margin: 14px 0 6px; letter-spacing: -0.02em; }
+.meta { color: var(--ink3); font-size: 13px; margin: 0 0 22px; }
+section { background: var(--card); border-radius: 18px; padding: 18px 20px; margin: 12px 0; border: 1px solid var(--line); }
+h2 { font-size: 17px; margin: 0 0 8px; letter-spacing: -0.01em; }
+h3 { font-size: 15px; margin: 14px 0 4px; }
+p { margin: 6px 0; color: var(--ink2); }
+ul, ol { margin: 6px 0; padding-left: 20px; color: var(--ink2); }
+li { margin: 3px 0; }
+b, strong { color: var(--ink); }
+a { color: var(--mint-text); font-weight: 700; }
+.tbl { width: 100%; overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin: 8px 0; min-width: 520px; }
+th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; color: var(--ink2); }
+th { background: var(--bg); color: var(--ink); font-weight: 700; }
+.missing { color: var(--warn); font-weight: 700; }
+.toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 8px; padding: 0; list-style: none; }
+.toc a { display: inline-block; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); font-size: 13px; text-decoration: none; }
+.steps { counter-reset: s; list-style: none; padding: 0; }
+.steps li { counter-increment: s; position: relative; padding-left: 36px; margin: 10px 0; }
+.steps li::before { content: counter(s); position: absolute; left: 0; top: 1px; width: 24px; height: 24px; border-radius: 50%; background: var(--mint); color: #0C3B30; font-weight: 800; font-size: 13px; display: flex; align-items: center; justify-content: center; }
+pre { white-space: pre-wrap; font-size: 12.5px; line-height: 1.55; background: var(--bg); padding: 12px; border-radius: 12px; color: var(--ink2); margin: 8px 0 0; }
+footer { margin-top: 28px; text-align: center; font-size: 13px; color: var(--ink3); }
+footer a { font-weight: 500; color: var(--ink3); margin: 0 6px; }

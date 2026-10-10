@@ -1,14 +1,16 @@
 // =====================================================================
-//  미니톡 — 화면과 동작 (디자인: 클로드디자인 "미니톡 UI 디자인 v1")
+//  끼리톡 — 화면과 동작 (디자인: 클로드디자인 "끼리톡 UI 디자인 v1")
 // =====================================================================
 import { CONFIG } from './config.js';
 import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.16.1';
+const VERSION = '1.17.0';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
-const APP = CONFIG.APP_NAME;
+// v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
+const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
+const CONTACT = String(CONFIG.CONTACT_EMAIL || '').trim();
 const app = document.getElementById('app');
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -57,6 +59,7 @@ const S = {
   phone: undefined,
   listSeen: new Set(),   // 채팅 목록에 이미 반영한 메시지 번호
   requests: [],          // 받은 친구 요청
+  blocks: new Set(),     // v1.17: 내가 차단한 회원 ID
   chatFilter: 'all',     // 채팅 목록: all / dm / group   // undefined = 아직 모름, null = 등록 안 함, { phone, findable }
 };
 
@@ -338,9 +341,12 @@ function setOffline(off) {
 
 function authShell(inner) {
   return `<div class="screen auth"><div class="scroll">
-    <div class="auth-top">${ic('logo', 76)}<h1>${esc(APP)}</h1><p>가볍게, 상큼하게 대화해요</p></div>
+    <div class="auth-top">${ic('logo', 76)}<h1>${esc(APP)}</h1><p>친구끼리, 가볍게 대화해요</p></div>
     <div class="auth-card">${inner}</div></div></div>`;
 }
+
+// v1.17: 이용약관 · 개인정보처리방침 링크 (로그인 화면 아래)
+const legalLinksHtml = () => `<div class="legal-links"><a href="./terms.html" target="_blank" rel="noopener">이용약관</a><span aria-hidden="true">·</span><a href="./privacy.html" target="_blank" rel="noopener"><b>개인정보처리방침</b></a>${CONTACT ? `<span aria-hidden="true">·</span><a href="mailto:${esc(CONTACT)}">문의</a>` : ''}</div>`;
 
 function renderFatal(msg) {
   app.innerHTML = authShell(`<div class="setup-box">${esc(msg)}</div><button class="btn" onclick="location.reload()">새로고침</button>`);
@@ -382,16 +388,21 @@ function renderAuth(mode = 'login') {
         ${signup ? fieldHtml('password2', '비밀번호 확인', { type: 'password', ph: '한 번 더 입력', auto: 'new-password' }) : ''}
         ${signup ? fieldHtml('phone', '휴대폰 번호 (선택)', { type: 'tel', ph: '010-1234-5678', help: '친구가 휴대폰 번호로 나를 찾을 때 쓰여요. 다른 사람에게는 보이지 않아요', auto: 'tel', max: 16 }) : ''}
       </div>
+      ${signup ? `<div class="field agree-field" data-field="agree"><label class="agree"><input type="checkbox" name="agree" value="yes" id="f-agree">
+        <span><a href="./terms.html" target="_blank" rel="noopener">이용약관</a>과 <a href="./privacy.html" target="_blank" rel="noopener">개인정보처리방침</a>에 동의하며, 만 14세 이상이에요 <b>(필수)</b></span></label>
+        <div class="field-err" id="err-agree"></div></div>` : ''}
       <button class="btn" type="submit" id="authBtn">${signup ? '가입 신청하기' : '로그인'}</button>
     </form>
     ${signup ? `<div class="note-mint">${ic('shield', 18)}아이디는 가입 후 바꿀 수 없어요. 관리자 설정에 따라 승인 후 이용할 수 있어요.</div>`
-    : '<div class="foot-note">비밀번호를 잊었다면 관리자에게 초기화를 요청하세요.</div>'}`);
+    : '<div class="foot-note">비밀번호를 잊었다면 관리자에게 초기화를 요청하세요.</div>'}
+    ${legalLinksHtml()}`);
 
   setOffline(!navigator.onLine);
   showInviteBanner();
   $$('.seg button').forEach((b) => (b.onclick = () => renderAuth(b.dataset.mode)));
   const form = $('#authForm');
   form.addEventListener('input', (e) => { if (e.target.name) setFieldErr(form, e.target.name, ''); });
+  form.addEventListener('change', (e) => { if (e.target.name === 'agree') setFieldErr(form, 'agree', ''); });
   form.onsubmit = async (e) => {
     e.preventDefault();
     const f = Object.fromEntries(new FormData(form));
@@ -405,7 +416,8 @@ function renderAuth(mode = 'login') {
     if (signup && (!f.password2 || f.password2 !== f.password)) errs.password2 = '비밀번호가 일치하지 않아요';
     const phone = signup ? (f.phone || '').trim() : '';
     if (phone && !normPhone(phone)) errs.phone = '휴대폰 번호를 정확히 입력해 주세요 (예: 010-1234-5678)';
-    ['displayName', 'username', 'password', 'password2', 'phone'].forEach((k) => setFieldErr(form, k, errs[k] || ''));
+    if (signup && f.agree !== 'yes') errs.agree = '약관에 동의해야 가입할 수 있어요';
+    ['displayName', 'username', 'password', 'password2', 'phone', 'agree'].forEach((k) => setFieldErr(form, k, errs[k] || ''));
     if (Object.keys(errs).length) return;
     const btn = $('#authBtn');
     btn.disabled = true; btn.innerHTML = '<span class="spin-sm" style="width:18px;height:18px;border-width:2.5px;border-color:rgba(12,59,48,.25);border-top-color:#0C3B30"></span>';
@@ -441,10 +453,14 @@ async function enterApp(id) {
     return;
   }
   if (S.me.status && S.me.status !== 'active') { renderBlocked(S.me.status); return; }
+  // v1.17: 약관 동의 전에 가입한 회원은 한 번 동의를 받음 (데이터베이스가 예전 버전이면 건너뜀)
+  if ('terms_agreed_at' in S.me && !S.me.terms_agreed_at && api.agreeTerms) {
+    if (!(await askTerms())) return;
+  }
   cacheProfile(S.me);
   buildShell();
-  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected });
-  await Promise.all([loadFriends(), loadRooms()]).catch(showErr);
+  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport });
+  await Promise.all([loadFriends(), loadRooms(), loadBlocks()]).catch(showErr);
   loadSuggestions();
   loadRequests();
   route();
@@ -469,8 +485,8 @@ function renderBlocked(status) {
       <div class="info-card"><div class="kv"><span>아이디</span><span>@${esc(S.me.username)}</span></div>
         <div class="kv"><span>${pending ? '신청일' : '이름'}</span><span>${pending ? fmtDay(S.me.created_at) : esc(S.me.display_name)}</span></div></div>
     </div>
-    <div class="btn-col">${pending ? '<button class="btn" id="recheckBtn">승인 상태 새로고침</button><button class="btn text" id="blockedLogout">로그아웃</button>'
-    : '<button class="btn line" id="blockedLogout" style="font-weight:700">로그아웃</button>'}</div></div>`;
+    <div class="btn-col">${pending ? '<button class="btn" id="recheckBtn">승인 상태 새로고침</button><button class="btn text" id="blockedLogout">로그아웃</button><button class="btn text danger-text" id="blockedWithdraw" style="font-size:14px">가입 취소 (회원 탈퇴)</button>'
+    : '<button class="btn line" id="blockedLogout" style="font-weight:700">로그아웃</button>'}</div>${legalLinksHtml()}</div>`;
   setOffline(!navigator.onLine);
   const re = $('#recheckBtn');
   if (re) re.onclick = async () => {
@@ -483,6 +499,34 @@ function renderBlocked(status) {
     re.disabled = false;
   };
   $('#blockedLogout').onclick = async () => { await api.signOut(); leaveApp(); };
+  const wd = $('#blockedWithdraw');
+  if (wd) wd.onclick = () => showWithdraw();
+}
+
+// v1.17: 약관 동의 (동의하면 true, 로그아웃하면 false)
+function askTerms() {
+  return new Promise((resolve) => {
+    app.innerHTML = `<div class="screen blocked"><div class="center">
+        <div class="big-icon mint">${ic('doc', 44)}</div>
+        <h2>약관 동의가 필요해요</h2>
+        <p>${esc(APP)}을 계속 이용하려면 아래 내용을 확인하고 동의해 주세요.</p>
+        <div class="info-card terms-card">
+          <a href="./terms.html" target="_blank" rel="noopener">이용약관 보기</a>
+          <a href="./privacy.html" target="_blank" rel="noopener">개인정보처리방침 보기</a>
+          <label class="agree"><input type="checkbox" id="termsChk"><span>이용약관과 개인정보처리방침에 동의하며, 만 14세 이상이에요 (필수)</span></label>
+        </div>
+      </div>
+      <div class="btn-col"><button class="btn" id="termsOk" disabled>동의하고 계속하기</button><button class="btn text" id="termsLogout">로그아웃</button></div></div>`;
+    setOffline(!navigator.onLine);
+    const chk = $('#termsChk'); const okBtn = $('#termsOk');
+    chk.onchange = () => { okBtn.disabled = !chk.checked; };
+    okBtn.onclick = async () => {
+      okBtn.disabled = true;
+      try { await api.agreeTerms(); S.me.terms_agreed_at = new Date().toISOString(); app.innerHTML = splashHtml(); resolve(true); }
+      catch (e) { okBtn.disabled = false; showErr(e); }
+    };
+    $('#termsLogout').onclick = async () => { await api.signOut(); leaveApp(); resolve(false); };
+  });
 }
 
 function leaveApp() {
@@ -492,7 +536,7 @@ function leaveApp() {
     uid: null, entered: false, me: null, friends: [], rooms: [], roomsLoaded: false, room: null,
     fromList: false, unsub: null, wasSubscribed: false, tab: 'friends', pushOn: false,
     admin: null, adminFromMore: false, lastTouch: 0, pending: 0, suggestions: [], phone: undefined,
-    requests: [], chatFilter: 'all',
+    requests: [], chatFilter: 'all', blocks: new Set(),
   });
   S.profiles.clear(); S.imgUrls.clear();
   setBadge(0);
@@ -699,10 +743,19 @@ function renderMore(head, body) {
       <button class="item" data-act="change-password"><span class="tile lav">${ic('lock', 19)}</span><span class="label">비밀번호 변경</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <div class="item"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림</span>
         <button class="switch ${on ? 'on' : ''}" data-act="notif" role="switch" aria-checked="${on}" aria-label="새 메시지 알림"></button></div>
-      <button class="item" data-act="install"><span class="tile mint">${ic('install', 19)}</span><span class="label">홈 화면에 설치</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      ${isStandalone() ? '' : `<button class="item" data-act="install"><span class="tile mint">${ic('install', 19)}</span><span class="label">홈 화면에 설치</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>`}
     </div>
-    ${me.is_admin ? `<button class="card item" data-act="open-admin"><span class="tile lemon">${ic('shield', 19)}</span><span class="label">회원 관리</span><span id="pendingBadge">${S.pending ? `<span class="chip-lemon">승인 대기 ${S.pending}</span>` : ''}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>` : ''}
+    <div class="card">
+      <div class="card-head">고객 지원</div>
+      <button class="item" data-act="blocks"><span class="tile pink">${ic('userx', 19)}</span><span class="label">차단한 사용자</span><span class="val">${S.blocks.size ? `${S.blocks.size}명` : ''}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <button class="item" data-act="contact-support"><span class="tile sky">${ic('mail', 19)}</span><span class="label">문의하기<span class="sub">${CONTACT ? esc(CONTACT) : '신고·불편 사항을 운영자에게 보내요'}</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <a class="item" href="./terms.html" target="_blank" rel="noopener"><span class="tile lav">${ic('doc', 19)}</span><span class="label">이용약관</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</a>
+      <a class="item" href="./privacy.html" target="_blank" rel="noopener"><span class="tile lav">${ic('lock', 19)}</span><span class="label"><b>개인정보처리방침</b></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</a>
+      <a class="item" href="./licenses.html" target="_blank" rel="noopener"><span class="tile lav">${ic('book', 19)}</span><span class="label">오픈소스 라이선스</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</a>
+    </div>
+    ${me.is_admin ? `<button class="card item" data-act="open-admin"><span class="tile lemon">${ic('shield', 19)}</span><span class="label">회원 관리</span><span id="reportBadgeMore">${S.openReports ? `<span class="chip-lemon">신고 ${S.openReports}</span>` : ''}</span><span id="pendingBadge">${S.pending ? `<span class="chip-lemon">승인 대기 ${S.pending}</span>` : ''}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>` : ''}
     <button class="card item danger" data-act="logout"><span class="tile pink">${ic('logout', 19)}</span><span class="label">로그아웃</span></button>
+    <button class="withdraw-link" data-act="withdraw">회원 탈퇴</button>
     <div class="version">${esc(APP)} 버전 ${VERSION}</div>
   </div>`;
 
@@ -718,6 +771,7 @@ function renderMore(head, body) {
       const b = $('#pendingBadge');
       if (b) b.innerHTML = S.pending ? `<span class="chip-lemon">승인 대기 ${S.pending}</span>` : '';
     }).catch(() => {});
+    refreshReportBadge();
   }
 }
 
@@ -728,6 +782,7 @@ function showEditProfile() {
     body: `<div style="display:flex;justify-content:center;padding:4px 0 20px"><div class="edit-av" id="editAv">${av(me, 96)}
         <button class="cam-btn" data-x="photo" aria-label="프로필 사진 변경">${ic('camera', 18)}</button></div></div>
       <input type="file" id="avatarInput" accept="image/*" hidden>
+      <div style="text-align:center;margin:-10px 0 14px"><button class="link-btn" data-x="avdel" hidden>사진 삭제</button></div>
       <div class="auth-fields">
         <div class="field" data-field="pfName"><label for="pfName">이름</label><input class="input" id="pfName" maxlength="20" value="${esc(me.display_name)}"><div class="field-err" id="err-pfName"></div></div>
         <div class="field"><label for="pfStatus">상태메시지</label><input class="input" id="pfStatus" maxlength="60" value="${esc(me.status_message || '')}" placeholder="상태메시지를 입력하세요"><div class="counter" id="stCount">${(me.status_message || '').length}/60</div></div>
@@ -748,7 +803,23 @@ function showEditProfile() {
           S.me = await api.updateProfile({ avatar_url: url });
           cacheProfile(S.me);
           $('#editAv', sheet).firstElementChild.outerHTML = av(S.me, 96);
+          syncAvDel();
           renderMain(); toast('프로필 사진을 바꿨어요');
+          if (api.cleanupAvatars) api.cleanupAvatars(url);   // v1.17: 예전 사진 파일 지우기
+        } catch (ex) { showErr(ex); }
+      };
+      // v1.17: 프로필 사진 삭제
+      const syncAvDel = () => { const d = $('[data-x=avdel]', sheet); if (d) d.hidden = !S.me.avatar_url; };
+      syncAvDel();
+      $('[data-x=avdel]', sheet).onclick = async (e) => {
+        e.stopPropagation();
+        if (!(await ask('프로필 사진을 삭제할까요?', '기본 프로필로 바뀌고 사진 파일도 지워져요.', '삭제', true))) return;
+        try {
+          S.me = await api.updateProfile({ avatar_url: null });
+          cacheProfile(S.me);
+          $('#editAv', sheet).firstElementChild.outerHTML = av(S.me, 96);
+          syncAvDel(); renderMain(); toast('프로필 사진을 삭제했어요');
+          if (api.cleanupAvatars) api.cleanupAvatars(null);
         } catch (ex) { showErr(ex); }
       };
       $('[data-x=save]', sheet).onclick = async (e) => {
@@ -765,8 +836,9 @@ function showEditProfile() {
   });
 }
 
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true || document.referrer.startsWith('android-app://');
 function showInstall() {
-  const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  const standalone = isStandalone();
   const ios = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   const steps = ios
     ? [['Safari 아래쪽 공유 버튼 누르기', 'share', '#2C6FD6'], ['‘홈 화면에 추가’ 고르기', 'addsq', '#4A5463'], ['오른쪽 위 ‘추가’ 누르기', '', '']]
@@ -908,7 +980,9 @@ function msgHtml(m, prev, next) {
   const mine = m.sender_id === S.uid && !notice;
   const first = notice || !sameGroup(prev, m) || (prev && dayKey(prev.created_at) !== dayKey(m.created_at));
   const p = profileOf(m.sender_id);
-  const content = m.kind === 'image'
+  const hidden = !notice && !mine && m.kind !== 'deleted' && isBlocked(m.sender_id);   // v1.17: 차단한 사람의 메시지는 가림
+  const content = hidden ? `<div class="bubble deleted blocked">${ic('userx', 15, 'flex:none')}차단한 사용자의 메시지예요</div>`
+    : m.kind === 'image'
     ? `<button class="bubble photo" data-act="view-img" data-id="${esc(m.id)}" aria-label="사진 크게 보기"><img alt="사진" ${m.localUrl ? `src="${esc(m.localUrl)}"` : ''} data-path="${esc(m.content)}"></button>`
     : m.kind === 'deleted' ? `<div class="bubble deleted">${ic('ban', 15, 'flex:none')}삭제된 메시지예요</div>`
     : m.kind === 'sticker' ? `<button class="bubble sticker" data-act="replay-sticker" aria-label="이모티콘 다시 움직이기">${stickerSvg(m.content, 120)}</button>`
@@ -1274,18 +1348,22 @@ function showMsgMenu(m) {
   const mineMsg = m.sender_id === S.uid;
   const local = !isNum(m.id);   // 아직 안 보내졌거나 실패한 메시지
   const items = [];
-  const canReact = !local;
-  if (!local && !isNoticeRoom() && $('#msgInput')) items.push(['reply', ic('reply', 22), '답장']);
-  if (m.kind === 'text') items.push(['copy', ic('copy', 22), '복사']);
-  if (m.kind === 'contact' && contactOf(m)) items.push(['copy', ic('copy', 22), '이름·번호 복사']);
-  if (m.kind === 'file' && isNum(m.id)) items.push(['save', ic('download', 22), '저장']);
+  const canReact = !local && !(m.sender_id !== S.uid && !isNoticeRoom() && isBlocked(m.sender_id));
+  const hiddenMsg = !mineMsg && !isNoticeRoom() && isBlocked(m.sender_id);   // v1.17: 차단한 사람 메시지는 신고·차단 해제만
+  if (!local && !isNoticeRoom() && $('#msgInput') && !hiddenMsg) items.push(['reply', ic('reply', 22), '답장']);
+  if (m.kind === 'text' && !hiddenMsg) items.push(['copy', ic('copy', 22), '복사']);
+  if (m.kind === 'contact' && contactOf(m) && !hiddenMsg) items.push(['copy', ic('copy', 22), '이름·번호 복사']);
+  if (m.kind === 'file' && isNum(m.id) && !hiddenMsg) items.push(['save', ic('download', 22), '저장']);
   if (mineMsg) items.push(['delete', ic('ban', 22), local ? '보내기 취소' : '삭제']);
+  const canReport = !mineMsg && !local && !isNoticeRoom() && !!m.sender_id && !!api.report;
+  if (canReport) items.push(['report', ic('flag', 22), '신고']);
+  if (canReport) items.push(hiddenMsg ? ['unblock', ic('userx', 22), '차단 해제'] : ['block', ic('userx', 22), '이 사람 차단']);
   if (!items.length && !canReact) return;
   const my = canReact && R.reacts && R.reacts.get(m.id) ? R.reacts.get(m.id).get(S.uid) : null;
   openSheet({
     title: '메시지', bare: true,
     body: `${canReact ? `<div class="rx-bar" role="group" aria-label="공감">${REACTS.map(([k, c, l]) => `<button class="${my === k ? 'on' : ''}" data-rx="${k}" aria-label="${l}${my === k ? ' (누르면 취소)' : ''}">${c}</button>`).join('')}</div>${reactWhoHtml(m)}` : ''}
-      <div class="msg-menu">${items.map(([k, i, l]) => `<button class="menu-row ${k === 'delete' ? 'leave' : ''}" data-x="${k}">${i}<span>${l}</span></button>`).join('')}</div>
+      <div class="msg-menu">${items.map(([k, i, l]) => `<button class="menu-row ${k === 'delete' || k === 'report' || k === 'block' ? 'leave' : ''}" data-x="${k}">${i}<span>${l}</span></button>`).join('')}</div>
       <button class="btn gray" data-close style="margin-top:8px">닫기</button>`,
     onMount(sheet, close) {
       sheet.addEventListener('click', async (e) => {
@@ -1300,6 +1378,13 @@ function showMsgMenu(m) {
           try { await navigator.clipboard.writeText(text); toast(c ? '이름과 번호를 복사했어요' : '메시지를 복사했어요'); } catch { toast('복사하지 못했어요', { error: true }); }
         }
         if (x.dataset.x === 'save') openFile(m);
+        if (x.dataset.x === 'report' || x.dataset.x === 'block' || x.dataset.x === 'unblock') {
+          const pp = profileOf(m.sender_id); const nm = pp ? pp.display_name : '(알 수 없음)';
+          if (x.dataset.x === 'report') showReport({ userId: m.sender_id, name: nm, m });
+          else if (x.dataset.x === 'block') blockUser(m.sender_id, nm);
+          else unblockUser(m.sender_id, nm);
+          return;
+        }
         if (x.dataset.x === 'delete') {
           if (local) { R.msgs = R.msgs.filter((y) => y !== m); if (S.room === R) renderMsgs(); return; }
           if (!(await ask('메시지를 삭제할까요?', '모든 대화 상대의 화면에서 "삭제된 메시지예요"로 바뀌어요. 되돌릴 수 없어요.', '삭제', true))) return;
@@ -1787,6 +1872,266 @@ function showAdForm(ad) {
   });
 }
 
+// ---------------------------------------------------------------------
+// v1.17: 차단 · 신고 · 회원 탈퇴 · 고객 지원 (스토어 등록 필수 기능)
+// ---------------------------------------------------------------------
+const isBlocked = (id) => !!id && S.blocks.has(id);
+async function loadBlocks() {
+  if (!api.myBlocks) return;
+  try { S.blocks = new Set((await api.myBlocks()).map((b) => b.id)); }
+  catch (e) { console.warn('blocks', e); }   // 데이터베이스가 예전 버전이면 차단 없이
+}
+function blockedChanged() {
+  if (S.room) renderMsgs();
+  refreshRoomsSoon();
+  if (!S.room) renderMain();
+}
+async function blockUser(id, name) {
+  if (!(await ask(`${name}님을 차단할까요?`, '친구에서 빠지고 1:1 대화·친구 요청·알림이 오지 않아요. 단체방에서는 이 사람의 메시지가 가려져요. 상대에게는 알리지 않아요.', '차단', true))) return false;
+  try {
+    await api.blockUser(id);
+    S.blocks.add(id);
+    await loadFriends().catch(() => {});
+    S.requests = S.requests.filter((x) => x.id !== id); updateFriendBadge();
+    blockedChanged();
+    toast(`${name}님을 차단했어요`);
+    return true;
+  } catch (e) { showErr(e); return false; }
+}
+async function unblockUser(id, name) {
+  try {
+    await api.unblockUser(id);
+    S.blocks.delete(id);
+    blockedChanged();
+    toast(`${name}님의 차단을 풀었어요. 대화하려면 친구로 다시 추가해 주세요`);
+    return true;
+  } catch (e) { showErr(e); return false; }
+}
+
+const REPORT_REASONS = [['spam', '스팸·광고'], ['abuse', '욕설·비방·괴롭힘'], ['sexual', '음란하거나 성적인 내용'], ['illegal', '불법 정보 (사기·도박·불법 거래 등)'], ['other', '기타']];
+// 신고하기 (m: 메시지 신고, 없으면 사람 신고)
+function showReport({ userId, name, m = null }) {
+  openSheet({
+    title: m ? '메시지 신고' : `${name}님 신고`,
+    body: `<p class="sheet-desc">${m ? '이 메시지를' : '이 회원을'} 신고하는 이유를 골라 주세요. 운영자가 확인하고 조치해요. 신고한 사실은 상대에게 알리지 않아요.</p>
+      <div class="reason-list" role="radiogroup" aria-label="신고 사유">${REPORT_REASONS.map(([k, l]) => `<label class="reason"><input type="radio" name="reason" value="${k}"><span>${l}</span></label>`).join('')}</div>
+      <div class="field-err" id="err-reason"></div>
+      <textarea class="input" id="repDetail" maxlength="300" rows="3" placeholder="자세한 내용 (선택)"></textarea>
+      ${isBlocked(userId) ? '' : `<label class="agree" style="margin-top:12px"><input type="checkbox" id="repBlock"><span>${esc(name)}님 차단하기</span></label>`}
+      <button class="btn danger" data-x="send" style="margin-top:16px">${ic('flag', 18)}신고하기</button>`,
+    onMount(sheet, close) {
+      sheet.addEventListener('change', () => { const e = $('#err-reason', sheet); if (e) e.innerHTML = ''; });
+      sheet.addEventListener('click', async (e) => {
+        const x = e.target.closest('[data-x="send"]'); if (!x) return;
+        const r = $('input[name=reason]:checked', sheet);
+        if (!r) { $('#err-reason', sheet).innerHTML = `${ic('alert', 16, 'flex:none')}신고 사유를 골라 주세요`; return; }
+        const alsoBlock = $('#repBlock', sheet) && $('#repBlock', sheet).checked;
+        x.disabled = true;
+        try {
+          await api.report({ target: m ? null : userId, message: m ? m.id : null, reason: r.value, detail: $('#repDetail', sheet).value.trim() });
+          close();
+          if (alsoBlock) {
+            await api.blockUser(userId); S.blocks.add(userId);
+            await loadFriends().catch(() => {});
+            blockedChanged();
+            toast(`신고하고 ${name}님을 차단했어요. 운영자가 확인 후 조치할게요`);
+          } else toast('신고했어요. 운영자가 확인 후 조치할게요');
+        } catch (ex) { x.disabled = false; showErr(ex); }
+      });
+    },
+  });
+}
+
+// 차단한 사용자 목록
+async function showBlocks() {
+  let rows = [];
+  try { rows = await api.myBlocks(); } catch (e) { showErr(e); return; }
+  S.blocks = new Set(rows.map((b) => b.id));
+  openSheet({
+    title: '차단한 사용자',
+    body: `<p class="sheet-desc">차단을 풀어도 친구로 다시 추가되지는 않아요.</p>
+      <div class="block-list">${rows.length ? rows.map((b) => `<div class="mrow" data-id="${esc(b.id)}">${av(b, 40)}
+        <div class="meta"><span class="name">${esc(b.display_name)}</span><span class="desc">@${esc(b.username)} · ${fmtDay(b.blocked_at)} 차단</span></div>
+        <button class="btn line sm" data-x="unblock" data-id="${esc(b.id)}">차단 해제</button></div>`).join('')
+    : '<div class="empty-line">차단한 사용자가 없어요</div>'}</div>`,
+    onMount(sheet) {
+      sheet.addEventListener('click', async (e) => {
+        const x = e.target.closest('[data-x="unblock"]'); if (!x) return;
+        const b = rows.find((r) => r.id === x.dataset.id);
+        x.disabled = true;
+        if (await unblockUser(b.id, b.display_name)) {
+          x.closest('.mrow').remove();
+          if (!$('.block-list .mrow', sheet)) $('.block-list', sheet).innerHTML = '<div class="empty-line">차단한 사용자가 없어요</div>';
+        } else x.disabled = false;
+      });
+    },
+  });
+}
+
+// 문의하기
+function contactSupport() {
+  if (!CONTACT) { toast('운영자가 문의 이메일을 아직 등록하지 않았어요', { error: true }); return; }
+  const subject = encodeURIComponent(`[${APP}] 문의`);
+  const body = encodeURIComponent(`\n\n----\n아이디: @${S.me ? S.me.username : ''}\n앱 버전: ${VERSION}`);
+  location.href = `mailto:${CONTACT}?subject=${subject}&body=${body}`;
+}
+
+// 회원 탈퇴
+function showWithdraw() {
+  openSheet({
+    title: '회원 탈퇴',
+    body: `<div class="withdraw-info">
+        <p><b>탈퇴하면 바로 지워져요</b></p>
+        <ul><li>계정, 프로필(이름·사진·상태메시지), 휴대폰 번호</li><li>친구 목록, 차단 목록, 대화방 참여 정보</li><li>알림 설정, 초대 링크</li></ul>
+        <p>이미 보낸 메시지는 상대방 대화방에 <b>"(알 수 없음)"</b>으로 남아요. 아래를 선택하면 내가 보낸 메시지·사진·파일도 모두 지워요.</p>
+      </div>
+      <label class="agree"><input type="checkbox" id="wdWipe"><span>내가 보낸 메시지·사진·파일도 모두 삭제</span></label>
+      <div class="field" data-field="wd" style="margin-top:14px"><label for="wdConfirm">확인을 위해 <b>탈퇴</b> 라고 입력해 주세요</label>
+        <input class="input" id="wdConfirm" placeholder="탈퇴" autocomplete="off"><div class="field-err" id="err-wd"></div></div>
+      <button class="btn danger" data-x="go" style="margin-top:16px" disabled>탈퇴하기</button>
+      <p class="foot-note" style="margin-top:12px">탈퇴는 되돌릴 수 없어요. 같은 아이디로 다시 가입할 수는 있어요.</p>`,
+    onMount(sheet, close) {
+      const inp = $('#wdConfirm', sheet); const go = $('[data-x="go"]', sheet);
+      inp.oninput = () => { go.disabled = inp.value.trim() !== '탈퇴'; };
+      go.onclick = async () => {
+        if (inp.value.trim() !== '탈퇴') return;
+        go.disabled = true; go.innerHTML = '<span class="spin-sm"></span>';
+        try {
+          await detachPush().catch(() => {});
+          await api.deleteMyAccount($('#wdWipe', sheet).checked);
+          close();
+          closeAllSheets();
+          leaveApp();
+          toast(`탈퇴했어요. 그동안 ${APP}을 이용해 주셔서 고마워요`, { ms: 4000 });
+        } catch (e) {
+          go.disabled = false; go.textContent = '탈퇴하기';
+          showErr(e);
+        }
+      };
+    },
+  });
+}
+
+// 관리자 강제 탈퇴 확인 (null = 취소, true/false = 보낸 메시지도 삭제할지)
+function askAdminDelete(name) {
+  return new Promise((resolve) => {
+    let done = false;
+    const sheet = openSheet({
+      title: `${name}님을 강제 탈퇴시킬까요?`,
+      body: `<p class="sheet-desc">계정·프로필 사진·친구·대화방 정보가 삭제되고 되돌릴 수 없어요. 보낸 메시지는 "(알 수 없음)"으로 남아요. 이메일로 탈퇴 요청을 받은 경우 요청 내용에 맞게 골라 주세요.</p>
+        <label class="agree"><input type="checkbox" id="admWipe"><span>보낸 메시지·사진·파일도 모두 삭제</span></label>
+        <div class="two" style="margin-top:18px"><button class="btn gray" data-no>취소</button><button class="btn danger" data-yes>강제 탈퇴</button></div>`,
+      onMount(el, close) {
+        $('[data-no]', el).onclick = () => close();
+        $('[data-yes]', el).onclick = () => { done = true; const w = $('#admWipe', el).checked; close(); resolve(w); };
+        onSheetGone(el, () => { if (!done) resolve(null); });
+      },
+    });
+    return sheet;
+  });
+}
+
+// ---------- 관리자: 신고 처리 ----------
+const REASON_LABEL = Object.fromEntries(REPORT_REASONS);
+const ACTION_LABEL = { dismiss: '문제 없음', delete: '메시지 삭제', suspend: '이용 정지', both: '메시지 삭제 + 이용 정지' };
+async function showReportsAdmin(status = 'open') {
+  let rows = [];
+  try { rows = await api.adminListReports(status); } catch (e) { showErr(e); return; }
+  closeAllSheets();
+  const kindTxt = (r) => (r.message_id == null ? '회원 신고' : r.message_kind === 'image' ? '사진' : r.message_kind === 'file' ? '파일' : r.message_kind === 'sticker' ? '이모티콘' : r.message_kind === 'contact' ? '연락처' : '메시지');
+  openSheet({
+    title: '신고 내역',
+    body: `<div class="seg" style="margin-bottom:12px"><button type="button" data-x="tab" data-s="open" class="${status === 'open' ? 'on' : ''}">처리 대기</button><button type="button" data-x="tab" data-s="done" class="${status === 'done' ? 'on' : ''}">처리 완료</button></div>
+      <div class="rep-list">${rows.length ? rows.map((r) => `<div class="rep-card" data-id="${r.id}">
+        <div class="rep-top"><span class="chip-lemon">${esc(REASON_LABEL[r.reason] || r.reason)}</span><span class="rep-kind">${kindTxt(r)}</span><span class="rep-time">${esc(fmtAgo(r.created_at))}</span></div>
+        <div class="rep-who"><b>${esc(r.target_name || '(탈퇴한 회원)')}</b>${r.target_username ? ` @${esc(r.target_username)}` : ''}${r.target_status === 'suspended' ? ' <span class="chip suspended">정지</span>' : ''} · 누적 신고 ${r.target_reports}건</div>
+        ${r.message_id != null ? `<div class="rep-snap ${r.message_gone ? 'gone' : ''}">${r.message_kind === 'image' && r.media_path && !r.message_gone ? `<img alt="신고된 사진" data-path="${esc(r.media_path)}">` : esc(r.message_kind === 'file' ? `파일: ${r.snapshot}` : r.snapshot)}${r.message_gone ? '<span class="rep-gone">삭제됨</span>' : ''}</div>` : ''}
+        ${r.detail ? `<div class="rep-detail">“${esc(r.detail)}”</div>` : ''}
+        <div class="rep-by">신고: ${esc(r.reporter_name || '(탈퇴한 회원)')}</div>
+        ${r.status === 'open' ? `<div class="rep-actions">
+          <button class="btn line sm" data-x="act" data-a="dismiss">문제 없음</button>
+          ${r.message_id != null && !r.message_gone ? '<button class="btn line sm" data-x="act" data-a="delete">메시지 삭제</button>' : ''}
+          ${r.target_id && r.target_status !== 'suspended' ? '<button class="btn line sm danger-text" data-x="act" data-a="suspend">이용 정지</button>' : ''}
+          ${r.message_id != null && !r.message_gone && r.target_id && r.target_status !== 'suspended' ? '<button class="btn danger sm" data-x="act" data-a="both">삭제 + 정지</button>' : ''}
+        </div>` : `<div class="rep-done">${ic('check', 15)}${esc(ACTION_LABEL[r.action] || '처리됨')}</div>`}
+      </div>`).join('') : `<div class="empty-line">${status === 'open' ? '처리할 신고가 없어요' : '처리한 신고가 없어요'}</div>`}</div>`,
+    onMount(sheet, close) {
+      const imgs = $$('img[data-path]', sheet);
+      if (imgs.length) api.imageUrls(imgs.map((i) => i.dataset.path)).then((u) => imgs.forEach((i) => { if (u[i.dataset.path]) i.src = u[i.dataset.path]; })).catch(() => {});
+      sheet.addEventListener('click', async (e) => {
+        const t = e.target.closest('[data-x="tab"]');
+        if (t) { close(); showReportsAdmin(t.dataset.s); return; }
+        const x = e.target.closest('[data-x="act"]'); if (!x) return;
+        const r = rows.find((y) => String(y.id) === x.closest('.rep-card').dataset.id);
+        const a = x.dataset.a;
+        const msg = {
+          dismiss: ['문제 없음으로 처리할까요?', '신고를 닫고 아무 조치도 하지 않아요.', '처리', false],
+          delete: ['이 메시지를 삭제할까요?', '모든 참여자 화면에서 "삭제된 메시지예요"로 바뀌어요.', '삭제', true],
+          suspend: [`${r.target_name}님의 이용을 정지할까요?`, '로그인과 대화를 할 수 없게 돼요. 회원 관리에서 정지를 풀 수 있어요.', '정지', true],
+          both: ['메시지를 삭제하고 이용을 정지할까요?', `메시지를 지우고 ${r.target_name}님의 이용을 정지해요.`, '삭제 + 정지', true],
+        }[a];
+        if (!(await ask(...msg))) return;
+        try {
+          if ((a === 'delete' || a === 'both') && r.media_path) {
+            await api.removeMedia([{ bucket: r.message_kind === 'image' ? 'chat-images' : 'chat-files', name: r.media_path }]).catch(() => {});
+          }
+          await api.adminResolveReport(r.id, a);
+          toast(`${ACTION_LABEL[a]}(으)로 처리했어요`);
+          refreshReportBadge();
+          closeAllSheets();
+          showReportsAdmin('open');
+        } catch (ex) { showErr(ex); }
+      });
+    },
+  });
+}
+// 새 신고 알림 (관리자)
+function onReport(p) {
+  if (!S.me || !S.me.is_admin) return;
+  S.openReports = Number(p.open) || 0;
+  refreshReportBadge();
+  toast(`새 신고가 들어왔어요 (처리 대기 ${S.openReports}건)`, { onClick: () => { S.adminFromMore = !!S.entered; go('#/admin'); setTimeout(() => showReportsAdmin('open'), 300); } });
+}
+function refreshReportBadge() {
+  if (!api.adminOpenReports) return;
+  api.adminOpenReports().then((n) => {
+    S.openReports = n || 0;
+    const b = $('#reportBadge');
+    if (b) b.innerHTML = S.openReports ? `<span class="chip-lemon">처리 대기 ${S.openReports}</span>` : '';
+    const b2 = $('#reportBadgeMore');
+    if (b2) b2.innerHTML = S.openReports ? `<span class="chip-lemon">신고 ${S.openReports}</span>` : '';
+  }).catch(() => {});
+}
+
+// ---------- 관리자: 금칙어 ----------
+async function showWordsAdmin() {
+  let words = [];
+  try { words = await api.adminGetWords(); } catch (e) { showErr(e); return; }
+  openSheet({
+    title: '금칙어 관리',
+    body: `<p class="sheet-desc">메시지·이름·상태메시지·단체방 이름에 들어간 금칙어는 <b>*</b> 로 가려져요. 쉼표나 줄바꿈으로 구분해 입력하세요. (한 개 30자까지, 영어는 대소문자 구분 없음)</p>
+      <textarea class="input" id="wordsBox" rows="9" style="font-size:15px">${esc(words.join(', '))}</textarea>
+      <div class="field-err" id="err-words"></div>
+      <div class="foot-note" id="wordsCount" style="text-align:left;margin-top:6px"></div>
+      <button class="btn" data-x="save" style="margin-top:14px">저장</button>`,
+    onMount(sheet, close) {
+      const box = $('#wordsBox', sheet);
+      const parse = () => [...new Set(box.value.split(/[,\n]/).map((w) => w.trim()).filter(Boolean))];
+      const count = () => { $('#wordsCount', sheet).textContent = `금칙어 ${parse().length}개`; };
+      box.oninput = () => { $('#err-words', sheet).innerHTML = ''; count(); };
+      count();
+      $('[data-x="save"]', sheet).onclick = async (e) => {
+        const list = parse();
+        const bad = list.find((w) => w.length > 30 || w.includes('*'));
+        if (bad) { $('#err-words', sheet).innerHTML = `${ic('alert', 16, 'flex:none')}"${esc(bad.slice(0, 20))}" — 30자까지, * 없이 입력해 주세요`; return; }
+        e.currentTarget.disabled = true;
+        try { const n = await api.adminSetWords(list); close(); toast(`금칙어 ${n}개를 저장했어요`); }
+        catch (ex) { e.currentTarget.disabled = false; showErr(ex); }
+      };
+    },
+  });
+}
+
 // v1.15: 채팅방 알림 켜기·끄기 (서버에 저장 → 앱을 닫아도 오는 알림·다른 기기에도 적용)
 async function toggleRoomMute(roomId, mute) {
   const prev = isMuted(roomId);
@@ -1878,6 +2223,7 @@ function snippetOf(m) {
   if (!m) return '';
   if (m.missing) return '원본 메시지를 볼 수 없어요';
   if (m.kind === 'deleted') return '삭제된 메시지예요';
+  if (m.sender_id !== S.uid && isBlocked(m.sender_id) && !isNoticeRoom()) return '차단한 사용자의 메시지예요';
   if (m.kind === 'image') return '사진';
   if (m.kind === 'sticker') return '이모티콘';
   if (m.kind === 'file') { const f = fileOf(m); return f ? `파일: ${f.name}` : '파일'; }
@@ -2046,6 +2392,7 @@ async function catchUp() {
 function maybeNotify(m) {
   if (!S.entered || m.sender_id === S.uid || m.kind === 'system') return;
   if (isMuted(m.room_id)) return;   // v1.15: 알림 꺼 둔 방
+  if (isBlocked(m.sender_id)) return;   // v1.17: 차단한 사람
   const inRoom = S.room && S.room.id === m.room_id;
   if (inRoom && !document.hidden) return;
   const sender = profileOf(m.sender_id);
@@ -2101,7 +2448,8 @@ async function showProfile(id) {
         ${isFriend ? '<button class="btn line" data-x="unfriend" style="font-size:15px;color:var(--ink2)">친구 삭제</button>' : `<button class="btn soft" data-x="befriend" style="font-size:15px">${ic('userplus', 18)}친구 추가</button>`}</div>
       ${canChat ? '' : `<div class="note-mint" style="margin-top:12px">${ic('lock', 18)}<span>${isFriend
     ? `상대방도 나를 친구로 추가하면 1:1 채팅을 할 수 있어요. 내 아이디 <b>@${esc(S.me.username)}</b> 를 알려 주세요.`
-    : '서로 친구로 추가해야 1:1 채팅을 할 수 있어요.'}</span></div>`}`}`,
+    : '서로 친구로 추가해야 1:1 채팅을 할 수 있어요.'}</span></div>`}
+      ${api.report ? `<div class="prof-safety">${isBlocked(id) ? `<button data-x="unblock">${ic('userx', 16)}차단 해제</button>` : `<button data-x="block">${ic('userx', 16)}차단</button>`}<button data-x="report">${ic('flag', 16)}신고</button></div>` : ''}`}`,
     onMount(sheet, close) {
       sheet.addEventListener('click', async (e) => {
         const x = e.target.closest('[data-x]'); if (!x) return;
@@ -2110,6 +2458,9 @@ async function showProfile(id) {
           if (act === 'edit') { close(); showEditProfile(); }
           if (act === 'chat') { x.disabled = true; const rid = await api.openDM(id); close(); goRoom(rid); }
           if (act === 'befriend') { await api.addFriend(id); await loadFriends(); loadSuggestions(); close(); friendAddedToast(id, p.display_name); }
+          if (act === 'block') { close(); await blockUser(id, p.display_name); }
+          if (act === 'unblock') { close(); await unblockUser(id, p.display_name); }
+          if (act === 'report') { close(); showReport({ userId: id, name: p.display_name }); }
           if (act === 'unfriend') {
             close();
             if (!(await ask(`${p.display_name}님을 친구에서 삭제할까요?`, '삭제해도 대화방은 그대로 남아요.', '삭제', true))) return;
@@ -2505,6 +2856,8 @@ function renderAdmin() {
       <div class="item" style="padding-top:14px;padding-bottom:14px"><span class="label">가입 승인제<span class="sub">${st.require_approval ? '켜져 있어요 · 새 회원은 관리자 승인 후 이용할 수 있어요' : '꺼져 있어요 · 가입하면 바로 이용할 수 있어요'}</span></span>
         <button class="switch ${st.require_approval ? 'on' : ''}" data-act="admin-approval" role="switch" aria-checked="${st.require_approval}" aria-label="가입 승인제"></button></div>
       <button class="item" data-act="admin-notice"><span class="tile mint">${ic('mega', 19)}</span><span class="label">전체 공지 보내기</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <button class="item" data-act="admin-reports"><span class="tile pink">${ic('flag', 19)}</span><span class="label">신고 내역<span class="sub">회원이 신고한 메시지·회원을 확인하고 조치해요</span></span><span id="reportBadge">${S.openReports ? `<span class="chip-lemon">처리 대기 ${S.openReports}</span>` : ''}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <button class="item" data-act="admin-words"><span class="tile peach">${ic('ban', 19)}</span><span class="label">금칙어 관리<span class="sub">욕설 등 부적절한 말을 * 로 가려요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="admin-ads"><span class="tile lav">${ic('gift', 19)}</span><span class="label">광고 관리<span class="sub">광고 탭에 보일 이미지와 링크를 등록해요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="admin-clean" style="padding-top:14px;padding-bottom:14px"><span class="tile sky">${ic('file', 19)}</span><span class="label">남은 사진·파일 정리<span class="sub">없어진 대화방에 남아 있는 사진·파일을 저장 공간에서 지워요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
     </div>
@@ -2515,6 +2868,7 @@ function renderAdmin() {
   const input = $('#adminSearch');
   input.oninput = () => { A.q = input.value; renderAdminList(); };
   renderAdminList();
+  refreshReportBadge();
 }
 
 // ---------------------------------------------------------------------
@@ -2611,7 +2965,7 @@ async function showInvite() {
         const text = `${S.me.display_name}님이 ${APP}에 초대했어요. 링크를 누르면 바로 친구가 돼요.`;
         if (x.dataset.x === 'share') {
           try { if (navigator.share) { await navigator.share({ title: `${APP} 친구 초대`, text, url }); return; } } catch (ex) { if (ex && ex.name === 'AbortError') return; }
-          try { await navigator.clipboard.writeText(`${text}\n${url}`); toast('초대 링크를 복사했어요. 카톡·문자에 붙여 넣어 보내세요'); } catch { toast('링크를 길게 눌러 복사해 주세요', { error: true }); }
+          try { await navigator.clipboard.writeText(`${text}\n${url}`); toast('초대 링크를 복사했어요. 메신저나 문자에 붙여 넣어 보내세요'); } catch { toast('링크를 길게 눌러 복사해 주세요', { error: true }); }
         }
         if (x.dataset.x === 'copy') {
           try { await navigator.clipboard.writeText(url); toast('초대 링크를 복사했어요'); } catch { toast('링크를 길게 눌러 복사해 주세요', { error: true }); }
@@ -2759,8 +3113,9 @@ function showAdminUser(id) {
             await api.adminClearPhone(u.id); toast(`${n}님의 휴대폰 번호를 삭제했어요`);
           } else if (act === 'delete') {
             close();
-            if (!(await ask(`${n}님을 강제 탈퇴시킬까요?`, '계정과 친구·대화방 정보가 삭제되고 되돌릴 수 없어요. 보낸 메시지는 "(알 수 없음)"으로 남아요.', '강제 탈퇴', true))) return;
-            await api.adminDeleteUser(u.id); toast(`${n}님을 탈퇴 처리했어요`);
+            const wipe = await askAdminDelete(n);
+            if (wipe === null) return;
+            await api.adminDeleteUser(u.id, wipe); toast(`${n}님을 탈퇴 처리했어요`);
             cleanOrphans(true);   // 아무도 없게 된 방의 사진·파일도 정리
           }
           await loadAdmin();
@@ -2899,6 +3254,11 @@ app.addEventListener('click', async (e) => {
     case 'admin-notice': showBroadcast(); break;
     case 'admin-clean': cleanOrphans(false, el); break;
     case 'admin-ads': showAdsAdmin(); break;
+    case 'admin-reports': showReportsAdmin('open'); break;
+    case 'admin-words': showWordsAdmin(); break;
+    case 'blocks': showBlocks(); break;
+    case 'contact-support': contactSupport(); break;
+    case 'withdraw': showWithdraw(); break;
     case 'open-ad': openAd(el.dataset.id); break;
     case 'ads-reload': S.adsLoaded = false; renderMain(); loadAds(); break;
     case 'admin-approval': {

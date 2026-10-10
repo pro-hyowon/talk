@@ -1,6 +1,6 @@
 -- =====================================================================
---  미니톡 — 앱을 닫아도 오는 알림(Web Push) 설정
---  ※ schema.sql(v1.2 이상)을 먼저 실행한 뒤에 실행하세요.
+--  끼리톡 — 앱을 닫아도 오는 알림(Web Push) 설정
+--  ※ schema.sql(v1.17 이상)을 먼저 실행한 뒤에 실행하세요.
 --  ※ 맨 아래 [설정값] 부분은 tools/push-setup.html 도구가 자동으로 채워 줍니다.
 --     도구가 만들어 준 SQL 전체를 그대로 붙여넣고 Run 하면 됩니다.
 --  여러 번 실행해도 안전합니다.
@@ -105,18 +105,20 @@ begin
     join profiles p on p.id = s.user_id and p.status = 'active'
    where s.user_id <> new.sender_id
      -- v1.15: 이 방 알림을 꺼 둔 사람은 빼기
-     and not exists (select 1 from private.room_mutes x where x.room_id = new.room_id and x.user_id = s.user_id);
+     and not exists (select 1 from private.room_mutes x where x.room_id = new.room_id and x.user_id = s.user_id)
+     -- v1.17: 보낸 사람을 차단한 사람은 빼기
+     and not exists (select 1 from private.blocks b where b.user_id = s.user_id and b.blocked_id = new.sender_id);
   if v_subs is null then return new; end if;
 
   select display_name into v_name from profiles where id = new.sender_id;
   select * into v_room from rooms where id = new.room_id;
 
   v_title := coalesce(v_name, '새 메시지');
-  if v_room.is_notice then v_title := '미니톡 공지사항';
+  if v_room.is_notice then v_title := '끼리톡 공지사항';
   elsif v_room.is_group then v_title := v_title || ' · ' || coalesce(v_room.title, '단체방'); end if;
 
   if not coalesce(v_preview, true) then
-    v_title := '미니톡';
+    v_title := '끼리톡';
     v_body  := '새 메시지가 도착했어요.';
   elsif new.kind = 'image' then
     v_body := '사진을 보냈어요.';

@@ -1,14 +1,20 @@
 {
-  "name": "미니톡",
-  "short_name": "미니톡",
-  "description": "가볍게, 상큼하게 대화해요",
+  "id": "./",
+  "name": "끼리톡",
+  "short_name": "끼리톡",
+  "description": "친구끼리 가볍게 주고받는 메신저",
   "lang": "ko",
+  "dir": "ltr",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
   "background_color": "#F6FBF9",
   "theme_color": "#F6FBF9",
+  "categories": [
+    "social",
+    "communication"
+  ],
   "icons": [
     {
       "src": "./icons/icon-192.png",

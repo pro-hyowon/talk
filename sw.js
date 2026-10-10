@@ -1,5 +1,5 @@
-// 미니톡 서비스 워커 — 앱 화면 캐시(오프라인에서도 열림) + 푸시 알림 수신·클릭 처리
-const CACHE = 'minitalk-v1.16.1';
+// 끼리톡 서비스 워커 — 앱 화면 캐시(오프라인에서도 열림) + 푸시 알림 수신·클릭 처리
+const CACHE = 'kkiritalk-v1.17.0';
 const SHELL = [
   './',
   './index.html',
@@ -67,7 +67,7 @@ self.addEventListener('push', (e) => {
     // 앱 화면을 보고 있으면 앱 안의 알림으로 충분 (아이폰은 규정상 항상 표시)
     const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
     if (!isAppleWebKit && wins.some((w) => w.visibilityState === 'visible')) return;
-    await self.registration.showNotification(d.title || '미니톡', {
+    await self.registration.showNotification(d.title || '끼리톡', {
       body: d.body || '새 메시지가 도착했습니다.',
       tag: d.tag || 'minitalk',
       renotify: true,

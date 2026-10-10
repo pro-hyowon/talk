@@ -1,5 +1,5 @@
 // =====================================================================
-//  미니톡 — 알림 발송 함수 (Supabase Edge Function: send-push)
+//  끼리톡 — 알림 발송 함수 (Supabase Edge Function: send-push)
 //  새 메시지가 저장되면 데이터베이스가 이 함수를 호출하고,
 //  이 함수가 받는 사람들의 휴대폰·PC로 암호화된 알림(Web Push)을 보냅니다.
 //  외부 라이브러리 없이 표준 암호 기능(WebCrypto)만 사용합니다.
@@ -133,7 +133,7 @@ export async function handler(req: Request): Promise<Response> {
   try { data = await req.json(); } catch { return new Response('bad json', { status: 400 }); }
   const subs = Array.isArray(data.subs) ? data.subs.slice(0, 500) : [];
   const payload = JSON.stringify({
-    title: data.title ?? '미니톡',
+    title: data.title ?? '끼리톡',
     body: data.body ?? '새 메시지가 도착했습니다.',
     tag: data.room_id ?? 'minitalk',
     url: data.room_id ? `./#/room/${data.room_id}` : './',
