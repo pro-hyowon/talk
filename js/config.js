@@ -13,7 +13,7 @@ export const CONFIG = {
 
   // 화면에 표시될 앱 이름
   APP_NAME: '끼리톡',
-  CONTACT_EMAIL: 'kisting@naver.com',
+  CONTACT_EMAIL: 'kkiritalk@gmail.com',
   OPERATOR_NAME: '박효원',
   SERVER_REGION: '대한민국 서울 (ap-northeast-2)',
 
