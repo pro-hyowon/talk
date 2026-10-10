@@ -13,6 +13,9 @@ export const CONFIG = {
 
   // 화면에 표시될 앱 이름
   APP_NAME: '끼리톡',
+  CONTACT_EMAIL: 'kisting@naver.com',
+  OPERATOR_NAME: '박효',
+  SERVER_REGION: '대한민국 서울 (ap-northeast-2)',
 
   // 아이디 로그인을 위한 내부용 주소 (실제 메일은 발송되지 않음). 바꿀 필요 없습니다.
   //  ※ 이미 가입자가 있는 상태에서 바꾸면 기존 회원이 로그인할 수 없습니다.
