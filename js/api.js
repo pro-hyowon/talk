@@ -14,8 +14,8 @@ function friendly(error) {
   const map = [
     [/Invalid login credentials/i, '아이디 또는 비밀번호가 맞지 않아요'],
     [/banned/i, '이용이 정지된 계정이에요. 관리자에게 문의해 주세요'],
-    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
-    [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found|'reply_to' column/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found|'reply_to' column|relation "public\.ads"|table 'public\.ads'|public\.ads/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/already registered|already exists/i, '이미 사용 중인 아이디예요'],
     [/Database error saving new user/i, '가입할 수 없는 아이디예요. 영문 소문자·숫자·밑줄(_) 3~20자로 입력해 주세요'],
     [/Password should be at least/i, '비밀번호는 6자 이상이어야 해요'],
@@ -248,6 +248,20 @@ export function createApi() {
     // ---------- 관리자 ----------
     async adminConnectFriends(userId, ids) { return must(await sb.rpc('admin_connect_friends', { p_user: userId, p_others: ids })) || 0; },
     async adminUserFriends(userId) { return must(await sb.rpc('admin_user_friends', { p_user: userId })) || []; },
+    // v1.16: 광고
+    async listAds() { return must(await sb.from('ads').select('id,title,link_url,image_path,active,sort,clicks').eq('active', true).order('sort').order('id', { ascending: false })); },
+    async adminListAds() { return must(await sb.from('ads').select('id,title,link_url,image_path,active,sort,clicks').order('sort').order('id', { ascending: false })); },
+    adImageUrl(path) { return sb.storage.from('ads').getPublicUrl(path).data.publicUrl; },
+    async uploadAdImage(blob, ext) {
+      const path = `${crypto.randomUUID()}.${ext}`;
+      must(await sb.storage.from('ads').upload(path, blob, { contentType: blob.type || 'image/jpeg', cacheControl: '31536000' }));
+      return path;
+    },
+    async removeAdImage(path) { try { await sb.storage.from('ads').remove([path]); } catch { /* 무시 */ } },
+    async adminSaveAd(ad) { return must(await sb.rpc('admin_save_ad', { p_id: ad.id, p_title: ad.title || null, p_link: ad.link, p_image: ad.image, p_active: ad.active })); },
+    async adminDeleteAd(id) { const path = must(await sb.rpc('admin_delete_ad', { p_id: id })); if (path) await api.removeAdImage(path); },
+    async adminMoveAd(id, dir) { must(await sb.rpc('admin_move_ad', { p_id: id, p_dir: dir })); },
+    async adClick(id) { try { await sb.rpc('ad_click', { p_id: id }); } catch { /* 무시 */ } },
     async adminOrphanMedia() { return must(await sb.rpc('admin_orphan_media')) || []; },
     async adminSettings() { return must(await sb.rpc('admin_get_settings'))[0]; },
     async adminSetApproval(on) { must(await sb.rpc('admin_set_settings', { p_require_approval: on })); },

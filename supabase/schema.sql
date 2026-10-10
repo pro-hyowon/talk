@@ -1,5 +1,5 @@
 -- =====================================================================
---  미니톡(MiniTalk) v1.15 — Supabase 데이터베이스 설정 스크립트
+--  미니톡(MiniTalk) v1.16.1 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -220,6 +220,19 @@ create table if not exists private.room_mutes (
   foreign key (room_id, user_id) references public.room_members(room_id, user_id) on delete cascade
 );
 revoke all on private.room_mutes from public, anon, authenticated;
+
+-- v1.16: 광고 (관리자가 이미지·링크 등록 → 광고 탭에 표시, 누르면 링크로 이동)
+create table if not exists public.ads (
+  id          bigint generated always as identity primary key,
+  title       text check (title is null or char_length(title) <= 60),
+  link_url    text not null check (link_url ~* '^https?://[^[:space:]]+$' and char_length(link_url) <= 2000),
+  image_path  text not null check (image_path ~ '^[a-z0-9-]{1,80}\.(jpg|jpeg|png|webp|gif)$'),
+  active      boolean not null default true,
+  sort        integer not null default 0,
+  clicks      bigint not null default 0,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
 
 -- v1.14: 친구 초대 링크·QR 코드 (회원마다 하나, 새로 만들면 예전 링크는 더 이상 안 됨)
 create table if not exists private.invite_codes (
@@ -1315,6 +1328,68 @@ begin
 end;
 $$;
 
+-- v1.16: 광고 저장 (p_id 가 없으면 새로 추가 — 새 광고는 맨 위에)
+create or replace function public.admin_save_ad(p_id bigint, p_title text, p_link text, p_image text, p_active boolean)
+returns bigint language plpgsql security definer set search_path = public as $$
+declare
+  v_me    uuid := public.admin_guard();
+  v_id    bigint;
+  v_title text := nullif(left(trim(coalesce(p_title, '')), 60), '');
+  v_link  text := trim(coalesce(p_link, ''));
+begin
+  if v_link !~* '^https?://[^[:space:]]+$' then raise exception '링크 주소는 http:// 또는 https:// 로 시작해야 해요'; end if;
+  if p_id is null then
+    insert into ads (title, link_url, image_path, active, sort)
+    values (v_title, v_link, p_image, coalesce(p_active, true), coalesce((select min(sort) from ads), 1) - 1)
+    returning id into v_id;
+  else
+    update ads set title = v_title, link_url = v_link, image_path = coalesce(p_image, image_path),
+                   active = coalesce(p_active, active), updated_at = now()
+     where id = p_id returning id into v_id;
+    if v_id is null then raise exception '광고를 찾을 수 없어요'; end if;
+  end if;
+  return v_id;
+end;
+$$;
+
+-- v1.16: 광고 삭제 (지운 이미지 경로를 돌려줘서 앱이 저장 공간에서도 지움)
+create or replace function public.admin_delete_ad(p_id bigint)
+returns text language plpgsql security definer set search_path = public as $$
+declare
+  v_me   uuid := public.admin_guard();
+  v_path text;
+begin
+  delete from ads where id = p_id returning image_path into v_path;
+  if v_path is null then raise exception '광고를 찾을 수 없어요'; end if;
+  return v_path;
+end;
+$$;
+
+-- v1.16: 광고 순서 바꾸기 (p_dir = -1 위로, 1 아래로)
+create or replace function public.admin_move_ad(p_id bigint, p_dir integer)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_me  uuid := public.admin_guard();
+  v_ids bigint[];
+  v_i   integer;
+  v_j   integer;
+begin
+  select array_agg(id order by sort, id desc) into v_ids from ads;
+  v_i := array_position(v_ids, p_id);
+  if v_i is null then raise exception '광고를 찾을 수 없어요'; end if;
+  v_j := v_i + sign(p_dir)::int;
+  if v_j < 1 or v_j > cardinality(v_ids) then return; end if;
+  v_ids[v_i] := v_ids[v_j]; v_ids[v_j] := p_id;
+  update ads a set sort = x.ord from unnest(v_ids) with ordinality as x(id, ord) where a.id = x.id;
+end;
+$$;
+
+-- v1.16: 광고를 누른 수 세기
+create or replace function public.ad_click(p_id bigint)
+returns void language sql security definer set search_path = public as $$
+  update ads set clicks = clicks + 1 where id = p_id and active and public.is_active();
+$$;
+
 -- v1.14: 내 초대 코드 (없으면 만듦)
 create or replace function public.my_invite_code()
 returns text language plpgsql security definer set search_path = public, private as $$
@@ -1590,6 +1665,14 @@ create policy "reactions_select_member" on public.message_reactions for select t
   using (public.can_see_message(room_id, message_id));
 revoke all on public.user_phones, public.friend_suggestions from anon, authenticated;
 
+-- v1.16: 광고는 로그인한 회원이 보기만 (관리자는 숨긴 광고도 봄), 고치기는 관리자 함수로만
+alter table public.ads enable row level security;
+revoke all on public.ads from anon, authenticated;
+grant select on public.ads to authenticated;
+drop policy if exists "ads_select" on public.ads;
+create policy "ads_select" on public.ads for select to authenticated
+  using ((active and public.is_active()) or public.is_admin());
+
 do $$
 declare
   f text;
@@ -1604,7 +1687,8 @@ declare
     'admin_list_users(text)', 'admin_set_status(uuid, text)', 'admin_set_admin(uuid, boolean)',
     'admin_reset_password(uuid)', 'admin_delete_user(uuid)', 'admin_get_settings()',
     'admin_set_settings(boolean)', 'admin_broadcast(text)', 'admin_orphan_media()',
-    'admin_connect_friends(uuid, uuid[])', 'admin_user_friends(uuid)'];
+    'admin_connect_friends(uuid, uuid[])', 'admin_user_friends(uuid)',
+    'admin_save_ad(bigint, text, text, text, boolean)', 'admin_delete_ad(bigint)', 'admin_move_ad(bigint, integer)', 'ad_click(bigint)'];
   helper_fns text[] := array[
     'is_active()', 'is_active_user(uuid)', 'is_admin()', 'is_room_member(uuid)', 'is_room_member_text(text)',
     'shares_room_with(uuid)', 'is_notice_room(uuid)', 'admin_guard()',
@@ -1626,7 +1710,7 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------
--- 8. 사진 저장소 (프로필 사진: 공개 / 채팅 사진: 방 참여자만)
+-- 8. 사진 저장소 (프로필 사진: 공개 / 채팅 사진: 방 참여자만 / 광고 이미지: 공개, 관리자만 올림)
 -- ---------------------------------------------------------------------
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values ('avatars', 'avatars', true, 2097152, array['image/jpeg', 'image/png', 'image/webp'])
@@ -1640,6 +1724,20 @@ on conflict (id) do nothing;
 insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 values ('chat-files', 'chat-files', false, 20971520, null)
 on conflict (id) do nothing;
+
+-- v1.16: 광고 이미지 (공개, 한 장 5MB까지)
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('ads', 'ads', true, 5242880, array['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
+on conflict (id) do nothing;
+drop policy if exists "minitalk_ads_insert" on storage.objects;
+create policy "minitalk_ads_insert" on storage.objects for insert to authenticated
+  with check (bucket_id = 'ads' and public.is_admin());
+drop policy if exists "minitalk_ads_select" on storage.objects;
+create policy "minitalk_ads_select" on storage.objects for select to authenticated
+  using (bucket_id = 'ads' and public.is_admin());
+drop policy if exists "minitalk_ads_delete" on storage.objects;
+create policy "minitalk_ads_delete" on storage.objects for delete to authenticated
+  using (bucket_id = 'ads' and public.is_admin());
 
 drop policy if exists "minitalk_avatar_insert" on storage.objects;
 create policy "minitalk_avatar_insert" on storage.objects for insert to authenticated
@@ -1716,6 +1814,11 @@ begin
   perform realtime.send(
     jsonb_build_object('room_id', new.room_id, 'user_id', new.user_id, 'last_read_id', new.last_read_id),
     'read', 'room:' || new.room_id::text, true);
+  -- v1.16.1: 각 참여자 개인 채널로도 보냄 (방 채널 연결이 늦거나 끊겨도 '1' 이 바로 사라지게)
+  perform realtime.send(
+    jsonb_build_object('room_id', new.room_id, 'user_id', new.user_id, 'last_read_id', new.last_read_id),
+    'read', 'user:' || m.user_id::text, true)
+     from room_members m where m.room_id = new.room_id;
   return new;
 exception when others then
   raise warning 'rt_on_read 실패: %', sqlerrm;

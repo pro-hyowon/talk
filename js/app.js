@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.15.2';
+const VERSION = '1.16.1';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 const APP = CONFIG.APP_NAME;
 const app = document.getElementById('app');
@@ -502,7 +502,7 @@ function leaveApp() {
 }
 
 function buildShell() {
-  const tabs = [['friends', '친구', 'user'], ['chats', '채팅', 'chat'], ['more', '더보기', 'more']];
+  const tabs = [['friends', '친구', 'user'], ['chats', '채팅', 'chat'], ['ads', '광고', 'gift'], ['more', '더보기', 'more']];
   app.innerHTML = `
   <div id="main" class="screen main">
     <div class="top" id="mainHeader"></div>
@@ -533,10 +533,11 @@ function route() {
     return;
   }
   closeAdmin();
-  const t = (h.match(/^#\/(friends|chats|more)$/) || [])[1];
+  const t = (h.match(/^#\/(friends|chats|ads|more)$/) || [])[1];
   if (t) S.tab = t;
   renderMain();
   if (S.tab === 'friends') { loadFriends().catch(() => {}); loadSuggestions(); loadRequests(); }
+  if (S.tab === 'ads') loadAds();   // v1.16: 광고 탭을 열 때마다 새로 불러옴
 }
 window.addEventListener('hashchange', route);
 function go(hash) { if (location.hash !== hash) location.hash = hash; else route(); }
@@ -664,6 +665,8 @@ function renderMain() {
     }
     body.innerHTML = `<div class="empty-state" style="padding-top:72px"><div class="es-icon sky">${ic('chat', 52)}</div><b>대화 중인 채팅방이 없어요</b><p>친구를 골라 첫 대화를 시작해 보세요.</p>
         <button class="btn sm" data-act="new-chat">${ic('chatplus', 20)}새 채팅</button></div>`;
+  } else if (S.tab === 'ads') {
+    renderAds(head, body);
   } else {
     renderMore(head, body);
   }
@@ -1016,6 +1019,7 @@ function addMessages(list, { forceBottom = false } = {}) {
   const have = new Set(S.room.msgs.filter((m) => isNum(m.id)).map((m) => m.id));
   const fresh = list.filter((m) => !have.has(m.id));
   if (!fresh.length) return;
+  S.room.lastActivity = Date.now();
   fresh.forEach((m) => { if (m.kind === 'sticker') markAnim(m); });
   let real = S.room.msgs.filter((m) => isNum(m.id)).concat(fresh).sort((a, b) => a.id - b.id);
   // 오래 켜 둔 방은 화면에 남는 메시지를 300개로 줄임 (위로 올리면 다시 불러옴)
@@ -1096,10 +1100,29 @@ function watchReads() {
   const live = !api.realtimeMode || api.realtimeMode() !== 'broadcast';
   R.pollReads = !live && R.members.length > READ_LIVE_MAX && !(R.info && R.info.is_notice);
   if (R.pollReads) R.pollTimer = setInterval(() => { if (!document.hidden) refreshReads(); }, 5000);
+  // v1.16.1: 실시간 읽음 신호가 늦거나 빠져도 '1' 이 남지 않게 — 내 메시지를 아직 안 읽은 사람이 있을 때만 확인
+  //          (대화 중엔 4초마다, 1분 넘게 조용하면 20초마다)
+  R.lastActivity = Date.now();
+  if (!R.pollReads && !(R.info && R.info.is_notice)) {
+    let tick = 0;
+    R.pendTimer = setInterval(() => {
+      tick++;
+      if (document.hidden || S.room !== R || !myReadPending(R)) return;
+      if (Date.now() - R.lastActivity > 60000 && tick % 5) return;
+      refreshReads();
+    }, 4000);
+  }
+}
+function myReadPending(R) {
+  for (let i = R.msgs.length - 1, n = 0; i >= 0 && n < 30; i--, n++) {
+    const m = R.msgs[i];
+    if (m.sender_id === S.uid && isNum(m.id) && m.kind !== 'deleted' && m.kind !== 'system' && unreadCount(m) > 0) return true;
+  }
+  return false;
 }
 function stopWatchReads(R) {
   if (R.unwatch) { try { R.unwatch(); } catch { /* 무시 */ } R.unwatch = null; }
-  clearInterval(R.pollTimer); clearTimeout(R.readsSoon);
+  clearInterval(R.pollTimer); clearInterval(R.pendTimer); clearTimeout(R.readsSoon);
 }
 async function refreshReads() {
   const R = S.room; if (!R) return;
@@ -1624,6 +1647,144 @@ async function sendContactMsg(c, retryMsg) {
     if (S.room === R) renderMsgs();
     showErr(e);
   }
+}
+
+// ---------------------------------------------------------------------
+// v1.16: 광고 탭 — 관리자가 등록한 이미지를 누르면 광고 링크로 이동
+// ---------------------------------------------------------------------
+const safeLink = (u) => (/^https?:\/\/\S+$/i.test(String(u || '')) ? String(u) : null);
+const linkHost = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return ''; } };
+
+async function loadAds() {
+  try { S.ads = await api.listAds(); S.adsError = null; }
+  catch (e) { S.adsError = e.message || '불러오지 못했어요'; S.ads = S.ads || []; }
+  S.adsLoaded = true;
+  if (S.tab === 'ads' && !S.room && $('#main')) renderMain();
+}
+
+function renderAds(head, body) {
+  head.innerHTML = `<h1>광고</h1>`;
+  if (!S.adsLoaded) { body.innerHTML = '<div class="spinner"></div>'; return; }
+  const ads = S.ads || [];
+  if (S.adsError && !ads.length) {
+    body.innerHTML = `<div class="empty-state" style="padding-top:28px"><b>광고를 불러오지 못했어요</b><p>${esc(S.adsError)}</p><button class="btn sm" data-act="ads-reload">다시 불러오기</button></div>`;
+    return;
+  }
+  if (!ads.length) {
+    body.innerHTML = `<div class="empty-state" style="padding-top:28px"><div class="es-icon lav">${ic('gift', 56)}</div><b>아직 광고가 없어요</b><p>${S.me.is_admin ? '더보기 → 회원 관리 → 광고 관리에서 광고를 등록해 보세요.' : '새 소식이 생기면 여기에 보여 드릴게요.'}</p></div>`;
+    return;
+  }
+  body.innerHTML = `<div class="ads-body">${ads.map((a) => `<button class="ad-card" data-act="open-ad" data-id="${esc(a.id)}" aria-label="${esc(a.title || '광고')} 열기">
+      <span class="ad-img"><img src="${esc(api.adImageUrl(a.image_path))}" alt="${esc(a.title || '광고')}" loading="lazy"><span class="ad-badge">AD</span></span>
+      ${a.title ? `<span class="ad-meta"><b>${esc(a.title)}</b></span>` : ''}</button>`).join('')}</div>`;
+}
+
+function openAd(id) {
+  const a = (S.ads || []).find((x) => String(x.id) === String(id));
+  const url = a && safeLink(a.link_url);
+  if (!url) { toast('열 수 없는 링크예요', { error: true }); return; }
+  api.adClick(a.id);
+  const w = window.open(url, '_blank', 'noopener');
+  if (!w) location.href = url;   // 새 창이 막혔으면 이 화면에서 열기
+}
+
+// ---------- 관리자: 광고 관리 ----------
+async function showAdsAdmin() {
+  let list = [];
+  try { list = await api.adminListAds(); } catch (e) { showErr(e); return; }
+  const row = (a, i) => `<div class="ad-row ${a.active ? '' : 'off'}">
+      <button class="ad-thumb" data-x="edit" data-id="${esc(a.id)}" aria-label="광고 고치기"><img src="${esc(api.adImageUrl(a.image_path))}" alt=""></button>
+      <button class="ad-info" data-x="edit" data-id="${esc(a.id)}"><b>${esc(a.title || '(제목 없음)')}</b><span>${esc(linkHost(a.link_url))}</span>
+        <span class="ad-stat"><span class="ad-clicks">클릭 ${Number(a.clicks || 0).toLocaleString()}회</span>${a.active ? '표시 중' : '숨김'}</span></button>
+      <span class="ad-ord"><button class="ibtn sm" data-x="up" data-id="${esc(a.id)}" aria-label="위로" ${i === 0 ? 'disabled' : ''}>${ic('down', 18, 'transform:rotate(180deg)')}</button>
+        <button class="ibtn sm" data-x="down" data-id="${esc(a.id)}" aria-label="아래로" ${i === list.length - 1 ? 'disabled' : ''}>${ic('down', 18)}</button></span></div>`;
+  openSheet({
+    title: '광고 관리',
+    body: `<div class="sub-text">광고 탭에 위에서부터 이 순서대로 보여요. 이미지를 누르면 수정할 수 있어요.</div>
+      ${list.length ? `<div class="ad-total">전체 광고 클릭 <b>${list.reduce((t, a) => t + Number(a.clicks || 0), 0).toLocaleString()}회</b> · 광고 ${list.length}개</div>` : ''}
+      <div class="ad-list" id="adList">${list.length ? list.map(row).join('') : '<div class="empty-line">아직 등록된 광고가 없어요</div>'}</div>
+      <button class="btn" data-x="add" style="margin-top:14px">${ic('plus', 20)}광고 추가</button>`,
+    onMount(sheet, close) {
+      sheet.addEventListener('click', async (e) => {
+        const x = e.target.closest('[data-x]'); if (!x || x.disabled) return;
+        const ad = list.find((a) => String(a.id) === x.dataset.id);
+        if (x.dataset.x === 'add') { close(); showAdForm(null); }
+        if (x.dataset.x === 'edit' && ad) { close(); showAdForm(ad); }
+        if ((x.dataset.x === 'up' || x.dataset.x === 'down') && ad) {
+          x.disabled = true;
+          try { await api.adminMoveAd(ad.id, x.dataset.x === 'up' ? -1 : 1); list = await api.adminListAds(); $('#adList', sheet).innerHTML = list.map(row).join(''); loadAds(); }
+          catch (ex) { x.disabled = false; showErr(ex); }
+        }
+      });
+    },
+  });
+}
+
+function showAdForm(ad) {
+  let file = null; let previewUrl = null; let active = ad ? !!ad.active : true;
+  openSheet({
+    title: ad ? '광고 수정' : '광고 추가',
+    body: `${ad ? `<div class="ad-total" style="margin-bottom:10px">이 광고 클릭 <b>${Number(ad.clicks || 0).toLocaleString()}회</b></div>` : ''}<button class="ad-pick ${ad ? 'has' : ''}" data-x="pick" id="adPick">${ad ? `<img src="${esc(api.adImageUrl(ad.image_path))}" alt="">` : ''}
+        <span class="ad-pick-hint">${ic('image', 26)}<b>${ad ? '이미지 바꾸기' : '광고 이미지 고르기'}</b><span>가로로 긴 이미지 추천 (예: 1200×600) · 5MB 이하</span></span></button>
+      <input type="file" id="adFile" accept="image/jpeg,image/png,image/webp,image/gif" hidden>
+      <div class="field-err" id="err-adimg" style="margin-top:6px"></div>
+      <div class="auth-fields" style="margin-top:12px">${fieldHtml('adlink', '링크 주소', { type: 'url', ph: 'https://', max: 2000 })}${fieldHtml('adtitle', '제목 (선택)', { ph: '예: 가을 맞이 할인 이벤트', max: 60, help: '이미지 아래에 작게 보여요' })}</div>
+      <div class="card-line"><span class="label">광고 탭에 보이기<span class="sub">끄면 회원에게 보이지 않아요 (삭제되지는 않아요)</span></span>
+        <button class="switch ${active ? 'on' : ''}" data-x="active" role="switch" aria-checked="${active}" aria-label="광고 탭에 보이기"></button></div>
+      <button class="btn" data-x="save" style="margin-top:18px">${ad ? '저장' : '등록하기'}</button>
+      ${ad ? '<button class="btn text danger-text" data-x="delete" style="margin-top:4px">광고 삭제</button>' : ''}`,
+    onMount(sheet, close) {
+      const link = $('#f-adlink', sheet); const title = $('#f-adtitle', sheet); const pick = $('#adPick', sheet);
+      if (ad) { link.value = ad.link_url; title.value = ad.title || ''; }
+      link.oninput = () => setFieldErr(sheet, 'adlink', '');
+      onSheetGone(sheet, () => { if (previewUrl) URL.revokeObjectURL(previewUrl); });
+      $('#adFile', sheet).onchange = (e) => {
+        const f = e.target.files[0]; e.target.value = '';
+        if (!f) return;
+        if (!/^image\/(jpeg|png|webp|gif)$/.test(f.type)) { $('#err-adimg', sheet).innerHTML = `${ic('alert', 16, 'flex:none')}JPG·PNG·WEBP·GIF 이미지만 쓸 수 있어요`; return; }
+        file = f; $('#err-adimg', sheet).innerHTML = '';
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        previewUrl = URL.createObjectURL(f);
+        pick.classList.add('has');
+        const img = $('img', pick);
+        if (img) img.src = previewUrl; else pick.insertAdjacentHTML('afterbegin', `<img src="${previewUrl}" alt="">`);
+      };
+      sheet.addEventListener('click', async (e) => {
+        const x = e.target.closest('[data-x]'); if (!x || x.disabled) return;
+        if (x.dataset.x === 'pick') $('#adFile', sheet).click();
+        if (x.dataset.x === 'active') { active = !active; x.classList.toggle('on', active); x.setAttribute('aria-checked', String(active)); }
+        if (x.dataset.x === 'delete') {
+          close();
+          if (!(await ask('이 광고를 삭제할까요?', '광고 탭에서 사라지고 이미지도 지워져요. 되돌릴 수 없어요.', '삭제', true))) { showAdForm(ad); return; }
+          try { await api.adminDeleteAd(ad.id); toast('광고를 삭제했어요'); loadAds(); showAdsAdmin(); } catch (ex) { showErr(ex); }
+        }
+        if (x.dataset.x === 'save') {
+          let url = link.value.trim();
+          if (url && !/^[a-z][a-z0-9+.-]*:/i.test(url)) url = 'https://' + url;   // 주소만 적었으면 https:// 붙이기
+          let bad = false;
+          if (!ad && !file) { $('#err-adimg', sheet).innerHTML = `${ic('alert', 16, 'flex:none')}광고 이미지를 골라 주세요`; bad = true; }
+          if (!url) { setFieldErr(sheet, 'adlink', '링크 주소를 입력해 주세요'); bad = true; }
+          else if (!safeLink(url)) { setFieldErr(sheet, 'adlink', 'http:// 또는 https:// 로 시작하는 주소를 입력해 주세요'); bad = true; }
+          if (bad) return;
+          x.disabled = true; x.innerHTML = '<span class="spin-sm"></span>';
+          let newPath = null;
+          try {
+            if (file) {
+              const prepared = file.type === 'image/gif' || file.size <= 1.5 * 1024 * 1024 ? { blob: file, ext: file.type.split('/')[1].replace('jpeg', 'jpg') } : await prepareChatImage(file);
+              newPath = await api.uploadAdImage(prepared.blob, prepared.ext);
+            }
+            await api.adminSaveAd({ id: ad ? ad.id : null, title: title.value.trim(), link: url, image: newPath, active });
+            if (ad && newPath && ad.image_path !== newPath) api.removeAdImage(ad.image_path);
+            close(); toast(ad ? '광고를 저장했어요' : '광고를 등록했어요');
+            loadAds(); showAdsAdmin();
+          } catch (ex) {
+            if (newPath) api.removeAdImage(newPath);
+            x.disabled = false; x.textContent = ad ? '저장' : '등록하기'; showErr(ex);
+          }
+        }
+      });
+    },
+  });
 }
 
 // v1.15: 채팅방 알림 켜기·끄기 (서버에 저장 → 앱을 닫아도 오는 알림·다른 기기에도 적용)
@@ -2344,6 +2505,7 @@ function renderAdmin() {
       <div class="item" style="padding-top:14px;padding-bottom:14px"><span class="label">가입 승인제<span class="sub">${st.require_approval ? '켜져 있어요 · 새 회원은 관리자 승인 후 이용할 수 있어요' : '꺼져 있어요 · 가입하면 바로 이용할 수 있어요'}</span></span>
         <button class="switch ${st.require_approval ? 'on' : ''}" data-act="admin-approval" role="switch" aria-checked="${st.require_approval}" aria-label="가입 승인제"></button></div>
       <button class="item" data-act="admin-notice"><span class="tile mint">${ic('mega', 19)}</span><span class="label">전체 공지 보내기</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <button class="item" data-act="admin-ads"><span class="tile lav">${ic('gift', 19)}</span><span class="label">광고 관리<span class="sub">광고 탭에 보일 이미지와 링크를 등록해요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="admin-clean" style="padding-top:14px;padding-bottom:14px"><span class="tile sky">${ic('file', 19)}</span><span class="label">남은 사진·파일 정리<span class="sub">없어진 대화방에 남아 있는 사진·파일을 저장 공간에서 지워요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
     </div>
     <label class="search">${ic('search', 20, 'flex:none')}<input id="adminSearch" placeholder="이름·아이디·휴대폰 번호 검색" value="${esc(A.q)}" autocapitalize="off" spellcheck="false"></label>
@@ -2736,6 +2898,9 @@ app.addEventListener('click', async (e) => {
     case 'admin-user': showAdminUser(el.dataset.id); break;
     case 'admin-notice': showBroadcast(); break;
     case 'admin-clean': cleanOrphans(false, el); break;
+    case 'admin-ads': showAdsAdmin(); break;
+    case 'open-ad': openAd(el.dataset.id); break;
+    case 'ads-reload': S.adsLoaded = false; renderMain(); loadAds(); break;
     case 'admin-approval': {
       if (!S.admin || !S.admin.settings) break;
       const on = !S.admin.settings.require_approval;
