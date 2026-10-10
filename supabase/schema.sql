@@ -1,5 +1,5 @@
 -- =====================================================================
---  끼리톡(Kkiri Talk) v1.17 — Supabase 데이터베이스 설정 스크립트
+--  끼리톡(Kkiri Talk) v1.18 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -293,6 +293,68 @@ create table if not exists private.purge_grants (
   primary key (user_id, admin_id)
 );
 revoke all on private.purge_grants from public, anon, authenticated;
+
+-- v1.18: 관리자 개편 — 기간 정지, 회원 메모·제재 이력, 하루 접속 기록(현황판), 1:1 문의
+alter table public.profiles add column if not exists suspended_until timestamptz;   -- 정지 끝나는 때 (null = 영구 정지)
+
+create table if not exists private.member_notes (
+  user_id    uuid primary key references public.profiles(id) on delete cascade,
+  note       text not null default '' check (char_length(note) <= 2000),
+  updated_at timestamptz not null default now(),
+  updated_by uuid references public.profiles(id) on delete set null
+);
+revoke all on private.member_notes from public, anon, authenticated;
+
+create table if not exists private.sanctions (
+  id         bigint generated always as identity primary key,
+  user_id    uuid not null references public.profiles(id) on delete cascade,
+  admin_id   uuid references public.profiles(id) on delete set null,
+  action     text not null check (action in ('suspend', 'unsuspend', 'auto_unsuspend', 'delete_message', 'approve')),
+  days       integer,
+  until      timestamptz,
+  reason     text not null default '' check (char_length(reason) <= 300),
+  created_at timestamptz not null default now()
+);
+create index if not exists sanctions_user_idx on private.sanctions(user_id, id desc);
+revoke all on private.sanctions from public, anon, authenticated;
+
+-- 하루에 한 번 이상 앱을 연 회원 (현황판의 접속자 수·추이용, 400일 보관)
+create table if not exists private.daily_active (
+  day     date not null,
+  user_id uuid not null references public.profiles(id) on delete cascade,
+  primary key (day, user_id)
+);
+create index if not exists daily_active_user_idx on private.daily_active(user_id);
+revoke all on private.daily_active from public, anon, authenticated;
+create index if not exists messages_created_idx on public.messages(created_at);
+create index if not exists profiles_created_idx on public.profiles(created_at);
+
+-- 1:1 문의 (회원 ↔ 관리자)
+create table if not exists private.inquiries (
+  id           bigint generated always as identity primary key,
+  user_id      uuid not null references public.profiles(id) on delete cascade,
+  category     text not null check (category in ('use', 'bug', 'account', 'suggest', 'other')),
+  title        text not null check (char_length(title) between 1 and 60),
+  status       text not null default 'open' check (status in ('open', 'answered', 'closed')),
+  user_unread  boolean not null default false,
+  admin_unread boolean not null default true,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now()
+);
+create index if not exists inquiries_user_idx on private.inquiries(user_id, id desc);
+create index if not exists inquiries_status_idx on private.inquiries(status, updated_at desc);
+revoke all on private.inquiries from public, anon, authenticated;
+
+create table if not exists private.inquiry_messages (
+  id         bigint generated always as identity primary key,
+  inquiry_id bigint not null references private.inquiries(id) on delete cascade,
+  sender_id  uuid references public.profiles(id) on delete set null,
+  from_admin boolean not null default false,
+  body       text not null check (char_length(body) between 1 and 2000),
+  created_at timestamptz not null default now()
+);
+create index if not exists inquiry_messages_inq_idx on private.inquiry_messages(inquiry_id, id);
+revoke all on private.inquiry_messages from public, anon, authenticated;
 alter table private.app_settings add column if not exists words_seeded boolean not null default false;
 do $$
 begin
@@ -1221,6 +1283,12 @@ create function public.touch_last_seen()
 returns void language plpgsql security definer set search_path = public as $$
 begin
   update profiles set last_seen_at = now() where id = auth.uid();
+  -- v1.18: 오늘 접속한 회원 기록 (현황판) + 400일 지난 기록 정리
+  if to_regclass('private.daily_active') is not null and auth.uid() is not null
+     and exists (select 1 from profiles where id = auth.uid() and status = 'active') then
+    execute 'insert into private.daily_active (day, user_id) values (public.kst_today(), $1) on conflict do nothing' using auth.uid();
+    execute 'delete from private.daily_active where day < public.kst_today() - 400';
+  end if;
   -- v1.17: 처리한 지 1년 지난 신고 기록 삭제 (앱을 여는 김에 정리 — 따로 예약 작업이 필요 없게)
   if to_regclass('private.reports') is not null then
     execute 'delete from private.reports where status = ''done'' and handled_at < now() - interval ''1 year''';
@@ -1268,12 +1336,23 @@ $$;
 create or replace function public.admin_set_status(p_user uuid, p_status text)
 returns void language plpgsql security definer set search_path = public as $$
 declare
-  v_me uuid := public.admin_guard();
+  v_me  uuid := public.admin_guard();
+  v_old text;
 begin
   if p_status not in ('active', 'suspended') then raise exception '잘못된 상태예요'; end if;
   if p_user = v_me then raise exception '내 계정의 상태는 바꿀 수 없어요'; end if;
-  update profiles set status = p_status where id = p_user;
+  if p_status = 'suspended' and to_regprocedure('public.admin_suspend(uuid,integer,text)') is not null then
+    perform public.admin_suspend(p_user, null, '');   -- v1.18: 정지는 제재 이력이 남는 한 곳에서 (영구 정지)
+    return;
+  end if;
+  select status into v_old from profiles where id = p_user;
+  update profiles set status = p_status, suspended_until = null where id = p_user;   -- v1.18: 여기서 정지하면 영구 정지
   if not found then raise exception '회원을 찾을 수 없어요'; end if;
+  -- v1.18: 제재 이력 남기기
+  if to_regclass('private.sanctions') is not null and v_old is distinct from p_status then
+    insert into private.sanctions (user_id, admin_id, action)
+    values (p_user, v_me, case when p_status = 'suspended' then 'suspend' when v_old = 'pending' then 'approve' else 'unsuspend' end);
+  end if;
 
   if p_status = 'suspended' then
     update auth.users set banned_until = 'infinity'::timestamptz where id = p_user;  -- 로그인 차단
@@ -1918,7 +1997,7 @@ begin
   if v_subs is null then return; end if;
   perform net.http_post(
     url := v_url,
-    body := jsonb_build_object('subs', v_subs, 'title', '새 신고', 'body', '처리할 신고가 ' || v_open || '건 있어요. 회원 관리 → 신고 내역에서 확인해 주세요.'),
+    body := jsonb_build_object('subs', v_subs, 'title', '새 신고', 'body', '처리할 신고가 ' || v_open || '건 있어요. 더보기 → 관리자 → 신고에서 확인해 주세요.'),
     headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
     timeout_milliseconds := 8000
   );
@@ -1967,7 +2046,8 @@ $$;
 
 -- 관리자: 신고 처리 (dismiss=문제 없음, delete=메시지 삭제, suspend=이용 정지, both=삭제+정지)
 --   같은 메시지에 들어온 다른 신고도 함께 처리됨
-create or replace function public.admin_resolve_report(p_id bigint, p_action text)
+drop function if exists public.admin_resolve_report(bigint, text);
+create or replace function public.admin_resolve_report(p_id bigint, p_action text, p_days integer default null)
 returns void language plpgsql security definer set search_path = public as $$
 declare
   v_me uuid := public.admin_guard();
@@ -1978,12 +2058,16 @@ begin
   if not found then raise exception '신고를 찾을 수 없어요'; end if;
   if p_action in ('delete', 'both') and v_r.message_id is not null then
     perform public.erase_message(v_r.message_id);
+    if v_r.target_id is not null then   -- v1.18: 제재 이력
+      insert into private.sanctions (user_id, admin_id, action, reason)
+      values (v_r.target_id, v_me, 'delete_message', left('신고 처리: ' || coalesce(v_r.snapshot, ''), 300));
+    end if;
   end if;
   if p_action in ('suspend', 'both') then
     if v_r.target_id is null then raise exception '이미 탈퇴한 회원이에요'; end if;
     if v_r.target_id = v_me then raise exception '내 계정은 정지할 수 없어요'; end if;
     if exists (select 1 from profiles where id = v_r.target_id and status <> 'suspended') then
-      perform public.admin_set_status(v_r.target_id, 'suspended');
+      perform public.admin_suspend(v_r.target_id, p_days, '신고 처리');
     end if;
   end if;
   update private.reports
@@ -2056,6 +2140,405 @@ begin
   end;
   delete from auth.users where id = v_me;
   delete from rooms r where not exists (select 1 from room_members m where m.room_id = r.id) and not r.is_notice;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- 6-3. v1.18: 관리자 개편 — 현황판 · 회원 목록(나눠 불러오기) · 회원 상세 · 기간 정지 · 1:1 문의
+-- ---------------------------------------------------------------------
+
+-- 오늘 날짜 (한국 시간 기준)
+create or replace function public.kst_today()
+returns date language sql stable as $$
+  select (now() at time zone 'Asia/Seoul')::date;
+$$;
+
+-- 앱을 닫아도 오는 알림을 특정 회원들에게 (내부용 — 알림 설정 전이면 아무것도 안 함)
+create or replace function public.push_to_users(p_users uuid[], p_title text, p_body text)
+returns void language plpgsql security definer set search_path = public, extensions as $$
+declare
+  v_url    text;
+  v_secret text;
+  v_subs   jsonb;
+begin
+  if coalesce(cardinality(p_users), 0) = 0 or to_regclass('private.push_config') is null then return; end if;
+  execute 'select function_url, secret from private.push_config where id = 1' into v_url, v_secret;
+  if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return; end if;
+  execute 'select jsonb_agg(jsonb_build_object(''endpoint'', s.endpoint, ''p256dh'', s.p256dh, ''auth'', s.auth))
+             from push_subscriptions s join profiles p on p.id = s.user_id and p.status in (''active'', ''pending'')
+            where s.user_id = any ($1)' into v_subs using p_users;
+  if v_subs is null then return; end if;
+  perform net.http_post(
+    url := v_url,
+    body := jsonb_build_object('subs', v_subs, 'title', p_title, 'body', p_body),
+    headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
+    timeout_milliseconds := 8000
+  );
+exception when others then
+  raise warning 'push_to_users 실패: %', sqlerrm;
+end;
+$$;
+
+-- 기간이 끝난 정지를 자동으로 풀기 (내부용)
+create or replace function public.lift_expired_suspensions(p_user uuid default null)
+returns integer language plpgsql security definer set search_path = public as $$
+declare
+  v_id uuid;
+  v_n  integer := 0;
+begin
+  for v_id in
+    update profiles set status = 'active', suspended_until = null
+     where status = 'suspended' and suspended_until is not null and suspended_until <= now()
+       and (p_user is null or id = p_user)
+    returning id
+  loop
+    update auth.users set banned_until = null where id = v_id;
+    perform public.join_notice_room(v_id);
+    insert into private.sanctions (user_id, action, reason) values (v_id, 'auto_unsuspend', '정지 기간 끝남');
+    v_n := v_n + 1;
+  end loop;
+  return v_n;
+end;
+$$;
+
+-- 정지 기간이 끝났는지 확인 (정지된 회원이 앱을 다시 열 때) — 지금 상태를 돌려줌
+create or replace function public.refresh_my_status()
+returns text language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then return null; end if;
+  perform public.lift_expired_suspensions(auth.uid());
+  return (select status from profiles where id = auth.uid());
+end;
+$$;
+
+-- 관리자: 이용 정지 (p_days = null 이면 영구)
+create or replace function public.admin_suspend(p_user uuid, p_days integer, p_reason text default '')
+returns timestamptz language plpgsql security definer set search_path = public as $$
+declare
+  v_me    uuid := public.admin_guard();
+  v_until timestamptz;
+begin
+  if p_user = v_me then raise exception '내 계정의 상태는 바꿀 수 없어요'; end if;
+  if p_days is not null and (p_days < 1 or p_days > 3650) then raise exception '정지 기간은 1일~3650일로 정해 주세요'; end if;
+  if not exists (select 1 from profiles where id = p_user) then raise exception '회원을 찾을 수 없어요'; end if;
+  if exists (select 1 from profiles where id = p_user and status = 'pending') then
+    raise exception '승인 대기 중인 회원은 정지 대신 가입을 거절해 주세요';
+  end if;
+  v_until := case when p_days is null then null else now() + make_interval(days => p_days) end;
+  update profiles set status = 'suspended', suspended_until = v_until where id = p_user;
+  update auth.users set banned_until = coalesce(v_until, 'infinity'::timestamptz) where id = p_user;
+  if to_regclass('public.push_subscriptions') is not null then
+    execute 'delete from public.push_subscriptions where user_id = $1' using p_user;
+  end if;
+  insert into private.sanctions (user_id, admin_id, action, days, until, reason)
+  values (p_user, v_me, 'suspend', p_days, v_until, left(btrim(coalesce(p_reason, '')), 300));
+  return v_until;
+end;
+$$;
+
+-- 관리자: 회원 메모
+create or replace function public.admin_set_note(p_user uuid, p_note text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_me uuid := public.admin_guard();
+begin
+  if not exists (select 1 from profiles where id = p_user) then raise exception '회원을 찾을 수 없어요'; end if;
+  if char_length(coalesce(p_note, '')) > 2000 then raise exception '메모는 2000자까지 쓸 수 있어요'; end if;
+  insert into private.member_notes (user_id, note, updated_at, updated_by)
+  values (p_user, coalesce(p_note, ''), now(), v_me)
+  on conflict (user_id) do update set note = excluded.note, updated_at = excluded.updated_at, updated_by = excluded.updated_by;
+end;
+$$;
+
+-- 관리자: 현황판
+create or replace function public.admin_dashboard()
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_today date := public.kst_today();
+  v_from  date := public.kst_today() - 13;
+  v_out   jsonb;
+begin
+  perform public.admin_guard();
+  perform public.lift_expired_suspensions();
+  select jsonb_build_object(
+    'total',         (select count(*) from profiles),
+    'active',        (select count(*) from profiles where status = 'active'),
+    'pending',       (select count(*) from profiles where status = 'pending'),
+    'suspended',     (select count(*) from profiles where status = 'suspended'),
+    'admins',        (select count(*) from profiles where is_admin),
+    'new7',          (select count(*) from profiles where created_at > now() - interval '7 days'),
+    'dormant',       (select count(*) from profiles where status = 'active' and coalesce(last_seen_at, created_at) < now() - interval '30 days'),
+    'today_signups', (select count(*) from profiles where (created_at at time zone 'Asia/Seoul')::date = v_today),
+    'today_active',  (select count(*) from private.daily_active where day = v_today),
+    'active_7d',     (select count(distinct user_id) from private.daily_active where day > v_today - 7),
+    'active_30d',    (select count(distinct user_id) from private.daily_active where day > v_today - 30),
+    'messages_today',(select count(*) from messages where created_at >= (v_today::timestamp at time zone 'Asia/Seoul') and kind <> 'system'),
+    'open_reports',  (select count(*) from private.reports where status = 'open'),
+    'open_inquiries',(select count(*) from private.inquiries where status = 'open'),
+    'require_approval', coalesce((select require_approval from private.app_settings where id = 1), false),
+    'series', (
+      select jsonb_agg(jsonb_build_object(
+               'd', d::text,
+               'signups', (select count(*) from profiles p where (p.created_at at time zone 'Asia/Seoul')::date = d),
+               'active', (select count(*) from private.daily_active a where a.day = d),
+               'messages', (select count(*) from messages g
+                             where g.created_at >= (d::timestamp at time zone 'Asia/Seoul')
+                               and g.created_at < ((d + 1)::timestamp at time zone 'Asia/Seoul')
+                               and g.kind <> 'system')) order by d)
+        from generate_series(v_from, v_today, interval '1 day') as gs(d0), lateral (select gs.d0::date as d) x)
+  ) into v_out;
+  return v_out;
+end;
+$$;
+
+-- 관리자: 처리할 일 수 (메뉴 배지용)
+create or replace function public.admin_badges()
+returns jsonb language plpgsql stable security definer set search_path = public as $$
+begin
+  perform public.admin_guard();
+  return jsonb_build_object(
+    'pending',   (select count(*) from profiles where status = 'pending'),
+    'reports',   (select count(*) from private.reports where status = 'open'),
+    'inquiries', (select count(*) from private.inquiries where status = 'open'));
+end;
+$$;
+
+-- 관리자: 회원 목록 (나눠 불러오기 · 서버에서 검색·정렬)
+--   p_filter: all / pending / suspended / admin / new(7일 안 가입) / dormant(30일 넘게 미접속) / reported(처리 안 된 신고)
+--   p_sort:   recent(가입 최신) / seen(최근 접속) / name(이름) / reports(신고 많은 순)
+drop function if exists public.admin_member_page(text, text, text, integer, integer);
+create or replace function public.admin_member_page(p_query text, p_filter text, p_sort text, p_limit integer, p_offset integer)
+returns table (
+  id uuid, username text, display_name text, avatar_url text, status text, is_admin boolean,
+  created_at timestamptz, last_seen_at timestamptz, suspended_until timestamptz, phone text,
+  reports integer, open_reports integer, total bigint
+)
+language plpgsql security definer set search_path = public as $$
+#variable_conflict use_column
+declare
+  v_q  text := lower(btrim(coalesce(p_query, '')));
+  v_d  text := regexp_replace(coalesce(p_query, ''), '[^0-9]', '', 'g');
+begin
+  perform public.admin_guard();
+  perform public.lift_expired_suspensions();
+  v_q := ltrim(v_q, '@');
+  return query
+  with base as (
+    select p.*, up.phone as ph,
+           (select count(*)::int from private.reports r where r.target_id = p.id) as rc,
+           (select count(*)::int from private.reports r where r.target_id = p.id and r.status = 'open') as orc
+      from profiles p left join user_phones up on up.user_id = p.id
+     where (v_q = '' or p.username like '%' || v_q || '%' or lower(p.display_name) like '%' || v_q || '%'
+            or (v_d <> '' and length(v_d) >= 3 and up.phone like '%' || v_d || '%'))
+       and case coalesce(p_filter, 'all')
+             when 'pending' then p.status = 'pending'
+             when 'suspended' then p.status = 'suspended'
+             when 'admin' then p.is_admin
+             when 'new' then p.created_at > now() - interval '7 days'
+             when 'dormant' then p.status = 'active' and coalesce(p.last_seen_at, p.created_at) < now() - interval '30 days'
+             when 'reported' then exists (select 1 from private.reports r where r.target_id = p.id and r.status = 'open')
+             else true end
+  )
+  select b.id, b.username, b.display_name, b.avatar_url, b.status, b.is_admin,
+         b.created_at, b.last_seen_at, b.suspended_until, b.ph, b.rc, b.orc, count(*) over ()
+    from base b
+   order by
+     case when coalesce(p_sort, 'recent') = 'seen' then b.last_seen_at end desc nulls last,
+     case when p_sort = 'name' then b.display_name end asc,
+     case when p_sort = 'reports' then b.rc end desc,
+     b.created_at desc
+   limit least(greatest(coalesce(p_limit, 50), 1), 200) offset greatest(coalesce(p_offset, 0), 0);
+end;
+$$;
+
+-- 관리자: 회원 상세 (통계·메모·제재 이력·받은 신고)
+create or replace function public.admin_member_detail(p_user uuid)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_p profiles%rowtype;
+begin
+  perform public.admin_guard();
+  perform public.lift_expired_suspensions(p_user);
+  select * into v_p from profiles where id = p_user;
+  if not found then raise exception '회원을 찾을 수 없어요'; end if;
+  return jsonb_build_object(
+    'id', v_p.id, 'username', v_p.username, 'display_name', v_p.display_name, 'avatar_url', v_p.avatar_url,
+    'status_message', v_p.status_message, 'status', v_p.status, 'is_admin', v_p.is_admin,
+    'created_at', v_p.created_at, 'last_seen_at', v_p.last_seen_at, 'suspended_until', v_p.suspended_until,
+    'terms_agreed_at', v_p.terms_agreed_at,
+    'phone', (select phone from user_phones where user_id = p_user),
+    'friend_count', (select count(*) from friends where user_id = p_user),
+    'room_count', (select count(*) from room_members m join rooms r on r.id = m.room_id where m.user_id = p_user and not r.is_notice),
+    'message_count', (select count(*) from messages where sender_id = p_user and kind not in ('system', 'deleted')),
+    'active_days_30', (select count(*) from private.daily_active where user_id = p_user and day > public.kst_today() - 30),
+    'reports_received', (select count(*) from private.reports where target_id = p_user),
+    'reports_made', (select count(*) from private.reports where reporter_id = p_user),
+    'inquiries', (select count(*) from private.inquiries where user_id = p_user),
+    'note', coalesce((select note from private.member_notes where user_id = p_user), ''),
+    'note_updated_at', (select updated_at from private.member_notes where user_id = p_user),
+    'sanctions', coalesce((select jsonb_agg(jsonb_build_object('action', s.action, 'days', s.days, 'until', s.until, 'reason', s.reason,
+                                                               'created_at', s.created_at, 'admin', a.display_name) order by s.id desc)
+                             from (select * from private.sanctions where user_id = p_user order by id desc limit 30) s
+                             left join profiles a on a.id = s.admin_id), '[]'::jsonb),
+    'reports', coalesce((select jsonb_agg(jsonb_build_object('id', r.id, 'reason', r.reason, 'snapshot', r.snapshot, 'status', r.status,
+                                                             'action', r.action, 'created_at', r.created_at, 'reporter', rp.display_name) order by r.id desc)
+                           from (select * from private.reports where target_id = p_user order by id desc limit 10) r
+                           left join profiles rp on rp.id = r.reporter_id), '[]'::jsonb));
+end;
+$$;
+
+-- ---------- 1:1 문의 ----------
+create or replace function public.create_inquiry(p_category text, p_title text, p_body text)
+returns bigint language plpgsql security definer set search_path = public as $$
+declare
+  v_me uuid := auth.uid();
+  v_id bigint;
+begin
+  if v_me is null or not exists (select 1 from profiles where id = v_me and status in ('active', 'pending')) then
+    raise exception '문의할 수 없는 계정이에요';
+  end if;
+  if p_category is null or p_category not in ('use', 'bug', 'account', 'suggest', 'other') then raise exception '문의 종류를 골라 주세요'; end if;
+  if char_length(btrim(coalesce(p_title, ''))) = 0 then raise exception '제목을 입력해 주세요'; end if;
+  if char_length(btrim(coalesce(p_body, ''))) = 0 then raise exception '내용을 입력해 주세요'; end if;
+  if (select count(*) from private.inquiries where user_id = v_me and created_at > now() - interval '1 day') >= 10 then
+    raise exception '오늘은 더 문의할 수 없어요. 내일 다시 시도해 주세요';
+  end if;
+  if (select count(*) from private.inquiries where user_id = v_me and status = 'open') >= 5 then
+    raise exception '답변을 기다리는 문의가 5개 있어요. 답변을 받은 뒤 다시 문의해 주세요';
+  end if;
+  insert into private.inquiries (user_id, category, title) values (v_me, p_category, left(btrim(p_title), 60))
+  returning id into v_id;
+  insert into private.inquiry_messages (inquiry_id, sender_id, from_admin, body) values (v_id, v_me, false, left(btrim(p_body), 2000));
+  perform public.notify_admins_inquiry();
+  return v_id;
+end;
+$$;
+
+-- 새 문의·추가 문의를 관리자에게 알림 (5분에 한 번만 앱을 닫아도 오는 알림)
+create or replace function public.notify_admins_inquiry()
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_open   integer;
+  v_admins uuid[];
+begin
+  select count(*) into v_open from private.inquiries where status = 'open';
+  select array_agg(id) into v_admins from profiles where is_admin and status = 'active';
+  if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null then
+    begin
+      perform realtime.send(jsonb_build_object('open', v_open), 'inquiry_admin', 'user:' || x::text, true)
+         from unnest(coalesce(v_admins, '{}')) x;
+    exception when others then null;
+    end;
+  end if;
+  if (select count(*) from private.inquiry_messages where not from_admin and created_at > now() - interval '5 minutes') > 1 then return; end if;
+  perform public.push_to_users(v_admins, '새 문의', '답변을 기다리는 문의가 ' || v_open || '건 있어요. 더보기 → 관리자 → 문의에서 확인해 주세요.');
+exception when others then
+  raise warning 'notify_admins_inquiry 실패: %', sqlerrm;
+end;
+$$;
+
+drop function if exists public.my_inquiries();
+create or replace function public.my_inquiries()
+returns table (id bigint, category text, title text, status text, user_unread boolean, created_at timestamptz, updated_at timestamptz, last_body text, last_from_admin boolean)
+language sql stable security definer set search_path = public as $$
+  select i.id, i.category, i.title, i.status, i.user_unread, i.created_at, i.updated_at, lm.body, lm.from_admin
+    from private.inquiries i
+    left join lateral (select body, from_admin from private.inquiry_messages m where m.inquiry_id = i.id order by m.id desc limit 1) lm on true
+   where i.user_id = auth.uid()
+   order by i.updated_at desc
+   limit 100;
+$$;
+
+-- 문의 내용 보기 (본인 또는 관리자) — 보면 읽음 처리
+create or replace function public.inquiry_thread(p_id bigint)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_i     private.inquiries%rowtype;
+  v_admin boolean := public.is_admin();
+begin
+  select * into v_i from private.inquiries where id = p_id;
+  if not found or (v_i.user_id is distinct from auth.uid() and not v_admin) then raise exception '문의를 찾을 수 없어요'; end if;
+  if v_i.user_id = auth.uid() then update private.inquiries set user_unread = false where id = p_id;
+  elsif v_admin then update private.inquiries set admin_unread = false where id = p_id; end if;
+  return jsonb_build_object(
+    'id', v_i.id, 'category', v_i.category, 'title', v_i.title, 'status', v_i.status, 'created_at', v_i.created_at,
+    'user_id', v_i.user_id,
+    'user', (select jsonb_build_object('display_name', display_name, 'username', username, 'avatar_url', avatar_url) from profiles where id = v_i.user_id),
+    'messages', coalesce((select jsonb_agg(jsonb_build_object('id', m.id, 'from_admin', m.from_admin, 'body', m.body, 'created_at', m.created_at) order by m.id)
+                            from private.inquiry_messages m where m.inquiry_id = p_id), '[]'::jsonb));
+end;
+$$;
+
+-- 답글 (본인: 추가 문의 / 관리자: 답변 → 회원에게 알림)
+create or replace function public.reply_inquiry(p_id bigint, p_body text)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_me    uuid := auth.uid();
+  v_i     private.inquiries%rowtype;
+  v_admin boolean := public.is_admin();
+  v_mine  boolean;
+begin
+  select * into v_i from private.inquiries where id = p_id;
+  if not found then raise exception '문의를 찾을 수 없어요'; end if;
+  v_mine := v_i.user_id = v_me;
+  if not v_mine and not v_admin then raise exception '문의를 찾을 수 없어요'; end if;
+  if char_length(btrim(coalesce(p_body, ''))) = 0 then raise exception '내용을 입력해 주세요'; end if;
+  if v_i.status = 'closed' then raise exception '종료된 문의예요. 새로 문의해 주세요'; end if;
+  if not v_admin then
+    if not exists (select 1 from profiles where id = v_me and status in ('active', 'pending')) then raise exception '문의할 수 없는 계정이에요'; end if;
+    if (select count(*) from private.inquiry_messages m join private.inquiries i on i.id = m.inquiry_id
+         where i.user_id = v_me and not m.from_admin and m.created_at > now() - interval '1 day') >= 30 then
+      raise exception '오늘은 더 보낼 수 없어요. 내일 다시 시도해 주세요';
+    end if;
+  end if;
+  insert into private.inquiry_messages (inquiry_id, sender_id, from_admin, body)
+  values (p_id, v_me, v_admin and not v_mine, left(btrim(p_body), 2000));
+  if v_admin and not v_mine then
+    update private.inquiries set status = 'answered', user_unread = true, admin_unread = false, updated_at = now() where id = p_id;
+    if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null then
+      begin
+        perform realtime.send(jsonb_build_object('id', p_id, 'title', v_i.title), 'inquiry', 'user:' || v_i.user_id::text, true);
+      exception when others then null;
+      end;
+    end if;
+    perform public.push_to_users(array[v_i.user_id], '문의 답변', '"' || left(v_i.title, 30) || '" 문의에 답변이 왔어요.');
+  else
+    update private.inquiries set status = 'open', admin_unread = true, updated_at = now() where id = p_id;
+    perform public.notify_admins_inquiry();
+  end if;
+end;
+$$;
+
+create or replace function public.close_inquiry(p_id bigint)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  update private.inquiries set status = 'closed', updated_at = now(), user_unread = false, admin_unread = false
+   where id = p_id and (user_id = auth.uid() or public.is_admin());
+  if not found then raise exception '문의를 찾을 수 없어요'; end if;
+end;
+$$;
+
+-- 관리자: 문의 목록 (p_status: open / answered / closed / all)
+drop function if exists public.admin_list_inquiries(text, integer, integer);
+create or replace function public.admin_list_inquiries(p_status text, p_limit integer, p_offset integer)
+returns table (
+  id bigint, user_id uuid, username text, display_name text, avatar_url text, category text, title text, status text,
+  admin_unread boolean, created_at timestamptz, updated_at timestamptz, last_body text, last_from_admin boolean, msg_count integer, total bigint
+)
+language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
+begin
+  perform public.admin_guard();
+  return query
+  select i.id, i.user_id, p.username, p.display_name, p.avatar_url, i.category, i.title, i.status,
+         i.admin_unread, i.created_at, i.updated_at, lm.body, lm.from_admin,
+         (select count(*)::int from private.inquiry_messages m where m.inquiry_id = i.id), count(*) over ()
+    from private.inquiries i
+    join profiles p on p.id = i.user_id
+    left join lateral (select body, from_admin from private.inquiry_messages m where m.inquiry_id = i.id order by m.id desc limit 1) lm on true
+   where coalesce(p_status, 'open') = 'all' or i.status = coalesce(p_status, 'open')
+   order by (i.status = 'open') desc, i.updated_at desc
+   limit least(greatest(coalesce(p_limit, 50), 1), 200) offset greatest(coalesce(p_offset, 0), 0);
 end;
 $$;
 
@@ -2159,16 +2642,20 @@ declare
     'admin_connect_friends(uuid, uuid[])', 'admin_user_friends(uuid)',
     'admin_save_ad(bigint, text, text, text, boolean)', 'admin_delete_ad(bigint)', 'admin_move_ad(bigint, integer)', 'ad_click(bigint)',
     'block_user(uuid)', 'unblock_user(uuid)', 'my_blocks()', 'report_content(uuid, bigint, text, text)',
-    'admin_open_reports()', 'admin_list_reports(text)', 'admin_resolve_report(bigint, text)',
+    'admin_open_reports()', 'admin_list_reports(text)', 'admin_resolve_report(bigint, text, integer)',
     'admin_get_banned_words()', 'admin_set_banned_words(text[])',
-    'agree_terms()', 'my_media_files()', 'delete_my_account(boolean)'];
+    'agree_terms()', 'my_media_files()', 'delete_my_account(boolean)',
+    'refresh_my_status()', 'create_inquiry(text, text, text)', 'my_inquiries()', 'inquiry_thread(bigint)',
+    'reply_inquiry(bigint, text)', 'close_inquiry(bigint)',
+    'admin_suspend(uuid, integer, text)', 'admin_set_note(uuid, text)', 'admin_dashboard()', 'admin_badges()',
+    'admin_member_page(text, text, text, integer, integer)', 'admin_member_detail(uuid)', 'admin_list_inquiries(text, integer, integer)'];
   helper_fns text[] := array[
     'is_active()', 'is_active_user(uuid)', 'is_admin()', 'is_room_member(uuid)', 'is_room_member_text(text)',
     'shares_room_with(uuid)', 'is_notice_room(uuid)', 'admin_guard()',
     'is_mutual_friend(uuid, uuid)', 'can_post(uuid)', 'can_post_text(text)',
     'valid_file_msg(text, uuid, uuid)', 'valid_contact_msg(text)',
     'can_see_message(uuid, bigint)', 'can_read_chat_object(text)', 'can_cleanup_folder(text)', 'is_orphan_folder(text)',
-    'admin_can_view_reported(text)', 'admin_can_purge(text)'];
+    'admin_can_view_reported(text)', 'admin_can_purge(text)', 'kst_today()'];
 begin
   foreach f in array user_fns || helper_fns loop
     execute format('revoke execute on function public.%s from public, anon', f);
@@ -2182,6 +2669,9 @@ begin
   execute 'revoke execute on function public.erase_message(bigint) from public, anon, authenticated';   -- v1.17 내부용
   execute 'revoke execute on function public.mask_banned(text) from public, anon, authenticated';
   execute 'revoke execute on function public.notify_admins_report() from public, anon, authenticated';
+  execute 'revoke execute on function public.push_to_users(uuid[], text, text) from public, anon, authenticated';   -- v1.18 내부용
+  execute 'revoke execute on function public.lift_expired_suspensions(uuid) from public, anon, authenticated';
+  execute 'revoke execute on function public.notify_admins_inquiry() from public, anon, authenticated';
   execute 'grant execute on function public.invite_preview(text) to anon';   -- 로그인 전 초대 화면용
 end;
 $$;

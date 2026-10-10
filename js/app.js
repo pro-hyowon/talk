@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.17.0';
+const VERSION = '1.18.0';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -452,6 +452,10 @@ async function enterApp(id) {
     showErr(e);
     return;
   }
+  // v1.18: 정지 기간이 끝났으면 풀고 들어감
+  if (S.me.status === 'suspended' && api.refreshMyStatus) {
+    try { if ((await api.refreshMyStatus()) === 'active') S.me = await api.getMyProfile(); } catch { /* 예전 데이터베이스 */ }
+  }
   if (S.me.status && S.me.status !== 'active') { renderBlocked(S.me.status); return; }
   // v1.17: 약관 동의 전에 가입한 회원은 한 번 동의를 받음 (데이터베이스가 예전 버전이면 건너뜀)
   if ('terms_agreed_at' in S.me && !S.me.terms_agreed_at && api.agreeTerms) {
@@ -459,10 +463,11 @@ async function enterApp(id) {
   }
   cacheProfile(S.me);
   buildShell();
-  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport });
+  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport, onInquiry, onInquiryAdmin });
   await Promise.all([loadFriends(), loadRooms(), loadBlocks()]).catch(showErr);
   loadSuggestions();
   loadRequests();
+  loadMyInquiries().then(() => { const b = $('#inqBadge'); if (b) b.innerHTML = inqBadgeHtml(); });   // v1.18
   route();
   handlePendingInvite();
   touchLastSeen();
@@ -481,6 +486,7 @@ function renderBlocked(status) {
   app.innerHTML = `<div class="screen blocked"><div class="center">
       <div class="big-icon ${pending ? 'lemon' : 'pink'}">${ic(pending ? 'clock' : 'ban', 44)}</div>
       <h2>${pending ? '가입 승인을 기다리고 있어요' : '이용이 정지된 계정이에요'}</h2>
+      ${!pending && S.me.suspended_until ? `<p class="until">${esc(fmtDT(S.me.suspended_until))}까지 정지돼요</p>` : ''}
       <p>${pending ? `관리자가 확인한 뒤 ${esc(APP)}을 쓸 수 있어요. 승인 소식을 들으면 아래 버튼을 눌러 주세요.` : '정지 기간에는 친구 추가와 대화를 할 수 없어요. 자세한 내용은 관리자에게 문의해 주세요.'}</p>
       <div class="info-card"><div class="kv"><span>아이디</span><span>@${esc(S.me.username)}</span></div>
         <div class="kv"><span>${pending ? '신청일' : '이름'}</span><span>${pending ? fmtDay(S.me.created_at) : esc(S.me.display_name)}</span></div></div>
@@ -536,7 +542,7 @@ function leaveApp() {
     uid: null, entered: false, me: null, friends: [], rooms: [], roomsLoaded: false, room: null,
     fromList: false, unsub: null, wasSubscribed: false, tab: 'friends', pushOn: false,
     admin: null, adminFromMore: false, lastTouch: 0, pending: 0, suggestions: [], phone: undefined,
-    requests: [], chatFilter: 'all', blocks: new Set(),
+    requests: [], chatFilter: 'all', blocks: new Set(), myInq: [], inqUnread: 0, openReports: 0, openInquiries: 0,
   });
   S.profiles.clear(); S.imgUrls.clear();
   setBadge(0);
@@ -572,8 +578,10 @@ function route() {
     return;
   }
   if (S.room) closeRoom();
-  if (h === '#/admin') {
-    if ($('#admin').hidden) openAdmin();
+  const am = h.match(/^#\/admin(?:\/(home|members|reports|inquiries|ops))?$/);   // v1.18: 관리자 메뉴
+  if (am) {
+    const sec = am[1] || 'home';
+    if ($('#admin').hidden || !S.admin || S.admin.sec !== sec) openAdmin(sec);
     return;
   }
   closeAdmin();
@@ -748,12 +756,12 @@ function renderMore(head, body) {
     <div class="card">
       <div class="card-head">고객 지원</div>
       <button class="item" data-act="blocks"><span class="tile pink">${ic('userx', 19)}</span><span class="label">차단한 사용자</span><span class="val">${S.blocks.size ? `${S.blocks.size}명` : ''}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      <button class="item" data-act="contact-support"><span class="tile sky">${ic('mail', 19)}</span><span class="label">문의하기<span class="sub">${CONTACT ? esc(CONTACT) : '신고·불편 사항을 운영자에게 보내요'}</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <button class="item" data-act="my-inquiries"><span class="tile sky">${ic('mail', 19)}</span><span class="label">1:1 문의<span class="sub">궁금한 점·불편한 점을 운영팀에 물어봐요</span></span><span id="inqBadge">${inqBadgeHtml()}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <a class="item" href="./terms.html" target="_blank" rel="noopener"><span class="tile lav">${ic('doc', 19)}</span><span class="label">이용약관</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</a>
       <a class="item" href="./privacy.html" target="_blank" rel="noopener"><span class="tile lav">${ic('lock', 19)}</span><span class="label"><b>개인정보처리방침</b></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</a>
       <a class="item" href="./licenses.html" target="_blank" rel="noopener"><span class="tile lav">${ic('book', 19)}</span><span class="label">오픈소스 라이선스</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</a>
     </div>
-    ${me.is_admin ? `<button class="card item" data-act="open-admin"><span class="tile lemon">${ic('shield', 19)}</span><span class="label">회원 관리</span><span id="reportBadgeMore">${S.openReports ? `<span class="chip-lemon">신고 ${S.openReports}</span>` : ''}</span><span id="pendingBadge">${S.pending ? `<span class="chip-lemon">승인 대기 ${S.pending}</span>` : ''}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>` : ''}
+    ${me.is_admin ? `<button class="card item" data-act="open-admin"><span class="tile lemon">${ic('shield', 19)}</span><span class="label">관리자</span><span id="adminTodo" class="todo-chips">${adminTodoChips()}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>` : ''}
     <button class="card item danger" data-act="logout"><span class="tile pink">${ic('logout', 19)}</span><span class="label">로그아웃</span></button>
     <button class="withdraw-link" data-act="withdraw">회원 탈퇴</button>
     <div class="version">${esc(APP)} 버전 ${VERSION}</div>
@@ -766,12 +774,7 @@ function renderMore(head, body) {
     });
   }
   if (me.is_admin && api.adminSettings) {
-    api.adminSettings().then((st) => {
-      S.pending = (st && st.pending) || 0;
-      const b = $('#pendingBadge');
-      if (b) b.innerHTML = S.pending ? `<span class="chip-lemon">승인 대기 ${S.pending}</span>` : '';
-    }).catch(() => {});
-    refreshReportBadge();
+    refreshAdminBadges();
   }
 }
 
@@ -1756,7 +1759,7 @@ function renderAds(head, body) {
     return;
   }
   if (!ads.length) {
-    body.innerHTML = `<div class="empty-state" style="padding-top:28px"><div class="es-icon lav">${ic('gift', 56)}</div><b>아직 광고가 없어요</b><p>${S.me.is_admin ? '더보기 → 회원 관리 → 광고 관리에서 광고를 등록해 보세요.' : '새 소식이 생기면 여기에 보여 드릴게요.'}</p></div>`;
+    body.innerHTML = `<div class="empty-state" style="padding-top:28px"><div class="es-icon lav">${ic('gift', 56)}</div><b>아직 광고가 없어요</b><p>${S.me.is_admin ? '더보기 → 관리자 → 운영 → 광고 관리에서 광고를 등록해 보세요.' : '새 소식이 생기면 여기에 보여 드릴게요.'}</p></div>`;
     return;
   }
   body.innerHTML = `<div class="ads-body">${ads.map((a) => `<button class="ad-card" data-act="open-ad" data-id="${esc(a.id)}" aria-label="${esc(a.title || '광고')} 열기">
@@ -2029,78 +2032,6 @@ function askAdminDelete(name) {
     });
     return sheet;
   });
-}
-
-// ---------- 관리자: 신고 처리 ----------
-const REASON_LABEL = Object.fromEntries(REPORT_REASONS);
-const ACTION_LABEL = { dismiss: '문제 없음', delete: '메시지 삭제', suspend: '이용 정지', both: '메시지 삭제 + 이용 정지' };
-async function showReportsAdmin(status = 'open') {
-  let rows = [];
-  try { rows = await api.adminListReports(status); } catch (e) { showErr(e); return; }
-  closeAllSheets();
-  const kindTxt = (r) => (r.message_id == null ? '회원 신고' : r.message_kind === 'image' ? '사진' : r.message_kind === 'file' ? '파일' : r.message_kind === 'sticker' ? '이모티콘' : r.message_kind === 'contact' ? '연락처' : '메시지');
-  openSheet({
-    title: '신고 내역',
-    body: `<div class="seg" style="margin-bottom:12px"><button type="button" data-x="tab" data-s="open" class="${status === 'open' ? 'on' : ''}">처리 대기</button><button type="button" data-x="tab" data-s="done" class="${status === 'done' ? 'on' : ''}">처리 완료</button></div>
-      <div class="rep-list">${rows.length ? rows.map((r) => `<div class="rep-card" data-id="${r.id}">
-        <div class="rep-top"><span class="chip-lemon">${esc(REASON_LABEL[r.reason] || r.reason)}</span><span class="rep-kind">${kindTxt(r)}</span><span class="rep-time">${esc(fmtAgo(r.created_at))}</span></div>
-        <div class="rep-who"><b>${esc(r.target_name || '(탈퇴한 회원)')}</b>${r.target_username ? ` @${esc(r.target_username)}` : ''}${r.target_status === 'suspended' ? ' <span class="chip suspended">정지</span>' : ''} · 누적 신고 ${r.target_reports}건</div>
-        ${r.message_id != null ? `<div class="rep-snap ${r.message_gone ? 'gone' : ''}">${r.message_kind === 'image' && r.media_path && !r.message_gone ? `<img alt="신고된 사진" data-path="${esc(r.media_path)}">` : esc(r.message_kind === 'file' ? `파일: ${r.snapshot}` : r.snapshot)}${r.message_gone ? '<span class="rep-gone">삭제됨</span>' : ''}</div>` : ''}
-        ${r.detail ? `<div class="rep-detail">“${esc(r.detail)}”</div>` : ''}
-        <div class="rep-by">신고: ${esc(r.reporter_name || '(탈퇴한 회원)')}</div>
-        ${r.status === 'open' ? `<div class="rep-actions">
-          <button class="btn line sm" data-x="act" data-a="dismiss">문제 없음</button>
-          ${r.message_id != null && !r.message_gone ? '<button class="btn line sm" data-x="act" data-a="delete">메시지 삭제</button>' : ''}
-          ${r.target_id && r.target_status !== 'suspended' ? '<button class="btn line sm danger-text" data-x="act" data-a="suspend">이용 정지</button>' : ''}
-          ${r.message_id != null && !r.message_gone && r.target_id && r.target_status !== 'suspended' ? '<button class="btn danger sm" data-x="act" data-a="both">삭제 + 정지</button>' : ''}
-        </div>` : `<div class="rep-done">${ic('check', 15)}${esc(ACTION_LABEL[r.action] || '처리됨')}</div>`}
-      </div>`).join('') : `<div class="empty-line">${status === 'open' ? '처리할 신고가 없어요' : '처리한 신고가 없어요'}</div>`}</div>`,
-    onMount(sheet, close) {
-      const imgs = $$('img[data-path]', sheet);
-      if (imgs.length) api.imageUrls(imgs.map((i) => i.dataset.path)).then((u) => imgs.forEach((i) => { if (u[i.dataset.path]) i.src = u[i.dataset.path]; })).catch(() => {});
-      sheet.addEventListener('click', async (e) => {
-        const t = e.target.closest('[data-x="tab"]');
-        if (t) { close(); showReportsAdmin(t.dataset.s); return; }
-        const x = e.target.closest('[data-x="act"]'); if (!x) return;
-        const r = rows.find((y) => String(y.id) === x.closest('.rep-card').dataset.id);
-        const a = x.dataset.a;
-        const msg = {
-          dismiss: ['문제 없음으로 처리할까요?', '신고를 닫고 아무 조치도 하지 않아요.', '처리', false],
-          delete: ['이 메시지를 삭제할까요?', '모든 참여자 화면에서 "삭제된 메시지예요"로 바뀌어요.', '삭제', true],
-          suspend: [`${r.target_name}님의 이용을 정지할까요?`, '로그인과 대화를 할 수 없게 돼요. 회원 관리에서 정지를 풀 수 있어요.', '정지', true],
-          both: ['메시지를 삭제하고 이용을 정지할까요?', `메시지를 지우고 ${r.target_name}님의 이용을 정지해요.`, '삭제 + 정지', true],
-        }[a];
-        if (!(await ask(...msg))) return;
-        try {
-          if ((a === 'delete' || a === 'both') && r.media_path) {
-            await api.removeMedia([{ bucket: r.message_kind === 'image' ? 'chat-images' : 'chat-files', name: r.media_path }]).catch(() => {});
-          }
-          await api.adminResolveReport(r.id, a);
-          toast(`${ACTION_LABEL[a]}(으)로 처리했어요`);
-          refreshReportBadge();
-          closeAllSheets();
-          showReportsAdmin('open');
-        } catch (ex) { showErr(ex); }
-      });
-    },
-  });
-}
-// 새 신고 알림 (관리자)
-function onReport(p) {
-  if (!S.me || !S.me.is_admin) return;
-  S.openReports = Number(p.open) || 0;
-  refreshReportBadge();
-  toast(`새 신고가 들어왔어요 (처리 대기 ${S.openReports}건)`, { onClick: () => { S.adminFromMore = !!S.entered; go('#/admin'); setTimeout(() => showReportsAdmin('open'), 300); } });
-}
-function refreshReportBadge() {
-  if (!api.adminOpenReports) return;
-  api.adminOpenReports().then((n) => {
-    S.openReports = n || 0;
-    const b = $('#reportBadge');
-    if (b) b.innerHTML = S.openReports ? `<span class="chip-lemon">처리 대기 ${S.openReports}</span>` : '';
-    const b2 = $('#reportBadgeMore');
-    if (b2) b2.innerHTML = S.openReports ? `<span class="chip-lemon">신고 ${S.openReports}</span>` : '';
-  }).catch(() => {});
 }
 
 // ---------- 관리자: 금칙어 ----------
@@ -2787,16 +2718,6 @@ function showChangePassword() {
 const ST_LABEL = { active: '정상', pending: '승인 대기', suspended: '정지', admin: '관리자' };
 const stOf = (u) => (u.status === 'active' && u.is_admin ? 'admin' : u.status);
 
-async function openAdmin() {
-  if (!S.me || !S.me.is_admin) { location.replace('#/more'); return; }
-  closeAllSheets();
-  S.admin = S.admin || { filter: 'all', q: '', users: [], settings: null };
-  const el = $('#admin');
-  el.hidden = false;
-  el.innerHTML = `<div class="bar" style="padding:0 8px"><button class="ibtn" data-act="admin-back" aria-label="뒤로">${ic('back', 24)}</button><h1>회원 관리</h1></div>
-    <div class="scroll" id="adminBody"><div class="spinner"></div></div>`;
-  await loadAdmin();
-}
 // v1.12: 없어진 방에 남은 사진·파일 정리 (quiet = 회원 탈퇴 뒤 자동으로, 묻지 않고)
 async function cleanOrphans(quiet, btn) {
   try {
@@ -2810,65 +2731,535 @@ async function cleanOrphans(quiet, btn) {
   } catch (e) { if (!quiet) showErr(e); }
   finally { if (btn && btn.isConnected) btn.disabled = false; }
 }
+// ---------------------------------------------------------------------
+// v1.18: 관리자 화면 — 현황 · 회원 · 신고 · 문의 · 운영 (휴대폰: 위쪽 탭 / PC: 왼쪽 메뉴)
+// ---------------------------------------------------------------------
+const ADM_SECS = [['home', '현황', 'shield'], ['members', '회원', 'user'], ['reports', '신고', 'flag'], ['inquiries', '문의', 'mail'], ['ops', '운영', 'more']];
+const MEMBER_FILTERS = [['all', '전체'], ['pending', '승인 대기'], ['suspended', '정지'], ['reported', '신고 있음'], ['new', '신규 7일'], ['dormant', '휴면 30일'], ['admin', '관리자']];
+const MEMBER_SORTS = [['recent', '최근 가입순'], ['seen', '최근 접속순'], ['name', '이름순'], ['reports', '신고 많은 순']];
+const INQ_CATS = [['use', '이용 문의'], ['bug', '오류 신고'], ['account', '계정·탈퇴'], ['suggest', '제안'], ['other', '기타']];
+const INQ_CAT = Object.fromEntries(INQ_CATS);
+const INQ_ST = { open: '답변 대기', answered: '답변 완료', closed: '종료' };
+const SANCTION_LABEL = { suspend: '이용 정지', unsuspend: '정지 해제', auto_unsuspend: '정지 기간 끝남', delete_message: '메시지 삭제', approve: '가입 승인' };
+const PAGE_SIZE = 50;
+const fmtDT = (iso) => { if (!iso) return '-'; const d = new Date(iso); return `${d.getMonth() + 1}월 ${d.getDate()}일 ${fmtTime(iso)}`; };
+const untilTxt = (u) => (u.suspended_until ? `${fmtDT(u.suspended_until)}까지 정지` : '영구 정지');
+
+async function openAdmin(sec) {
+  if (!S.me || !S.me.is_admin) { location.replace('#/more'); return; }
+  closeAllSheets();
+  const A = S.admin = S.admin || {
+    sec: 'home', badges: {}, dash: null, chart: 'active',
+    members: { q: '', filter: 'all', sort: 'recent', rows: [], total: 0, loaded: false, busy: false, seq: 0 },
+    reports: { status: 'open' }, inquiries: { status: 'open', rows: [], total: 0 },
+  };
+  if (sec) A.sec = sec;
+  const el = $('#admin');
+  if (el.hidden || !$('#admMain')) {
+    el.hidden = false;
+    app.classList.add('adm-wide');
+    el.innerHTML = `<div class="adm">
+      <aside class="adm-nav">
+        <div class="adm-top"><button class="ibtn" data-act="admin-back" aria-label="뒤로">${ic('back', 24)}</button><h1>관리자</h1>
+          <button class="ibtn adm-refresh" data-act="admin-refresh" aria-label="새로고침">${ic('retry', 20)}</button></div>
+        <nav class="adm-tabs" aria-label="관리 메뉴">${ADM_SECS.map(([k, l, i]) => `<button data-act="admin-sec" data-s="${k}">${ic(i, 19)}<span>${l}</span><i class="adm-badge" id="admBadge-${k}"></i></button>`).join('')}</nav>
+      </aside>
+      <section class="adm-main scroll" id="admMain"></section>
+    </div>`;
+  }
+  $$('.adm-tabs button').forEach((b) => b.classList.toggle('on', b.dataset.s === A.sec));
+  refreshAdminBadges();
+  renderAdminSection();
+}
 function closeAdmin() {
   const el = $('#admin');
+  app.classList.remove('adm-wide');
   if (el && !el.hidden) { el.hidden = true; el.innerHTML = ''; }
 }
-async function loadAdmin() {
-  try {
-    const [settings, users] = await Promise.all([api.adminSettings(), api.adminListUsers('')]);
-    if (!S.admin) return;
-    S.admin.settings = settings; S.admin.users = users;
-    S.pending = settings.pending || 0;
-    renderAdmin();
-  } catch (e) {
-    const b = $('#adminBody');
-    if (b) b.innerHTML = `<div class="empty-state"><b>불러오지 못했어요</b><p>${esc(e.message || '')}</p></div>`;
+function adminGo(sec) { go(sec === 'home' ? '#/admin' : '#/admin/' + sec); }
+const admMain = () => $('#admMain');
+const admLoading = () => { const m = admMain(); if (m) m.innerHTML = '<div class="spinner"></div>'; };
+const admError = (e) => { const m = admMain(); if (m) m.innerHTML = `<div class="empty-state"><b>불러오지 못했어요</b><p>${esc(e.message || '')}</p><button class="btn line sm" data-act="admin-refresh">다시 시도</button></div>`; };
+
+// 메뉴 배지 (승인 대기 · 처리할 신고 · 답변할 문의)
+async function refreshAdminBadges() {
+  if (!S.me || !S.me.is_admin) return;
+  let b = null;
+  try { b = api.adminBadges ? await api.adminBadges() : null; } catch { b = null; }
+  if (!b) {   // 데이터베이스가 예전 버전이면 있는 것만
+    b = {};
+    try { b.pending = ((await api.adminSettings()) || {}).pending || 0; } catch { /* 없음 */ }
+    try { b.reports = api.adminOpenReports ? await api.adminOpenReports() : 0; } catch { /* 없음 */ }
   }
+  S.pending = b.pending || 0; S.openReports = b.reports || 0; S.openInquiries = b.inquiries || 0;
+  if (S.admin) S.admin.badges = b;
+  const set = (id, n) => { const e = $('#' + id); if (e) e.textContent = n ? (n > 99 ? '99+' : String(n)) : ''; };
+  set('admBadge-members', b.pending); set('admBadge-reports', b.reports); set('admBadge-inquiries', b.inquiries);
+  const more = $('#adminTodo');
+  if (more) more.innerHTML = adminTodoChips();
 }
-function adminFiltered() {
-  const A = S.admin; const q = A.q.trim().toLowerCase().replace(/^@/, '');
-  return A.users.filter((u) => (A.filter === 'all' || stOf(u) === A.filter || (A.filter === 'admin' && u.is_admin))
-    && (!q || u.username.includes(q) || u.display_name.toLowerCase().includes(q)
-      || (q.replace(/\D/g, '') && (u.phone || '').includes(q.replace(/\D/g, '')))));
+const adminTodoChips = () => [[S.pending, '승인 대기'], [S.openReports, '신고'], [S.openInquiries, '문의']]
+  .filter(([n]) => n).map(([n, l]) => `<span class="chip-lemon">${l} ${n}</span>`).join('');
+function refreshReportBadge() { refreshAdminBadges(); }
+
+function renderAdminSection() {
+  const A = S.admin; if (!A || !admMain()) return;
+  admMain().scrollTop = 0;
+  if (A.sec === 'members') return renderMembersSec();
+  if (A.sec === 'reports') return renderReportsSec();
+  if (A.sec === 'inquiries') return renderInquiriesSec();
+  if (A.sec === 'ops') return renderOpsSec();
+  return renderHomeSec();
 }
-const stChip = (u) => { const s = stOf(u); return `<span class="chip ${s}">${ST_LABEL[s]}</span>`; };
-function renderAdminList() {
-  const box = $('#adminList'); if (!box) return;
-  const list = adminFiltered();
-  box.innerHTML = list.length ? list.map((u) => `
-    <button class="mrow row" data-act="admin-user" data-id="${esc(u.id)}">${av(u, 44)}
-      <div class="meta"><span class="name">${esc(u.display_name)}</span><span class="desc">@${esc(u.username)} · ${fmtDay(u.created_at)} 가입</span></div>
-      <span class="chips">${stChip(u)}</span></button>`).join('')
-    : '<div class="empty-line">조건에 맞는 회원이 없어요</div>';
-}
-function renderAdmin() {
-  const body = $('#adminBody'); if (!body || !S.admin || !S.admin.settings) return;
-  const A = S.admin; const st = A.settings;
-  const cnt = (k) => A.users.filter((u) => (k === 'admin' ? u.is_admin : u.status === k)).length;
-  body.innerHTML = `<div class="admin-body">
-    <div class="stats">
-      <button class="stat all ${A.filter === 'all' ? 'on' : ''}" data-act="admin-filter" data-f="all"><span class="k">전체</span><span class="n">${st.total}</span></button>
-      <button class="stat pending ${A.filter === 'pending' ? 'on' : ''}" data-act="admin-filter" data-f="pending"><span class="k">승인 대기</span><span class="n">${st.pending}</span></button>
-      <button class="stat suspended ${A.filter === 'suspended' ? 'on' : ''}" data-act="admin-filter" data-f="suspended"><span class="k">정지</span><span class="n">${st.suspended}</span></button>
+
+// ---------- 현황 ----------
+async function renderHomeSec() {
+  const A = S.admin;
+  if (!A.dash) admLoading();
+  let d;
+  try { d = await api.adminDashboard(); } catch (e) { if (S.admin && A.sec === 'home') admError(e); return; }
+  if (!S.admin || A.sec !== 'home' || !admMain()) return;
+  A.dash = d;
+  const tile = (k, n, sub, act = '') => `<${act ? `button data-act="admin-sec" data-s="${act}"` : 'div'} class="kpi"><span class="k">${k}</span><b class="n">${Number(n || 0).toLocaleString()}</b><span class="s">${sub}</span></${act ? 'button' : 'div'}>`;
+  const todo = [
+    ['members', 'pending', d.pending, '가입 승인 대기', '승인하거나 거절해 주세요'],
+    ['reports', null, d.open_reports, '처리할 신고', '가능한 한 24시간 안에 확인해요'],
+    ['inquiries', null, d.open_inquiries, '답변할 문의', '회원이 답을 기다리고 있어요'],
+  ].filter((t) => t[2] > 0);
+  admMain().innerHTML = `<div class="adm-sec">
+    <div class="adm-h"><h2>현황</h2><span class="adm-date">${fmtDate(new Date().toISOString())}</span></div>
+    <div class="kpis">
+      ${tile('전체 회원', d.total, `사용 중 ${d.active} · 정지 ${d.suspended}`, 'members')}
+      ${tile('오늘 접속', d.today_active, `7일 ${d.active_7d} · 30일 ${d.active_30d}`)}
+      ${tile('오늘 가입', d.today_signups, `최근 7일 ${d.new7}명`)}
+      ${tile('오늘 메시지', d.messages_today, '시스템 안내 제외')}
     </div>
-    <div class="card" style="margin-top:12px">
-      <div class="item" style="padding-top:14px;padding-bottom:14px"><span class="label">가입 승인제<span class="sub">${st.require_approval ? '켜져 있어요 · 새 회원은 관리자 승인 후 이용할 수 있어요' : '꺼져 있어요 · 가입하면 바로 이용할 수 있어요'}</span></span>
-        <button class="switch ${st.require_approval ? 'on' : ''}" data-act="admin-approval" role="switch" aria-checked="${st.require_approval}" aria-label="가입 승인제"></button></div>
-      <button class="item" data-act="admin-notice"><span class="tile mint">${ic('mega', 19)}</span><span class="label">전체 공지 보내기</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      <button class="item" data-act="admin-reports"><span class="tile pink">${ic('flag', 19)}</span><span class="label">신고 내역<span class="sub">회원이 신고한 메시지·회원을 확인하고 조치해요</span></span><span id="reportBadge">${S.openReports ? `<span class="chip-lemon">처리 대기 ${S.openReports}</span>` : ''}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      <button class="item" data-act="admin-words"><span class="tile peach">${ic('ban', 19)}</span><span class="label">금칙어 관리<span class="sub">욕설 등 부적절한 말을 * 로 가려요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      <button class="item" data-act="admin-ads"><span class="tile lav">${ic('gift', 19)}</span><span class="label">광고 관리<span class="sub">광고 탭에 보일 이미지와 링크를 등록해요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      <button class="item" data-act="admin-clean" style="padding-top:14px;padding-bottom:14px"><span class="tile sky">${ic('file', 19)}</span><span class="label">남은 사진·파일 정리<span class="sub">없어진 대화방에 남아 있는 사진·파일을 저장 공간에서 지워요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+    <div class="card adm-card"><div class="card-head">처리할 일</div>
+      ${todo.length ? todo.map(([s, f, n, l, sub]) => `<button class="item" data-act="admin-todo" data-s="${s}" data-f="${f || ''}"><span class="todo-n">${n}</span><span class="label">${l}<span class="sub">${sub}</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>`).join('')
+    : '<div class="empty-line">지금 처리할 일이 없어요</div>'}</div>
+    <div class="card adm-card"><div class="card-head chart-head">최근 14일
+      <div class="seg mini">${[['active', '접속'], ['signups', '가입'], ['messages', '메시지']].map(([k, l]) => `<button type="button" data-act="admin-chart" data-k="${k}" class="${A.chart === k ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+      <div id="admChart">${chartSvg(d.series || [], A.chart)}</div>
+      ${A.chart === 'active' ? '<p class="chart-note">접속자 수는 v1.18 을 설치한 날부터 쌓여요.</p>' : ''}</div>
+    <div class="card adm-card"><div class="card-head">회원 구성</div>
+      <div class="mix">${[['신규 7일', d.new7, 'new'], ['휴면 30일', d.dormant, 'dormant'], ['승인 대기', d.pending, 'pending'], ['정지', d.suspended, 'suspended'], ['관리자', d.admins, 'admin']]
+    .map(([l, n, f]) => `<button data-act="admin-todo" data-s="members" data-f="${f}"><b>${n}</b><span>${l}</span></button>`).join('')}</div></div>
+  </div>`;
+}
+// 막대그래프 (값에 맞게 눈금 · 날짜는 이틀마다)
+function chartSvg(series, key) {
+  const W = 640, H = 220, L = 46, R = 8, T = 18, B = 30;
+  const vals = series.map((x) => Number(x[key]) || 0);
+  const max = Math.max(1, ...vals);
+  const step = max <= 4 ? 1 : Math.ceil(max / 4 / (10 ** Math.floor(Math.log10(max / 4)))) * (10 ** Math.floor(Math.log10(max / 4)));
+  const top = Math.ceil(max / step) * step;
+  const bw = (W - L - R) / Math.max(1, series.length);
+  const y = (v) => T + (H - T - B) * (1 - v / top);
+  let g = '';
+  for (let v = 0; v <= top; v += step) g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" class="cg"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" class="ct">${v}</text>`;
+  const bars = series.map((x, i) => {
+    const v = vals[i]; const h = (H - T - B) - (y(v) - T);
+    const d = String(x.d || '').slice(5).replace('-', '/').replace(/^0/, '');
+    return `<rect x="${L + i * bw + bw * 0.18}" y="${y(v)}" width="${bw * 0.64}" height="${Math.max(0, h)}" rx="3" class="cb ${i === series.length - 1 ? 'today' : ''}"><title>${esc(x.d)}: ${v}</title></rect>`
+      + (v && (i === series.length - 1 || v === max) ? `<text x="${L + i * bw + bw / 2}" y="${y(v) - 4}" text-anchor="middle" class="cv">${v}</text>` : '')
+      + ((series.length - 1 - i) % 2 === 0 ? `<text x="${L + i * bw + bw / 2}" y="${H - 8}" text-anchor="middle" class="ct">${d}</text>` : '');
+  }).join('');
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="최근 14일 막대그래프">${g}${bars}</svg>`;
+}
+
+// ---------- 회원 ----------
+function renderMembersSec() {
+  const M = S.admin.members;
+  admMain().innerHTML = `<div class="adm-sec">
+    <div class="adm-h"><h2>회원</h2><span class="adm-date" id="memTotal">${M.loaded ? `총 ${M.total.toLocaleString()}명` : ''}</span></div>
+    <div class="mem-tools">
+      <label class="search">${ic('search', 20, 'flex:none')}<input id="adminSearch" placeholder="이름·아이디·휴대폰 번호 검색" value="${esc(M.q)}" autocapitalize="off" spellcheck="false"></label>
+      <select id="memSort" class="adm-select" aria-label="정렬">${MEMBER_SORTS.map(([k, l]) => `<option value="${k}" ${M.sort === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
     </div>
-    <label class="search">${ic('search', 20, 'flex:none')}<input id="adminSearch" placeholder="이름·아이디·휴대폰 번호 검색" value="${esc(A.q)}" autocapitalize="off" spellcheck="false"></label>
-    <div class="filters">${[['all', '전체'], ['pending', `승인 대기 ${cnt('pending')}`], ['suspended', `정지 ${cnt('suspended')}`], ['admin', `관리자 ${cnt('admin')}`]]
-    .map(([k, l]) => `<button data-act="admin-filter" data-f="${k}" class="${A.filter === k ? 'on' : ''}">${l}</button>`).join('')}</div>
-    <div class="card" style="margin-top:12px" id="adminList"></div></div>`;
+    <div class="filters">${MEMBER_FILTERS.map(([k, l]) => `<button data-act="admin-filter" data-f="${k}" class="${M.filter === k ? 'on' : ''}">${l}</button>`).join('')}</div>
+    <div class="card mem-card" id="adminList"><div class="spinner"></div></div>
+    <div id="memMore"></div>
+  </div>`;
   const input = $('#adminSearch');
-  input.oninput = () => { A.q = input.value; renderAdminList(); };
-  renderAdminList();
-  refreshReportBadge();
+  let t = null;
+  input.oninput = () => { clearTimeout(t); t = setTimeout(() => { M.q = input.value.trim(); loadMembers(true); }, 300); };
+  $('#memSort').onchange = (e) => { M.sort = e.target.value; loadMembers(true); };
+  if (M.loaded) drawMembers(); else loadMembers(true);
+}
+async function loadMembers(reset) {
+  const M = S.admin && S.admin.members; if (!M) return;
+  const seq = ++M.seq;
+  if (reset) { M.rows = []; M.total = 0; const l = $('#adminList'); if (l) l.innerHTML = '<div class="spinner"></div>'; }
+  M.busy = true; drawMore();
+  try {
+    const rows = await api.adminMemberPage({ q: M.q, filter: M.filter, sort: M.sort, limit: PAGE_SIZE, offset: reset ? 0 : M.rows.length });
+    if (!S.admin || seq !== M.seq) return;
+    M.rows = reset ? rows : M.rows.concat(rows);
+    M.total = rows.length ? Number(rows[0].total) : (reset ? 0 : M.total);
+    M.loaded = true;
+  } catch (e) {
+    if (seq === M.seq) { const l = $('#adminList'); if (l) l.innerHTML = `<div class="empty-line">${esc(e.message || '불러오지 못했어요')}</div>`; }
+    M.busy = false; drawMore(); return;
+  }
+  M.busy = false;
+  drawMembers();
+}
+const ST_CHIP = (u) => { const s = stOf(u); return `<span class="chip ${s}">${ST_LABEL[s]}</span>`; };
+function drawMembers() {
+  const M = S.admin.members; const box = $('#adminList'); if (!box) return;
+  const tt = $('#memTotal'); if (tt) tt.textContent = `총 ${M.total.toLocaleString()}명`;
+  if (!M.rows.length) { box.innerHTML = '<div class="empty-line">조건에 맞는 회원이 없어요</div>'; drawMore(); return; }
+  box.innerHTML = `<div class="mem-head" aria-hidden="true"><span>회원</span><span>상태</span><span>가입일</span><span>최근 접속</span><span>신고</span></div>`
+    + M.rows.map((u) => `<button class="mrow row mem-row" data-act="admin-user" data-id="${esc(u.id)}">${av(u, 40)}
+      <div class="meta"><span class="name">${esc(u.display_name)}</span><span class="desc">@${esc(u.username)}<span class="m-only"> · ${esc(fmtAgo(u.last_seen_at))}</span></span></div>
+      <span class="c-st">${ST_CHIP(u)}${u.status === 'suspended' ? `<span class="m-until">${esc(u.suspended_until ? fmtDT(u.suspended_until) + '까지' : '영구')}</span>` : ''}</span>
+      <span class="c-d pc-only">${fmtDay(u.created_at)}</span>
+      <span class="c-d pc-only">${esc(fmtAgo(u.last_seen_at))}</span>
+      <span class="c-r">${u.open_reports ? `<span class="chip suspended">신고 ${u.open_reports}</span>` : u.reports ? `<span class="r-n">${u.reports}</span>` : '<span class="r-n">-</span>'}</span></button>`).join('');
+  drawMore();
+}
+function drawMore() {
+  const M = S.admin && S.admin.members; const el = $('#memMore'); if (!M || !el) return;
+  const left = M.total - M.rows.length;
+  el.innerHTML = M.busy && M.rows.length ? '<div class="spinner"></div>'
+    : left > 0 ? `<button class="btn line sm more-btn" data-act="admin-more">더 보기 (${left.toLocaleString()}명 남음)</button>` : '';
+}
+
+// 회원 상세
+async function showAdminUser(id) {
+  let u;
+  try { u = await api.adminMemberDetail(id); } catch (e) { showErr(e); return; }
+  const self = u.id === S.uid;
+  const s = stOf(u);
+  const B = (label, x, kind) => `<button class="btn md ${kind}" data-x="${x}" ${self ? 'disabled' : ''}>${label}</button>`;
+  const btns = {
+    pending: [B('가입 승인', 'approve', ''), B('가입 거절 (강제 탈퇴)', 'delete', 'danger-line')],
+    active: [B('이용 정지', 'suspend', 'line'), B('비밀번호 초기화', 'reset', 'line'), B('관리자로 지정', 'admin', 'line'), B('강제 탈퇴', 'delete', 'danger-line')],
+    suspended: [B('정지 해제', 'unsuspend', ''), B('정지 기간 바꾸기', 'suspend', 'line'), B('비밀번호 초기화', 'reset', 'line'), B('강제 탈퇴', 'delete', 'danger-line')],
+    admin: [B('관리자 해제', 'admin', 'line'), B('비밀번호 초기화', 'reset', 'line')],
+  }[s];
+  if (u.phone) btns.splice(btns.length - (s === 'admin' ? 0 : 1), 0, `<button class="btn md line" data-x="clearphone">휴대폰 번호 삭제</button>`);
+  if (s === 'active' || s === 'admin') btns.unshift(`<button class="btn md soft" data-x="connect">${ic('userplus', 18)}친구 연결</button>`);
+  const cell = (k, v, wide) => `<div class="cell ${wide ? 'wide' : ''}"><span>${k}</span><b>${v}</b></div>`;
+  openSheet({
+    title: '회원 정보',
+    body: `<div class="m-head">${av(u, 64)}<div class="meta" style="gap:6px"><div class="nm"><b>${esc(u.display_name)}</b>${ST_CHIP(u)}</div><span class="desc">@${esc(u.username)}${u.status_message ? ` · ${esc(u.status_message)}` : ''}</span></div></div>
+      ${u.status === 'suspended' ? `<div class="note-berry">${ic('ban', 16, 'flex:none')}${esc(untilTxt(u))}</div>` : ''}
+      <div class="grid3">
+        ${cell('가입일', fmtDay(u.created_at))}${cell('최근 접속', esc(fmtAgo(u.last_seen_at)))}${cell('30일 중 접속', `${u.active_days_30}일`)}
+        ${cell('친구', `${u.friend_count}명`)}${cell('대화방', `${u.room_count}개`)}${cell('보낸 메시지', Number(u.message_count).toLocaleString())}
+        ${cell('받은 신고', `${u.reports_received}건`)}${cell('한 신고', `${u.reports_made}건`)}${cell('문의', `${u.inquiries}건`)}
+        ${cell('휴대폰 번호', u.phone ? esc(fmtPhone(u.phone)) : '등록 안 함', true)}
+        ${cell('약관 동의', u.terms_agreed_at ? fmtDT(u.terms_agreed_at) : '아직 안 함', true)}
+      </div>
+      <div class="adm-block"><div class="blk-h">관리자 메모${u.note_updated_at ? `<span>${fmtDT(u.note_updated_at)} 저장</span>` : ''}</div>
+        <textarea class="input memo" id="memo" maxlength="2000" rows="3" placeholder="이 회원에 대해 기억할 내용 (회원에게는 보이지 않아요)">${esc(u.note || '')}</textarea>
+        <button class="btn line sm" data-x="memo" style="align-self:flex-end">메모 저장</button></div>
+      <div class="adm-block"><div class="blk-h">제재 이력</div>
+        ${u.sanctions.length ? `<ul class="hist">${u.sanctions.map((x) => `<li><b>${esc(SANCTION_LABEL[x.action] || x.action)}</b>${x.action === 'suspend' ? ` · ${x.days ? `${x.days}일` : '영구'}` : ''}${x.reason ? ` · ${esc(x.reason)}` : ''}<span>${fmtDT(x.created_at)}${x.admin ? ` · ${esc(x.admin)}` : ''}</span></li>`).join('')}</ul>` : '<div class="empty-mini">없어요</div>'}</div>
+      <div class="adm-block"><div class="blk-h">받은 신고</div>
+        ${u.reports.length ? `<ul class="hist">${u.reports.map((r) => `<li><b>${esc(REASON_LABEL[r.reason] || r.reason)}</b>${r.snapshot ? ` · ${esc(String(r.snapshot).slice(0, 40))}` : ''}<span>${fmtDT(r.created_at)} · ${r.status === 'open' ? '처리 대기' : esc(ACTION_LABEL[r.action] || '처리됨')}${r.reporter ? ` · 신고: ${esc(r.reporter)}` : ''}</span></li>`).join('')}</ul>` : '<div class="empty-mini">없어요</div>'}</div>
+      ${self ? '<div class="help" style="margin-top:12px;text-align:center">내 계정의 권한은 다른 관리자만 바꿀 수 있어요.</div>' : ''}
+      <div class="stack">${btns.join('')}</div>`,
+    onMount(sheet, close) {
+      sheet.addEventListener('click', async (e) => {
+        const x = e.target.closest('[data-x]'); if (!x || x.disabled) return;
+        const act = x.dataset.x;
+        const n = u.display_name;
+        try {
+          if (act === 'memo') {
+            x.disabled = true;
+            await api.adminSetNote(u.id, $('#memo', sheet).value);
+            x.disabled = false; toast('메모를 저장했어요'); return;
+          }
+          if (act === 'connect') { close(); showConnectFriends(u); return; }
+          if (act === 'approve') {
+            await api.adminSetStatus(u.id, 'active'); close(); toast(`${n}님의 가입을 승인했어요`);
+          } else if (act === 'unsuspend') {
+            await api.adminSetStatus(u.id, 'active'); close(); toast(`${n}님의 정지를 해제했어요`);
+          } else if (act === 'suspend') {
+            close();
+            const pick = await askSuspend(n);
+            if (!pick) return;
+            await api.adminSuspend(u.id, pick.days, pick.reason);
+            toast(pick.days ? `${n}님의 이용을 ${pick.days}일 동안 정지했어요` : `${n}님의 이용을 정지했어요 (영구)`);
+          } else if (act === 'admin') {
+            const on = !u.is_admin;
+            await api.adminSetAdmin(u.id, on); close(); toast(on ? `${n}님을 관리자로 지정했어요` : `${n}님의 관리자 권한을 해제했어요`);
+          } else if (act === 'reset') {
+            close();
+            if (!(await ask(`${n}님의 비밀번호를 초기화할까요?`, '임시 비밀번호가 발급되고 기존 비밀번호는 더 이상 쓸 수 없어요.', '초기화'))) return;
+            showTempPassword(n, await api.adminResetPassword(u.id));
+          } else if (act === 'clearphone') {
+            close();
+            if (!(await ask(`${n}님의 휴대폰 번호를 삭제할까요?`, '다른 사람 번호를 잘못 등록한 경우 등에 사용해요. 회원이 나중에 다시 등록할 수 있어요.', '삭제', true))) return;
+            await api.adminClearPhone(u.id); toast(`${n}님의 휴대폰 번호를 삭제했어요`);
+          } else if (act === 'delete') {
+            close();
+            const wipe = await askAdminDelete(n);
+            if (wipe === null) return;
+            await api.adminDeleteUser(u.id, wipe); toast(`${n}님을 탈퇴 처리했어요`);
+            cleanOrphans(true);
+          }
+          adminAfterChange();
+        } catch (ex) { x.disabled = false; showErr(ex); }
+      });
+    },
+  });
+}
+// 회원 상태가 바뀐 뒤: 목록·배지·현황 새로
+function adminAfterChange() {
+  if (!S.admin) return;
+  refreshAdminBadges();
+  S.admin.dash = null;
+  if (S.admin.sec === 'members') loadMembers(true);
+  else if (S.admin.sec === 'home') renderHomeSec();
+  else { S.admin.members.loaded = false; }
+}
+// 정지 기간 고르기 → { days(null=영구), reason } 또는 null(취소)
+function askSuspend(name) {
+  return new Promise((resolve) => {
+    let done = false;
+    openSheet({
+      title: `${name}님 이용 정지`,
+      body: `<p class="sheet-desc">정지 기간에는 로그인과 대화를 할 수 없어요. 기간이 끝나면 자동으로 풀려요.</p>
+        <div class="reason-list" role="radiogroup" aria-label="정지 기간">${[[1, '1일'], [3, '3일'], [7, '7일'], [30, '30일'], ['', '영구 (직접 풀 때까지)']].map(([v, l], i) => `<label class="reason"><input type="radio" name="days" value="${v}" ${i === 2 ? 'checked' : ''}><span>${l}</span></label>`).join('')}</div>
+        <input class="input" id="susReason" maxlength="300" placeholder="사유 (관리자만 봐요, 선택)" style="margin-top:12px">
+        <div class="two" style="margin-top:16px"><button class="btn gray" data-no>취소</button><button class="btn danger" data-yes>정지</button></div>`,
+      onMount(el, close) {
+        $('[data-no]', el).onclick = () => close();
+        $('[data-yes]', el).onclick = () => {
+          const v = $('input[name=days]:checked', el).value;
+          done = true; close(); resolve({ days: v ? Number(v) : null, reason: $('#susReason', el).value.trim() });
+        };
+        onSheetGone(el, () => { if (!done) resolve(null); });
+      },
+    });
+  });
+}
+
+// ---------- 신고 ----------
+const REASON_LABEL = Object.fromEntries(REPORT_REASONS);
+const ACTION_LABEL = { dismiss: '문제 없음', delete: '메시지 삭제', suspend: '이용 정지', both: '메시지 삭제 + 이용 정지' };
+function showReportsAdmin(status = 'open') {
+  if (S.admin) S.admin.reports.status = status;
+  else S.pendingReportsStatus = status;
+  adminGo('reports');
+}
+async function renderReportsSec() {
+  const A = S.admin;
+  if (S.pendingReportsStatus) { A.reports.status = S.pendingReportsStatus; S.pendingReportsStatus = null; }
+  const status = A.reports.status;
+  admLoading();
+  let rows;
+  try { rows = await api.adminListReports(status); } catch (e) { if (S.admin && A.sec === 'reports') admError(e); return; }
+  if (!S.admin || A.sec !== 'reports' || !admMain()) return;
+  const kindTxt = (r) => (r.message_id == null ? '회원 신고' : r.message_kind === 'image' ? '사진' : r.message_kind === 'file' ? '파일' : r.message_kind === 'sticker' ? '이모티콘' : r.message_kind === 'contact' ? '연락처' : '메시지');
+  admMain().innerHTML = `<div class="adm-sec">
+    <div class="adm-h"><h2>신고</h2></div>
+    <div class="seg" style="margin-bottom:12px;max-width:420px"><button type="button" data-act="admin-rep-tab" data-s="open" class="${status === 'open' ? 'on' : ''}">처리 대기</button><button type="button" data-act="admin-rep-tab" data-s="done" class="${status === 'done' ? 'on' : ''}">처리 완료</button></div>
+    <div class="rep-list">${rows.length ? rows.map((r) => `<div class="rep-card" data-id="${r.id}">
+      <div class="rep-top"><span class="chip-lemon">${esc(REASON_LABEL[r.reason] || r.reason)}</span><span class="rep-kind">${kindTxt(r)}</span><span class="rep-time">${esc(fmtAgo(r.created_at))}</span></div>
+      <div class="rep-who">${r.target_id ? `<button class="linkish" data-act="admin-user" data-id="${esc(r.target_id)}"><b>${esc(r.target_name || '(알 수 없음)')}</b></button>` : '<b>(탈퇴한 회원)</b>'}${r.target_username ? ` @${esc(r.target_username)}` : ''}${r.target_status === 'suspended' ? ' <span class="chip suspended">정지</span>' : ''} · 누적 신고 ${r.target_reports}건</div>
+      ${r.message_id != null ? `<div class="rep-snap ${r.message_gone ? 'gone' : ''}">${r.message_kind === 'image' && r.media_path && !r.message_gone ? `<img alt="신고된 사진" data-path="${esc(r.media_path)}">` : esc(r.message_kind === 'file' ? `파일: ${r.snapshot}` : r.snapshot)}${r.message_gone ? '<span class="rep-gone">삭제됨</span>' : ''}</div>` : ''}
+      ${r.detail ? `<div class="rep-detail">“${esc(r.detail)}”</div>` : ''}
+      <div class="rep-by">신고: ${esc(r.reporter_name || '(탈퇴한 회원)')}</div>
+      ${r.status === 'open' ? `<div class="rep-actions">
+        <button class="btn line sm" data-act="admin-rep" data-a="dismiss">문제 없음</button>
+        ${r.message_id != null && !r.message_gone ? '<button class="btn line sm" data-act="admin-rep" data-a="delete">메시지 삭제</button>' : ''}
+        ${r.target_id && r.target_status !== 'suspended' ? '<button class="btn line sm danger-text" data-act="admin-rep" data-a="suspend">이용 정지</button>' : ''}
+        ${r.message_id != null && !r.message_gone && r.target_id && r.target_status !== 'suspended' ? '<button class="btn danger sm" data-act="admin-rep" data-a="both">삭제 + 정지</button>' : ''}
+      </div>` : `<div class="rep-done">${ic('check', 15)}${esc(ACTION_LABEL[r.action] || '처리됨')}</div>`}
+    </div>`).join('') : `<div class="empty-line">${status === 'open' ? '처리할 신고가 없어요' : '처리한 신고가 없어요'}</div>`}</div></div>`;
+  A.reports.rows = rows;
+  const imgs = $$('#admMain img[data-path]');
+  if (imgs.length) api.imageUrls(imgs.map((i) => i.dataset.path)).then((u) => imgs.forEach((i) => { if (u[i.dataset.path]) i.src = u[i.dataset.path]; })).catch(() => {});
+}
+async function resolveReport(btn) {
+  const A = S.admin; if (!A) return;
+  const r = (A.reports.rows || []).find((y) => String(y.id) === btn.closest('.rep-card').dataset.id);
+  if (!r) return;
+  const a = btn.dataset.a;
+  let days = null;
+  if (a === 'suspend' || a === 'both') {
+    const pick = await askSuspend(r.target_name || '회원');
+    if (!pick) return;
+    days = pick.days;
+    if (a === 'both' && !(await ask('메시지도 삭제할까요?', '모든 참여자 화면에서 "삭제된 메시지예요"로 바뀌어요.', '삭제 + 정지', true))) return;
+  } else {
+    const msg = {
+      dismiss: ['문제 없음으로 처리할까요?', '신고를 닫고 아무 조치도 하지 않아요.', '처리', false],
+      delete: ['이 메시지를 삭제할까요?', '모든 참여자 화면에서 "삭제된 메시지예요"로 바뀌어요.', '삭제', true],
+    }[a];
+    if (!(await ask(...msg))) return;
+  }
+  try {
+    if ((a === 'delete' || a === 'both') && r.media_path) {
+      await api.removeMedia([{ bucket: r.message_kind === 'image' ? 'chat-images' : 'chat-files', name: r.media_path }]).catch(() => {});
+    }
+    await api.adminResolveReport(r.id, a, days);
+    toast(`${ACTION_LABEL[a]}(으)로 처리했어요`);
+    refreshAdminBadges();
+    if (S.admin && S.admin.sec === 'reports') renderReportsSec();
+  } catch (ex) { showErr(ex); }
+}
+function onReport(p) {
+  if (!S.me || !S.me.is_admin) return;
+  S.openReports = Number(p.open) || 0;
+  refreshAdminBadges();
+  toast(`새 신고가 들어왔어요 (처리 대기 ${S.openReports}건)`, { onClick: () => { S.adminFromMore = !!S.entered; showReportsAdmin('open'); } });
+}
+
+// ---------- 문의 (관리자) ----------
+async function renderInquiriesSec(append) {
+  const A = S.admin; const Q = A.inquiries;
+  if (!append) admLoading();
+  let rows;
+  try { rows = await api.adminListInquiries(Q.status, PAGE_SIZE, append ? Q.rows.length : 0); } catch (e) { if (S.admin && A.sec === 'inquiries') admError(e); return; }
+  if (!S.admin || A.sec !== 'inquiries' || !admMain()) return;
+  Q.rows = append ? Q.rows.concat(rows) : rows;
+  Q.total = rows.length ? Number(rows[0].total) : (append ? Q.total : 0);
+  const left = Q.total - Q.rows.length;
+  admMain().innerHTML = `<div class="adm-sec">
+    <div class="adm-h"><h2>문의</h2><span class="adm-date">${Q.total ? `${Q.total.toLocaleString()}건` : ''}</span></div>
+    <div class="filters">${[['open', '답변 대기'], ['answered', '답변 완료'], ['closed', '종료'], ['all', '전체']].map(([k, l]) => `<button data-act="admin-inq-tab" data-s="${k}" class="${Q.status === k ? 'on' : ''}">${l}</button>`).join('')}</div>
+    <div class="card inq-list">${Q.rows.length ? Q.rows.map((q) => `<button class="inq-row" data-act="admin-inq" data-id="${q.id}">
+        <div class="inq-l1"><span class="chip ${q.status === 'open' ? 'pending' : q.status === 'answered' ? 'active' : ''}">${INQ_ST[q.status]}</span><span class="inq-cat">${esc(INQ_CAT[q.category] || '')}</span>${q.admin_unread ? '<i class="dot" aria-label="새 글"></i>' : ''}<span class="inq-time">${esc(fmtAgo(q.updated_at))}</span></div>
+        <b class="inq-title">${esc(q.title)}</b>
+        <span class="inq-sub">${esc(q.display_name)} @${esc(q.username)} · ${q.last_from_admin ? '내 답변: ' : ''}${esc(String(q.last_body || '').replace(/\s+/g, ' ').slice(0, 60))}</span></button>`).join('')
+    : `<div class="empty-line">${Q.status === 'open' ? '답변할 문의가 없어요' : '문의가 없어요'}</div>`}</div>
+    ${left > 0 ? `<button class="btn line sm more-btn" data-act="admin-inq-more">더 보기 (${left}건 남음)</button>` : ''}</div>`;
+}
+
+// 문의 내용 보기 (회원·관리자 공용)
+async function showInquiryThread(id, { admin = false } = {}) {
+  let t;
+  try { t = await api.inquiryThread(id); } catch (e) { showErr(e); return; }
+  const closed = t.status === 'closed';
+  openSheet({
+    title: t.title,
+    body: `<div class="inq-meta"><span class="chip ${t.status === 'open' ? 'pending' : t.status === 'answered' ? 'active' : ''}">${INQ_ST[t.status]}</span><span>${esc(INQ_CAT[t.category] || '')}</span><span>${fmtDT(t.created_at)}</span>
+        ${admin && t.user ? `<button class="linkish" data-x="member">${esc(t.user.display_name)} @${esc(t.user.username)}</button>` : ''}</div>
+      <div class="thread">${t.messages.map((m) => `<div class="tmsg ${m.from_admin ? 'adm' : 'usr'}"><span class="who">${m.from_admin ? `${esc(APP)} 운영팀` : admin ? esc(t.user ? t.user.display_name : '회원') : '나'}</span><div class="tb">${linkify(m.body)}</div><span class="tt">${fmtDT(m.created_at)}</span></div>`).join('')}</div>
+      ${closed && !admin ? '<div class="empty-mini">종료된 문의예요. 더 궁금한 점은 새로 문의해 주세요.</div>' : `
+      <textarea class="input memo" id="inqReply" maxlength="2000" rows="3" placeholder="${admin ? '답변을 입력하세요 (회원에게 알림이 가요)' : '추가로 문의할 내용을 입력하세요'}"></textarea>
+      <div class="field-err" id="err-inq"></div>
+      <div class="two" style="margin-top:10px">${closed ? '<span></span>' : `<button class="btn gray" data-x="close">${admin ? '문의 종료' : '해결됐어요 (종료)'}</button>`}<button class="btn" data-x="send">${admin ? '답변 보내기' : '보내기'}</button></div>`}`,
+    onMount(sheet, close) {
+      const th = $('.thread', sheet); if (th) th.scrollTop = th.scrollHeight;
+      sheet.addEventListener('click', async (e) => {
+        const x = e.target.closest('[data-x]'); if (!x) return;
+        try {
+          if (x.dataset.x === 'member') { close(); showAdminUser(t.user_id); return; }
+          if (x.dataset.x === 'send') {
+            const body = $('#inqReply', sheet).value.trim();
+            if (!body) { $('#err-inq', sheet).innerHTML = `${ic('alert', 16, 'flex:none')}내용을 입력해 주세요`; return; }
+            x.disabled = true;
+            await api.replyInquiry(t.id, body);
+            close(); toast(admin ? '답변을 보냈어요. 회원에게 알림이 가요' : '문의를 보냈어요');
+          }
+          if (x.dataset.x === 'close') {
+            await api.closeInquiry(t.id); close(); toast('문의를 종료했어요');
+          }
+          if (admin) { refreshAdminBadges(); if (S.admin && S.admin.sec === 'inquiries') renderInquiriesSec(); }
+          else loadMyInquiries().then(() => { if (S.tab === 'more' && !S.room) renderMain(); });
+        } catch (ex) { x.disabled = false; showErr(ex); }
+      });
+    },
+  });
+  if (admin) refreshAdminBadges();
+  else loadMyInquiries().then(() => { if (S.tab === 'more' && !S.room && !$('#admin:not([hidden])')) { const b = $('#inqBadge'); if (b) b.innerHTML = inqBadgeHtml(); } });
+}
+function onInquiryAdmin(p) {
+  if (!S.me || !S.me.is_admin) return;
+  S.openInquiries = Number(p.open) || 0;
+  refreshAdminBadges();
+  if (S.admin && S.admin.sec === 'inquiries' && !$('.sheet-back')) renderInquiriesSec();
+  toast(`새 문의가 있어요 (답변 대기 ${S.openInquiries}건)`, { onClick: () => { S.adminFromMore = !!S.entered; if (S.admin) S.admin.inquiries.status = 'open'; adminGo('inquiries'); } });
+}
+
+// ---------- 운영 ----------
+function renderOpsSec() {
+  const d = S.admin.dash;
+  const approval = d ? d.require_approval : (S.admin.settings ? S.admin.settings.require_approval : false);
+  admMain().innerHTML = `<div class="adm-sec">
+    <div class="adm-h"><h2>운영</h2></div>
+    <div class="card adm-card">
+      <div class="item" style="padding-top:14px;padding-bottom:14px"><span class="label">가입 승인제<span class="sub">${approval ? '켜져 있어요 · 새 회원은 관리자 승인 후 이용할 수 있어요' : '꺼져 있어요 · 가입하면 바로 이용할 수 있어요'}</span></span>
+        <button class="switch ${approval ? 'on' : ''}" data-act="admin-approval" role="switch" aria-checked="${approval}" aria-label="가입 승인제"></button></div>
+      <button class="item" data-act="admin-notice"><span class="tile mint">${ic('mega', 19)}</span><span class="label">전체 공지 보내기<span class="sub">모든 회원의 공지사항 방에 글을 올려요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <button class="item" data-act="admin-ads"><span class="tile lav">${ic('gift', 19)}</span><span class="label">광고 관리<span class="sub">광고 탭에 보일 이미지와 링크를 등록해요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <button class="item" data-act="admin-words"><span class="tile peach">${ic('ban', 19)}</span><span class="label">금칙어 관리<span class="sub">욕설 등 부적절한 말을 * 로 가려요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <button class="item" data-act="admin-clean" style="padding-top:14px;padding-bottom:14px"><span class="tile sky">${ic('file', 19)}</span><span class="label">남은 사진·파일 정리<span class="sub">없어진 대화방에 남아 있는 사진·파일을 저장 공간에서 지워요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+    </div></div>`;
+  if (!d) api.adminDashboard().then((x) => { if (S.admin) { S.admin.dash = x; if (S.admin.sec === 'ops') renderOpsSec(); } }).catch(() => {});
+}
+
+// ---------- 회원: 1:1 문의 ----------
+const inqBadgeHtml = () => (S.inqUnread ? `<span class="chip-lemon">답변 ${S.inqUnread}</span>` : '');
+async function loadMyInquiries() {
+  if (!api.myInquiries) return [];
+  try { S.myInq = await api.myInquiries(); } catch { S.myInq = S.myInq || []; }
+  S.inqUnread = (S.myInq || []).filter((q) => q.user_unread).length;
+  return S.myInq;
+}
+async function showMyInquiries() {
+  const list = await loadMyInquiries();
+  openSheet({
+    title: '1:1 문의',
+    body: `<p class="sheet-desc">궁금한 점이나 불편한 점을 남겨 주세요. 답변이 오면 알려 드려요.${CONTACT ? ` 이메일 <b>${esc(CONTACT)}</b> 로도 문의할 수 있어요.` : ''}</p>
+      <button class="btn" data-x="new">${ic('pencil', 18)}새 문의 쓰기</button>
+      <div class="card inq-list" style="margin-top:14px">${list.length ? list.map((q) => `<button class="inq-row" data-x="open" data-id="${q.id}">
+        <div class="inq-l1"><span class="chip ${q.status === 'open' ? 'pending' : q.status === 'answered' ? 'active' : ''}">${INQ_ST[q.status]}</span><span class="inq-cat">${esc(INQ_CAT[q.category] || '')}</span>${q.user_unread ? '<i class="dot" aria-label="새 답변"></i>' : ''}<span class="inq-time">${esc(fmtAgo(q.updated_at))}</span></div>
+        <b class="inq-title">${esc(q.title)}</b><span class="inq-sub">${q.last_from_admin ? '운영팀: ' : ''}${esc(String(q.last_body || '').replace(/\s+/g, ' ').slice(0, 60))}</span></button>`).join('')
+    : '<div class="empty-line">아직 문의한 내용이 없어요</div>'}</div>`,
+    onMount(sheet, close) {
+      sheet.addEventListener('click', (e) => {
+        const x = e.target.closest('[data-x]'); if (!x) return;
+        close();
+        if (x.dataset.x === 'new') showNewInquiry();
+        if (x.dataset.x === 'open') showInquiryThread(Number(x.dataset.id));
+      });
+    },
+  });
+}
+function showNewInquiry() {
+  openSheet({
+    title: '새 문의',
+    body: `<div class="auth-fields">
+        <div class="field" data-field="inqCat"><label>문의 종류</label><div class="filters inq-cats">${INQ_CATS.map(([k, l]) => `<button type="button" data-cat="${k}">${l}</button>`).join('')}</div><div class="field-err" id="err-inqCat"></div></div>
+        <div class="field" data-field="inqTitle"><label for="inqTitle">제목</label><input class="input" id="inqTitle" maxlength="60" placeholder="한 줄로 적어 주세요"><div class="field-err" id="err-inqTitle"></div></div>
+        <div class="field" data-field="inqBody"><label for="inqBody">내용</label><textarea class="input memo" id="inqBody" maxlength="2000" rows="6" placeholder="언제, 어떤 화면에서, 어떤 일이 있었는지 적어 주시면 빨리 도와드릴 수 있어요. 비밀번호는 적지 마세요."></textarea><div class="field-err" id="err-inqBody"></div></div>
+      </div>
+      <button class="btn" data-x="send" style="margin-top:14px">보내기</button>`,
+    onMount(sheet, close) {
+      let cat = null;
+      sheet.addEventListener('click', async (e) => {
+        const c = e.target.closest('[data-cat]');
+        if (c) { cat = c.dataset.cat; $$('[data-cat]', sheet).forEach((b) => b.classList.toggle('on', b === c)); setFieldErr(sheet, 'inqCat', ''); return; }
+        const x = e.target.closest('[data-x="send"]'); if (!x) return;
+        const title = $('#inqTitle', sheet).value.trim(); const body = $('#inqBody', sheet).value.trim();
+        setFieldErr(sheet, 'inqCat', cat ? '' : '문의 종류를 골라 주세요');
+        setFieldErr(sheet, 'inqTitle', title ? '' : '제목을 입력해 주세요');
+        setFieldErr(sheet, 'inqBody', body ? '' : '내용을 입력해 주세요');
+        if (!cat || !title || !body) return;
+        x.disabled = true;
+        try {
+          await api.createInquiry({ category: cat, title, body });
+          close(); toast('문의를 보냈어요. 답변이 오면 알려 드려요');
+          await loadMyInquiries();
+          if (S.tab === 'more' && !S.room) renderMain();
+        } catch (ex) { x.disabled = false; showErr(ex); }
+      });
+      $('#inqTitle', sheet).oninput = () => setFieldErr(sheet, 'inqTitle', '');
+      $('#inqBody', sheet).oninput = () => setFieldErr(sheet, 'inqBody', '');
+    },
+  });
+}
+function onInquiry(p) {
+  S.inqUnread = (S.inqUnread || 0) + 1;
+  const b = $('#inqBadge'); if (b) b.innerHTML = inqBadgeHtml();
+  toast(`문의에 답변이 왔어요: ${String(p.title || '').slice(0, 20)}`, { onClick: () => showInquiryThread(Number(p.id)) });
 }
 
 // ---------------------------------------------------------------------
@@ -2987,12 +3378,20 @@ async function showConnectFriends(u) {
   let rel;
   try { rel = await api.adminUserFriends(u.id); } catch (e) { showErr(e); return; }
   const relMap = new Map((rel || []).map((r) => [r.id, r]));
-  const people = S.admin.users.filter((x) => x.id !== u.id && x.status === 'active')
-    .sort((a, b) => {
-      const ra = relMap.get(a.id); const rb = relMap.get(b.id);
-      const k = (r) => (r && r.added && r.added_me ? 2 : 0);   // 이미 친구는 아래로
-      return k(ra) - k(rb) || a.display_name.localeCompare(b.display_name, 'ko');
-    });
+  // v1.18: 회원이 많아도 되게 서버에서 검색 (이름순 200명까지)
+  let people = [];
+  const known = new Map();
+  const fetchPeople = async (t) => {
+    const rows = await api.adminMemberPage({ q: t, filter: 'all', sort: 'name', limit: 200 });
+    people = rows.filter((x) => x.id !== u.id && x.status === 'active')
+      .sort((a, b) => {
+        const ra = relMap.get(a.id); const rb = relMap.get(b.id);
+        const k = (r) => (r && r.added && r.added_me ? 2 : 0);   // 이미 친구는 아래로
+        return k(ra) - k(rb) || a.display_name.localeCompare(b.display_name, 'ko');
+      });
+    people.forEach((x) => known.set(x.id, x));
+  };
+  try { await fetchPeople(''); } catch (e) { showErr(e); return; }
   const sel = [];
   const state = (x) => { const r = relMap.get(x.id); return r && r.added && r.added_me ? 'mutual' : r && (r.added || r.added_me) ? 'oneway' : ''; };
   openSheet({
@@ -3005,8 +3404,7 @@ async function showConnectFriends(u) {
     onMount(sheet, close) {
       const list = $('#cnList', sheet); const chips = $('#cnChips', sheet); const ok = $('#cnOk', sheet); const q = $('#cnSearch', sheet);
       const draw = () => {
-        const t = q.value.trim().toLowerCase().replace(/^@/, '');
-        const shown = people.filter((x) => !t || x.display_name.toLowerCase().includes(t) || x.username.includes(t));
+        const shown = people;
         list.innerHTML = shown.length ? shown.map((x) => {
           const st = state(x); const on = sel.includes(x.id);
           return `<button class="pick ${on ? 'on' : ''} ${st === 'mutual' ? 'done' : ''}" data-cn="${esc(x.id)}" role="checkbox" aria-checked="${on}" ${st === 'mutual' ? 'disabled' : ''}>${av(x, 44)}
@@ -3014,11 +3412,12 @@ async function showConnectFriends(u) {
             ${st === 'mutual' ? '<span class="cres-tag">이미 친구</span>' : `<span class="ck">${ic('check', 16)}</span>`}</button>`;
         }).join('') : '<div class="empty-line">연결할 수 있는 회원이 없어요</div>';
         chips.hidden = !sel.length;
-        chips.innerHTML = sel.map((id) => { const x = people.find((p) => p.id === id); return `<button class="sel-chip" data-uncn="${esc(id)}" aria-label="${esc(x.display_name)} 선택 해제">${av(x, 32)}${esc(x.display_name)}${ic('x', 14)}</button>`; }).join('');
+        chips.innerHTML = sel.map((id) => { const x = known.get(id); return `<button class="sel-chip" data-uncn="${esc(id)}" aria-label="${esc(x.display_name)} 선택 해제">${av(x, 32)}${esc(x.display_name)}${ic('x', 14)}</button>`; }).join('');
         ok.disabled = !sel.length;
         ok.textContent = sel.length ? `${sel.length}명과 친구로 연결` : '연결할 회원을 고르세요';
       };
-      q.oninput = draw;
+      let qt = null;
+      q.oninput = () => { clearTimeout(qt); qt = setTimeout(() => { fetchPeople(q.value.trim()).then(draw).catch(showErr); }, 300); };
       sheet.addEventListener('click', async (e) => {
         const b = e.target.closest('[data-cn]'); const c = e.target.closest('[data-uncn]');
         const id = b ? b.dataset.cn : c ? c.dataset.uncn : null;
@@ -3030,7 +3429,7 @@ async function showConnectFriends(u) {
             close();
             toast(n ? `${u.display_name}님과 ${n}명을 서로 친구로 연결했어요` : '이미 모두 친구예요', { ms: 3200 });
             if (u.id === S.uid || sel.includes(S.uid)) { loadFriends().then(() => { if (S.tab === 'friends' && !S.room) renderMain(); }).catch(() => {}); }
-            loadAdmin();
+            adminAfterChange();
           } catch (ex) { draw(); showErr(ex); }
         }
       });
@@ -3056,73 +3455,6 @@ function onConnected(p) {
     return;
   }
   toastMsg({ person, title: invite ? '새 친구' : '친구 연결', body: text, onClick: () => showProfile(p.friend_id) });
-}
-
-function showAdminUser(id) {
-  const u = S.admin && S.admin.users.find((x) => x.id === id);
-  if (!u) return;
-  const self = u.id === S.uid;
-  const s = stOf(u);
-  const B = (label, x, kind) => `<button class="btn md ${kind}" data-x="${x}" ${self ? 'disabled' : ''}>${label}</button>`;
-  const btns = {
-    pending: [B('가입 승인', 'approve', ''), B('가입 거절 (강제 탈퇴)', 'delete', 'danger-line')],
-    active: [B('이용 정지', 'suspend', 'line'), B('비밀번호 초기화', 'reset', 'line'), B('관리자로 지정', 'admin', 'line'), B('강제 탈퇴', 'delete', 'danger-line')],
-    suspended: [B('정지 해제', 'unsuspend', ''), B('비밀번호 초기화', 'reset', 'line'), B('강제 탈퇴', 'delete', 'danger-line')],
-    admin: [B('관리자 해제', 'admin', 'line'), B('비밀번호 초기화', 'reset', 'line')],
-  }[s];
-  if (u.phone) btns.splice(btns.length - (s === 'admin' ? 0 : 1), 0, `<button class="btn md line" data-x="clearphone">휴대폰 번호 삭제</button>`);
-  if (s === 'active' || s === 'admin') btns.unshift(`<button class="btn md soft" data-x="connect">${ic('userplus', 18)}친구 연결</button>`);   // v1.13
-  openSheet({
-    title: '회원 정보',
-    body: `<div class="m-head">${av(u, 64)}<div class="meta" style="gap:6px"><div class="nm"><b>${esc(u.display_name)}</b>${stChip(u)}</div><span class="desc">@${esc(u.username)}</span></div></div>
-      <div class="grid2">
-        <div class="cell"><span>가입일</span><b>${fmtDay(u.created_at)}</b></div>
-        <div class="cell"><span>최근 접속</span><b>${esc(fmtAgo(u.last_seen_at))}</b></div>
-        <div class="cell"><span>친구</span><b>${u.friend_count}명</b></div>
-        <div class="cell"><span>대화방</span><b>${u.room_count}개</b></div>
-        <div class="cell wide"><span>휴대폰 번호</span><b>${u.phone ? esc(fmtPhone(u.phone)) : '등록 안 함'}</b></div>
-      </div>
-      ${self ? '<div class="help" style="margin-top:12px;text-align:center">내 계정의 권한은 다른 관리자만 바꿀 수 있어요.</div>' : ''}
-      <div class="stack">${btns.join('')}</div>`,
-    onMount(sheet, close) {
-      sheet.addEventListener('click', async (e) => {
-        const x = e.target.closest('[data-x]'); if (!x || x.disabled) return;
-        const act = x.dataset.x;
-        const n = u.display_name;
-        try {
-          if (act === 'connect') { close(); showConnectFriends(u); return; }
-          if (act === 'approve') {
-            await api.adminSetStatus(u.id, 'active'); close(); toast(`${n}님의 가입을 승인했어요`);
-          } else if (act === 'unsuspend') {
-            await api.adminSetStatus(u.id, 'active'); close(); toast(`${n}님의 정지를 해제했어요`);
-          } else if (act === 'suspend') {
-            close();
-            if (!(await ask(`${n}님의 이용을 정지할까요?`, '정지된 회원은 바로 대화를 볼 수 없고 다시 로그인할 수 없어요. 나중에 해제할 수 있어요.', '이용 정지', true))) return;
-            await api.adminSetStatus(u.id, 'suspended'); toast(`${n}님의 이용을 정지했어요`);
-          } else if (act === 'admin') {
-            const on = !u.is_admin;
-            await api.adminSetAdmin(u.id, on); close(); toast(on ? `${n}님을 관리자로 지정했어요` : `${n}님의 관리자 권한을 해제했어요`);
-          } else if (act === 'reset') {
-            close();
-            if (!(await ask(`${n}님의 비밀번호를 초기화할까요?`, '임시 비밀번호가 발급되고 기존 비밀번호는 더 이상 쓸 수 없어요.', '초기화'))) return;
-            const pw = await api.adminResetPassword(u.id);
-            showTempPassword(n, pw);
-          } else if (act === 'clearphone') {
-            close();
-            if (!(await ask(`${n}님의 휴대폰 번호를 삭제할까요?`, '다른 사람 번호를 잘못 등록한 경우 등에 사용해요. 회원이 나중에 다시 등록할 수 있어요.', '삭제', true))) return;
-            await api.adminClearPhone(u.id); toast(`${n}님의 휴대폰 번호를 삭제했어요`);
-          } else if (act === 'delete') {
-            close();
-            const wipe = await askAdminDelete(n);
-            if (wipe === null) return;
-            await api.adminDeleteUser(u.id, wipe); toast(`${n}님을 탈퇴 처리했어요`);
-            cleanOrphans(true);   // 아무도 없게 된 방의 사진·파일도 정리
-          }
-          await loadAdmin();
-        } catch (ex) { showErr(ex); }
-      });
-    },
-  });
 }
 
 function showTempPassword(name, pw) {
@@ -3244,12 +3576,33 @@ app.addEventListener('click', async (e) => {
     case 'change-password': showChangePassword(); break;
     case 'install': showInstall(); break;
     case 'open-admin': S.adminFromMore = true; go('#/admin'); break;
-    case 'admin-back':
-      if (S.adminFromMore) { S.adminFromMore = false; history.back(); } else location.replace('#/more');
+    case 'admin-back':   // v1.18: 관리자 안에서 메뉴를 옮겨 다녀도 한 번에 더보기로
+      S.adminFromMore = false; location.replace('#/more');
       break;
     case 'admin-filter':
-      if (S.admin) { S.admin.filter = el.dataset.f; renderAdmin(); }
+      if (S.admin) { S.admin.members.filter = el.dataset.f; $$('.filters [data-act=admin-filter]').forEach((b) => b.classList.toggle('on', b === el)); loadMembers(true); }
       break;
+    // v1.18: 관리자 화면 이동·동작
+    case 'admin-sec': adminGo(el.dataset.s); break;
+    case 'admin-todo':
+      if (S.admin && el.dataset.s === 'members') { S.admin.members.filter = el.dataset.f || 'all'; S.admin.members.loaded = false; }
+      if (S.admin && el.dataset.s === 'inquiries') S.admin.inquiries.status = 'open';
+      if (S.admin && el.dataset.s === 'reports') S.admin.reports.status = 'open';
+      if (S.admin && S.admin.sec === el.dataset.s) renderAdminSection(); else adminGo(el.dataset.s);
+      break;
+    case 'admin-refresh':
+      if (S.admin) { S.admin.dash = null; S.admin.members.loaded = false; refreshAdminBadges(); renderAdminSection(); }
+      break;
+    case 'admin-chart':
+      if (S.admin && S.admin.dash) { S.admin.chart = el.dataset.k; $$('[data-act=admin-chart]').forEach((b) => b.classList.toggle('on', b === el)); const c = $('#admChart'); if (c) c.innerHTML = chartSvg(S.admin.dash.series || [], S.admin.chart); const n = $('.chart-note'); if (n) n.hidden = S.admin.chart !== 'active'; }
+      break;
+    case 'admin-more': loadMembers(false); break;
+    case 'admin-rep-tab': if (S.admin) { S.admin.reports.status = el.dataset.s; renderReportsSec(); } break;
+    case 'admin-rep': resolveReport(el); break;
+    case 'admin-inq-tab': if (S.admin) { S.admin.inquiries.status = el.dataset.s; renderInquiriesSec(); } break;
+    case 'admin-inq-more': renderInquiriesSec(true); break;
+    case 'admin-inq': showInquiryThread(Number(el.dataset.id), { admin: true }); break;
+    case 'my-inquiries': showMyInquiries(); break;
     case 'admin-user': showAdminUser(el.dataset.id); break;
     case 'admin-notice': showBroadcast(); break;
     case 'admin-clean': cleanOrphans(false, el); break;
@@ -3262,12 +3615,12 @@ app.addEventListener('click', async (e) => {
     case 'open-ad': openAd(el.dataset.id); break;
     case 'ads-reload': S.adsLoaded = false; renderMain(); loadAds(); break;
     case 'admin-approval': {
-      if (!S.admin || !S.admin.settings) break;
-      const on = !S.admin.settings.require_approval;
+      if (!S.admin || !S.admin.dash) break;
+      const on = !S.admin.dash.require_approval;
       if (!(await ask(on ? '가입 승인제를 켤까요?' : '가입 승인제를 끌까요?',
         on ? '이제부터 새로 가입한 사람은 관리자가 승인해야 이용할 수 있어요. 이미 가입한 회원은 그대로예요.' : '이제부터 누구나 가입하면 바로 이용할 수 있어요. 승인 대기 중인 회원은 직접 승인해 주세요.',
         on ? '켜기' : '끄기'))) break;
-      try { await api.adminSetApproval(on); toast(on ? '가입 승인제를 켰어요' : '가입 승인제를 껐어요'); await loadAdmin(); }
+      try { await api.adminSetApproval(on); toast(on ? '가입 승인제를 켰어요' : '가입 승인제를 껐어요'); S.admin.dash.require_approval = on; renderOpsSec(); }
       catch (ex) { showErr(ex); }
       break;
     }

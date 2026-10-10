@@ -14,7 +14,7 @@ function friendly(error) {
   const map = [
     [/Invalid login credentials/i, '아이디 또는 비밀번호가 맞지 않아요'],
     [/banned/i, '이용이 정지된 계정이에요. 관리자에게 문의해 주세요'],
-    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad|block_user|unblock_user|my_blocks|report_content|agree_terms|my_media_files|delete_my_account)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad|block_user|unblock_user|my_blocks|report_content|agree_terms|my_media_files|delete_my_account|refresh_my_status|create_inquiry|my_inquiries|inquiry_thread|reply_inquiry|close_inquiry)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found|'reply_to' column|relation "public\.ads"|table 'public\.ads'|public\.ads/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/already registered|already exists/i, '이미 사용 중인 아이디예요'],
     [/Database error saving new user/i, '가입할 수 없는 아이디예요. 영문 소문자·숫자·밑줄(_) 3~20자로 입력해 주세요'],
@@ -261,6 +261,13 @@ export function createApi() {
       must(await sb.rpc('report_content', { p_target: target, p_message: message, p_reason: reason, p_detail: detail }));
     },
     async agreeTerms() { must(await sb.rpc('agree_terms')); },
+    // v1.18: 정지 기간이 끝났는지 확인 · 1:1 문의
+    async refreshMyStatus() { return must(await sb.rpc('refresh_my_status')); },
+    async createInquiry({ category, title, body }) { return must(await sb.rpc('create_inquiry', { p_category: category, p_title: title, p_body: body })); },
+    async myInquiries() { return must(await sb.rpc('my_inquiries')) || []; },
+    async inquiryThread(id) { return must(await sb.rpc('inquiry_thread', { p_id: id })); },
+    async replyInquiry(id, body) { must(await sb.rpc('reply_inquiry', { p_id: id, p_body: body })); },
+    async closeInquiry(id) { must(await sb.rpc('close_inquiry', { p_id: id })); },
     // 탈퇴: (wipe 면 내가 올린 사진·파일도) 저장 공간에서 지운 뒤 계정 삭제
     async deleteMyAccount(wipe) {
       try {
@@ -295,7 +302,21 @@ export function createApi() {
     // v1.17: 신고 · 금칙어
     async adminOpenReports() { return must(await sb.rpc('admin_open_reports')) || 0; },
     async adminListReports(status) { return must(await sb.rpc('admin_list_reports', { p_status: status || 'open' })) || []; },
-    async adminResolveReport(id, action) { must(await sb.rpc('admin_resolve_report', { p_id: id, p_action: action })); },
+    async adminResolveReport(id, action, days = null) {
+      const args = { p_id: id, p_action: action };
+      if (days != null) args.p_days = days;
+      must(await sb.rpc('admin_resolve_report', args));
+    },
+    // v1.18: 관리자 개편
+    async adminDashboard() { return must(await sb.rpc('admin_dashboard')); },
+    async adminBadges() { return must(await sb.rpc('admin_badges')) || {}; },
+    async adminMemberPage({ q = '', filter = 'all', sort = 'recent', limit = 50, offset = 0 } = {}) {
+      return must(await sb.rpc('admin_member_page', { p_query: q, p_filter: filter, p_sort: sort, p_limit: limit, p_offset: offset })) || [];
+    },
+    async adminMemberDetail(id) { return must(await sb.rpc('admin_member_detail', { p_user: id })); },
+    async adminSuspend(id, days, reason) { return must(await sb.rpc('admin_suspend', { p_user: id, p_days: days, p_reason: reason || '' })); },
+    async adminSetNote(id, note) { must(await sb.rpc('admin_set_note', { p_user: id, p_note: note })); },
+    async adminListInquiries(status, limit = 50, offset = 0) { return must(await sb.rpc('admin_list_inquiries', { p_status: status, p_limit: limit, p_offset: offset })) || []; },
     async adminGetWords() { return must(await sb.rpc('admin_get_banned_words')) || []; },
     async adminSetWords(words) { return must(await sb.rpc('admin_set_banned_words', { p_words: words })); },
     async adminOrphanMedia() { return must(await sb.rpc('admin_orphan_media')) || []; },
@@ -336,7 +357,7 @@ export function createApi() {
     // 기본: 내 전용 비공개 채널(user:<내 ID>)로 내가 속한 방의 새 메시지만 받음 (Broadcast).
     //   → 접속자가 많아도 메시지 1건당 그 방 참여자에게만 전달돼 빠름.
     // 데이터베이스가 아직 v1.6 이 아니면(채널 권한 없음) 예전 방식(Postgres Changes)으로 자동 전환.
-    subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport }) {
+    subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport, onInquiry, onInquiryAdmin }) {
       let closed = false; let ch = null; let joined = false;
       const legacy = () => {
         rtMode = 'legacy';
@@ -359,6 +380,8 @@ export function createApi() {
           .on('broadcast', { event: 'reaction' }, ({ payload }) => payload && onReaction && onReaction(payload))
           .on('broadcast', { event: 'connected' }, ({ payload }) => payload && onConnected && onConnected(payload))
           .on('broadcast', { event: 'report' }, ({ payload }) => payload && onReport && onReport(payload))   // v1.17: 관리자에게 새 신고
+          .on('broadcast', { event: 'inquiry' }, ({ payload }) => payload && onInquiry && onInquiry(payload))   // v1.18: 내 문의에 답변
+          .on('broadcast', { event: 'inquiry_admin' }, ({ payload }) => payload && onInquiryAdmin && onInquiryAdmin(payload))   // v1.18: 관리자에게 새 문의
           .subscribe((status) => {
             if (status === 'SUBSCRIBED') joined = true;
             if (!joined && status === 'CHANNEL_ERROR' && !closed) {

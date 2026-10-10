@@ -1,5 +1,5 @@
 // 끼리톡 서비스 워커 — 앱 화면 캐시(오프라인에서도 열림) + 푸시 알림 수신·클릭 처리
-const CACHE = 'kkiritalk-v1.17.0';
+const CACHE = 'kkiritalk-v1.18.0';
 const SHELL = [
   './',
   './index.html',
