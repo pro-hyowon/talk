@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.18.0';
+const VERSION = '1.18.1';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -934,6 +934,7 @@ function setupNoticeComposer() {
 function closeRoom() {
   S.roomToken++;
   if (S.room) stopWatchReads(S.room);
+  if (S.room && S.room.ro) { S.room.ro.disconnect(); S.room.ro = null; }
   S.room = null;
   const el = $('#room');
   if (el) { el.hidden = true; el.innerHTML = ''; }
@@ -1255,14 +1256,33 @@ function wireComposer() {
   const ta = $('#msgInput'); const btn = $('#sendBtn'); const box = $('#msgs');
   const fit = () => { ta.style.height = '22px'; ta.style.height = Math.min(ta.scrollHeight, 110) + 'px'; btn.disabled = !ta.value.trim() && !(S.room && S.room.pick); };
   ta.addEventListener('input', fit);
-  ta.addEventListener('focus', () => { if (matchMedia('(pointer: coarse)').matches) toggleStickers(false); });
+  ta.addEventListener('focus', () => {
+    if (matchMedia('(pointer: coarse)').matches) toggleStickers(false);
+    // v1.18.1: 키보드가 올라온 뒤에도 맨 아래에 있었다면 맨 아래 유지 (화면 크기 변화가 늦게 오는 기기 대비)
+    const R = S.room;
+    if (R && R.atBottom) [120, 350].forEach((ms) => setTimeout(() => { if (S.room === R && R.atBottom) scrollBottom(); }, ms));
+  });
   ta.addEventListener('keydown', (e) => {
     const touch = matchMedia('(pointer: coarse)').matches;
     if (e.key === 'Enter' && !e.shiftKey && !touch && !e.isComposing) { e.preventDefault(); sendComposer(); }
     if (e.key === 'Escape' && S.room && S.room.replyTo) { e.preventDefault(); cancelReply(); }
   });
+  // v1.18.1: 대화창 높이가 바뀌면(키보드가 올라오거나 입력창·답장 줄이 커지면) 맨 아래에 있던 경우 맨 아래를 따라감
+  let lastH = box.clientHeight;
+  if ('ResizeObserver' in window && S.room) {
+    const R = S.room;
+    if (R.ro) R.ro.disconnect();
+    R.ro = new ResizeObserver(() => {
+      const h = box.clientHeight;
+      if (h === lastH) return;
+      lastH = h;
+      if (S.room === R && R.atBottom) scrollBottom();
+    });
+    R.ro.observe(box);
+  }
   box.addEventListener('scroll', () => {
     if (!S.room) return;
+    if (box.clientHeight !== lastH) return;   // 크기가 바뀌는 중에 생긴 스크롤은 무시 (위 ResizeObserver 가 처리)
     S.room.atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
     if (S.room.atBottom) { const p = $('#newPill'); if (p) p.hidden = true; }
     if (box.scrollTop < 80) loadOlder();
@@ -3653,6 +3673,26 @@ app.addEventListener('click', async (e) => {
 // 설치(PWA)·알림 클릭 연결
 // ---------------------------------------------------------------------
 window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); S.installEvt = e; });
+
+// v1.18.1: 키보드가 올라와도 앱 화면이 저절로 줄지 않는 기기(아이폰 등)는 보이는 높이에 맞춰 줄임
+//   → 입력창이 키보드 바로 위에 붙고, 대화창은 맨 아래를 따라감 (안드로이드 크롬은 브라우저가 직접 줄여 줌)
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  let raf = 0;
+  const fitViewport = () => {
+    cancelAnimationFrame(raf);
+    raf = requestAnimationFrame(() => {
+      const kb = Math.abs(vv.scale - 1) < 0.01 && window.innerHeight - vv.height > 80;
+      if (kb) {
+        app.style.height = Math.round(vv.height) + 'px';
+        if (window.scrollY) window.scrollTo(0, 0);
+      } else if (app.style.height) app.style.height = '';
+      document.documentElement.classList.toggle('kb-open', kb);
+    });
+  };
+  vv.addEventListener('resize', fitViewport);
+  vv.addEventListener('scroll', fitViewport);
+}
 if ('serviceWorker' in navigator && !window.__MINITALK_API__) {
   navigator.serviceWorker.register('./sw.js').catch((e) => console.warn('SW 등록 실패', e));
   navigator.serviceWorker.addEventListener('message', (e) => {
