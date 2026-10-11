@@ -958,3 +958,5 @@ button.kpi:active { transform: scale(.98); }
 @media (max-width: 899px) {
   .chart .ct, .chart .cv { font-size: 19px; }
 }
+/* v1.18.1: 키보드가 올라와 있을 때는 아래쪽 안전 여백(홈 표시줄 자리)을 빼서 입력창이 키보드에 바로 붙게 */
+html.kb-open .composer { padding-bottom: 8px; }
