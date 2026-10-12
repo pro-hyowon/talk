@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.18.1';
+const VERSION = '1.18.2';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -281,8 +281,21 @@ function sameServerKey(sub) {
     return a.length === b.length && a.every((v, i) => v === b[i]);
   } catch { return true; }
 }
+// v1.18.2: 알림은 기본으로 켜져 있고, 사용자가 직접 끈 경우에만 이 기기에서 꺼 둠
+const NOTIF_OFF_KEY = 'kkiri-notif-off';
+const NOTIF_ASK_KEY = 'kkiri-notif-asked';
+function notifOffPref() {
+  try { return localStorage.getItem(NOTIF_OFF_KEY) === '1'; } catch { return S.notifOff === true; }
+}
+function setNotifOff(off) {
+  S.notifOff = off;
+  try { if (off) localStorage.setItem(NOTIF_OFF_KEY, '1'); else localStorage.removeItem(NOTIF_OFF_KEY); } catch { /* 저장 안 됨 */ }
+}
+// 앱이 열려 있지만 화면이 꺼져 있을 때 기기 알림을 띄워도 되는지
+const localNotifOk = () => !notifOffPref() && 'Notification' in window && Notification.permission === 'granted' && !!navigator.serviceWorker;
 async function enablePush({ silent = false } = {}) {
   if (!push.supported()) return false;
+  if (silent && notifOffPref()) return false;
   if (Notification.permission !== 'granted') {
     if (silent) return false;
     if ((await Notification.requestPermission()) !== 'granted') return false;
@@ -308,6 +321,7 @@ async function detachPush() {
   S.pushOn = false;
 }
 function notifOn() {
+  if (notifOffPref()) return false;
   if (!('Notification' in window) || Notification.permission !== 'granted') return false;
   return push.supported() ? S.pushOn : true;
 }
@@ -472,6 +486,44 @@ async function enterApp(id) {
   handlePendingInvite();
   touchLastSeen();
   enablePush({ silent: true }).then(() => { if (S.tab === 'more' && !S.room) renderMain(); }).catch((e) => console.warn('push', e));
+  maybeAskNotif();
+}
+
+// v1.18.2: 아직 알림 권한을 묻지 않은 기기면 들어오자마자 한 번 안내 → "알림 받기" 한 번이면 켜짐
+//   (브라우저는 사용자가 버튼을 눌러야 권한 창을 띄울 수 있어서 안내 창을 거침. "나중에"를 누르면 3일 뒤 다시 물어봄)
+function maybeAskNotif(tries = 0) {
+  const want = () => S.entered && 'Notification' in window && Notification.permission === 'default' && !notifOffPref();
+  if (!want()) return;
+  let last = 0;
+  try { last = Number(localStorage.getItem(NOTIF_ASK_KEY)) || 0; } catch { if (S.notifAsked) return; }
+  if (Date.now() - last < 3 * 864e5) return;
+  setTimeout(() => {
+    if (!want()) return;
+    if ($('.sheet-back')) { if (tries < 10) maybeAskNotif(tries + 1); return; }   // 다른 창이 떠 있으면 닫힌 뒤에
+    S.notifAsked = true;
+    try { localStorage.setItem(NOTIF_ASK_KEY, String(Date.now())); } catch { /* 저장 안 됨 */ }
+    openSheet({
+      title: '알림 받기', bare: true,
+      body: `<div class="confirm notif-ask"><span class="notif-ask-ic">${ic('bell', 30)}</span><h3>새 메시지 알림을 켜 둘게요</h3>
+        <p>친구가 메시지를 보내면 앱을 닫아 두어도 바로 알려 드려요. 다음 화면에서 <b>허용</b>을 눌러 주세요.<br>원하지 않으면 더보기 → 알림에서 언제든 끌 수 있어요.</p></div>
+        <div class="two"><button class="btn gray" data-no>나중에</button><button class="btn" data-yes>알림 받기</button></div>`,
+      onMount(sheet, close) {
+        $('[data-no]', sheet).onclick = () => { close(); toast('더보기 → 알림에서 언제든 켤 수 있어요'); };
+        $('[data-yes]', sheet).onclick = () => {
+          close();
+          // 버튼을 누른 바로 그 순간에 권한 창을 띄워야 아이폰에서도 열림
+          let req;
+          try { req = Promise.resolve(Notification.requestPermission()); } catch (e) { req = Promise.reject(e); }
+          req.then(async (p) => {
+            if (p !== 'granted') { toast('알림이 허용되지 않았어요. 나중에 더보기 → 알림에서 켤 수 있어요', { error: true, ms: 4500 }); return; }
+            if (push.supported()) await enablePush({ silent: true });
+            toast('알림을 켰어요');
+          }).catch((e) => { console.warn('push', e); toast('알림을 켜지 못했어요. 더보기 → 알림에서 다시 시도해 주세요', { error: true }); })
+            .finally(() => { if (S.tab === 'more' && !S.room) renderMain(); });
+        };
+      },
+    });
+  }, 1500);
 }
 
 function touchLastSeen() {
@@ -731,6 +783,12 @@ function chatRowHtml(r) {
     <div class="side"><span class="time">${esc(fmtListTime(r.last_message_at))}</span>${r.unread ? `<span class="badge ${isMuted(r.room_id) ? 'muted' : ''}">${badgeTxt(r.unread)}</span>` : ''}</div></button>`;
 }
 
+function notifSub(on) {
+  if (on) return '새 메시지·친구 소식을 알려 드려요';
+  if (!('Notification' in window)) return '이 브라우저에서는 쓸 수 없어요';
+  if (Notification.permission === 'denied' && !notifOffPref()) return '휴대폰(브라우저) 설정에서 알림이 막혀 있어요';
+  return '꺼져 있어요. 켜면 새 메시지를 알려 드려요';
+}
 function renderMore(head, body) {
   head.innerHTML = '<h1>더보기</h1>';
   const me = S.me;
@@ -749,7 +807,7 @@ function renderMore(head, body) {
         <button class="ibtn" data-act="copy-id" aria-label="아이디 복사" style="border-radius:12px;color:var(--ink3)">${ic('copy', 18)}</button></div>
       <button class="item" data-act="phone"><span class="tile sky">${ic('phone', 19)}</span><span class="label">휴대폰 번호</span><span class="val" id="phoneVal">${S.phone === undefined ? '' : S.phone ? esc(maskPhone(S.phone.phone)) : '등록하기'}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="change-password"><span class="tile lav">${ic('lock', 19)}</span><span class="label">비밀번호 변경</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      <div class="item"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림</span>
+      <div class="item"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림<span class="sub">${notifSub(on)}</span></span>
         <button class="switch ${on ? 'on' : ''}" data-act="notif" role="switch" aria-checked="${on}" aria-label="새 메시지 알림"></button></div>
       ${isStandalone() ? '' : `<button class="item" data-act="install"><span class="tile mint">${ic('install', 19)}</span><span class="label">홈 화면에 설치</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>`}
     </div>
@@ -2354,7 +2412,7 @@ function maybeNotify(m) {
 
   if (document.hidden) {
     if (S.pushOn) return; // 서버 알림(Web Push)이 대신 보여 줌
-    if ('Notification' in window && Notification.permission === 'granted' && navigator.serviceWorker) {
+    if (localNotifOk()) {
       navigator.serviceWorker.ready.then((reg) => reg.showNotification(title, {
         body: text.slice(0, 120), tag: m.room_id, renotify: true,
         icon: './icons/icon-192.png', badge: './icons/badge-72.png',
@@ -2535,7 +2593,7 @@ function onFriend(p) {
   const text = `${person.display_name}님이 나를 친구로 추가했어요. 나도 추가하면 대화할 수 있어요`;
   if (document.hidden) {
     if (S.pushOn) return; // 서버 알림이 대신 보여 줌
-    if ('Notification' in window && Notification.permission === 'granted' && navigator.serviceWorker) {
+    if (localNotifOk()) {
       navigator.serviceWorker.ready.then((reg) => reg.showNotification('친구 요청', { body: text, tag: 'friend-' + p.from_id, icon: './icons/icon-192.png', badge: './icons/badge-72.png', data: { url: './#/friends' } })).catch(() => {});
     }
     return;
@@ -3469,7 +3527,7 @@ function onConnected(p) {
     : `관리자가 ${person.display_name}님과 친구로 연결해 줬어요. 이제 대화할 수 있어요`;
   if (document.hidden) {
     if (S.pushOn) return;   // 서버 알림이 대신 보여 줌
-    if ('Notification' in window && Notification.permission === 'granted' && navigator.serviceWorker) {
+    if (localNotifOk()) {
       navigator.serviceWorker.ready.then((reg) => reg.showNotification(invite ? '새 친구' : '친구 연결', { body: text, tag: 'conn-' + p.friend_id, icon: './icons/icon-192.png', badge: './icons/badge-72.png', data: { url: './#/friends' } })).catch(() => {});
     }
     return;
@@ -3646,17 +3704,22 @@ app.addEventListener('click', async (e) => {
     }
     case 'notif': {
       if (!('Notification' in window)) { toast('이 브라우저는 알림을 지원하지 않아요. 아이폰은 홈 화면에 추가한 뒤 사용할 수 있어요', { error: true, ms: 4500 }); break; }
-      if (Notification.permission === 'denied') { toast('알림이 차단되어 있어요. 브라우저 설정에서 이 사이트의 알림을 허용해 주세요', { error: true, ms: 5000 }); break; }
       el.disabled = true;
       try {
-        if (push.supported()) {
-          if (S.pushOn) { await disablePush(); toast('알림을 껐어요'); }
-          else toast((await enablePush()) ? '알림을 켰어요' : '알림 권한이 허용되지 않았어요', { error: !S.pushOn });
-        } else if (Notification.permission === 'granted') {
-          toast('앱이 열려 있을 때 알림이 와요. 끄려면 브라우저 설정에서 바꿔 주세요');
+        if (notifOn()) {
+          // 끄기: 이 기기에서 꺼 둔 것을 기억 → 앱을 다시 열어도 저절로 켜지지 않음
+          setNotifOff(true);
+          if (push.supported()) await disablePush();
+          toast('알림을 껐어요. 언제든 다시 켤 수 있어요');
         } else {
-          const p = await Notification.requestPermission();
-          toast(p === 'granted' ? '알림을 켰어요' : '알림 권한이 허용되지 않았어요', { error: p !== 'granted' });
+          setNotifOff(false);
+          if (Notification.permission === 'denied') toast('알림이 차단되어 있어요. 휴대폰(브라우저) 설정에서 이 앱의 알림을 허용해 주세요', { error: true, ms: 5000 });
+          else if (push.supported()) toast((await enablePush()) ? '알림을 켰어요' : '알림 권한이 허용되지 않았어요', { error: !S.pushOn });
+          else if (Notification.permission === 'granted') toast('알림을 켰어요');
+          else {
+            const p = await Notification.requestPermission();
+            toast(p === 'granted' ? '알림을 켰어요' : '알림 권한이 허용되지 않았어요', { error: p !== 'granted' });
+          }
         }
       } catch (ex) { showErr(ex); }
       renderMain();

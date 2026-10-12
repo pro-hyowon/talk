@@ -373,6 +373,9 @@ button.item:active { background: var(--soft-bg); }
 .confirm { padding: 18px 4px 0; text-align: center; }
 .confirm h3 { font-size: 19px; font-weight: 700; letter-spacing: -0.4px; line-height: 1.4; margin: 0; }
 .confirm p { font-size: 14px; color: var(--ink2); margin: 10px 0 0; line-height: 1.6; }
+.notif-ask-ic { display: inline-flex; align-items: center; justify-content: center; width: 60px; height: 60px; border-radius: 20px; background: #FFE6DE; color: #A2442C; margin-bottom: 12px; }
+.notif-ask p { word-break: keep-all; }
+.notif-ask p b { color: var(--ink); }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 26px; }
 
 .profile-card { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 0 0 4px; }
