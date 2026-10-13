@@ -1,5 +1,5 @@
 -- =====================================================================
---  끼리톡(Kkiri Talk) v1.19 — Supabase 데이터베이스 설정 스크립트
+--  끼리톡(Kkiri Talk) v1.20 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -349,6 +349,10 @@ create table if not exists private.sanctions (
   created_at timestamptz not null default now()
 );
 create index if not exists sanctions_user_idx on private.sanctions(user_id, id desc);
+-- v1.20: 관리자의 친구 삭제도 이력에 남김
+alter table private.sanctions drop constraint if exists sanctions_action_check;
+alter table private.sanctions add constraint sanctions_action_check
+  check (action in ('suspend', 'unsuspend', 'auto_unsuspend', 'delete_message', 'approve', 'unfriend'));
 revoke all on private.sanctions from public, anon, authenticated;
 
 -- 하루에 한 번 이상 앱을 연 회원 (현황판의 접속자 수·추이용, 400일 보관)
@@ -1673,17 +1677,62 @@ end;
 $$;
 
 -- v1.13: 회원의 친구 관계 (관리자 친구 연결 화면용: 내가 추가함 / 상대가 추가함)
+--   v1.20: 이름·아이디·사진도 함께 (관리자 친구 삭제 화면용)
+drop function if exists public.admin_user_friends(uuid);
 create or replace function public.admin_user_friends(p_user uuid)
-returns table (id uuid, added boolean, added_me boolean)
+returns table (id uuid, added boolean, added_me boolean, username text, display_name text, avatar_url text, status text)
 language plpgsql stable security definer set search_path = public as $$
+#variable_conflict use_column
 begin
   perform public.admin_guard();
   return query
-    select x.id, bool_or(x.a), bool_or(x.b) from (
+    select x.id, bool_or(x.a), bool_or(x.b), p.username, p.display_name, p.avatar_url, p.status from (
       select f.friend_id as id, true as a, false as b from friends f where f.user_id = p_user
       union all
       select f.user_id, false, true from friends f where f.friend_id = p_user
-    ) x group by x.id;
+    ) x join profiles p on p.id = x.id
+    group by x.id, p.username, p.display_name, p.avatar_url, p.status
+    order by p.display_name;
+end;
+$$;
+
+-- v1.20: 관리자: 회원과 고른 사람들의 친구 관계를 양쪽 모두 끊음 (한쪽만 추가한 상태·받은 친구 요청도 함께)
+--   대화방과 지난 대화는 그대로 두지만, 1:1 대화는 다시 서로 친구가 되기 전까지 보낼 수 없어요. 회원에게 알림은 가지 않아요.
+create or replace function public.admin_remove_friends(p_user uuid, p_others uuid[])
+returns integer language plpgsql security definer set search_path = public, private as $$
+declare
+  v_me   uuid := public.admin_guard();
+  v_o    uuid;
+  v_n    integer := 0;
+  v_cnt  integer;
+  v_name text; v_oname text;
+begin
+  if not exists (select 1 from profiles where id = p_user) then raise exception '회원을 찾을 수 없어요'; end if;
+  if coalesce(cardinality(p_others), 0) = 0 then return 0; end if;
+  if cardinality(p_others) > 200 then raise exception '한 번에 200명까지 삭제할 수 있어요'; end if;
+  select display_name into v_name from profiles where id = p_user;
+  for v_o in select distinct x from unnest(p_others) as x loop
+    continue when v_o is null or v_o = p_user;
+    delete from friends where (user_id = p_user and friend_id = v_o) or (user_id = v_o and friend_id = p_user);
+    get diagnostics v_cnt = row_count;
+    continue when v_cnt = 0;
+    v_n := v_n + 1;
+    delete from friend_suggestions
+     where (user_id = p_user and suggested_id = v_o) or (user_id = v_o and suggested_id = p_user);
+    select display_name into v_oname from profiles where id = v_o;
+    insert into private.sanctions (user_id, admin_id, action, reason)
+    values (p_user, v_me, 'unfriend', left(coalesce(v_oname, '(알 수 없음)') || '님과 친구 삭제', 300)),
+           (v_o,    v_me, 'unfriend', left(coalesce(v_name, '(알 수 없음)') || '님과 친구 삭제', 300));
+    -- 두 사람 앱의 친구 목록이 바로 바뀌게 (조용히 — 알림은 없음)
+    if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null then
+      begin
+        perform realtime.send(jsonb_build_object('friend_id', v_o), 'unfriended', 'user:' || p_user::text, true);
+        perform realtime.send(jsonb_build_object('friend_id', p_user), 'unfriended', 'user:' || v_o::text, true);
+      exception when others then null;
+      end;
+    end if;
+  end loop;
+  return v_n;
 end;
 $$;
 
@@ -2871,7 +2920,7 @@ declare
     'admin_list_users(text)', 'admin_set_status(uuid, text)', 'admin_set_admin(uuid, boolean)',
     'admin_reset_password(uuid)', 'admin_delete_user(uuid, boolean)', 'admin_user_media(uuid)', 'admin_get_settings()',
     'admin_set_settings(boolean)', 'admin_broadcast(text)', 'admin_orphan_media()',
-    'admin_connect_friends(uuid, uuid[])', 'admin_user_friends(uuid)',
+    'admin_connect_friends(uuid, uuid[])', 'admin_user_friends(uuid)', 'admin_remove_friends(uuid, uuid[])',
     'admin_save_ad(bigint, text, text, text, boolean)', 'admin_delete_ad(bigint)', 'admin_move_ad(bigint, integer)', 'ad_click(bigint)',
     'block_user(uuid)', 'unblock_user(uuid)', 'my_blocks()', 'report_content(uuid, bigint, text, text)',
     'admin_open_reports()', 'admin_list_reports(text)', 'admin_resolve_report(bigint, text, integer)',

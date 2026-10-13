@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.19';
+const VERSION = '1.20.1';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -479,7 +479,7 @@ async function enterApp(id) {
   }
   cacheProfile(S.me);
   buildShell();
-  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport, onInquiry, onInquiryAdmin });
+  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport, onInquiry, onInquiryAdmin, onUnfriended });
   await Promise.all([loadFriends(), loadRooms(), loadBlocks(), loadAppInfo()]).catch(showErr);
   loadSuggestions();
   loadRequests();
@@ -2883,7 +2883,7 @@ const MEMBER_SORTS = [['recent', '최근 가입순'], ['seen', '최근 접속순
 const INQ_CATS = [['use', '이용 문의'], ['bug', '오류 신고'], ['account', '계정·탈퇴'], ['suggest', '제안'], ['other', '기타']];
 const INQ_CAT = Object.fromEntries(INQ_CATS);
 const INQ_ST = { open: '답변 대기', answered: '답변 완료', closed: '종료' };
-const SANCTION_LABEL = { suspend: '이용 정지', unsuspend: '정지 해제', auto_unsuspend: '정지 기간 끝남', delete_message: '메시지 삭제', approve: '가입 승인' };
+const SANCTION_LABEL = { suspend: '이용 정지', unsuspend: '정지 해제', auto_unsuspend: '정지 기간 끝남', delete_message: '메시지 삭제', approve: '가입 승인', unfriend: '친구 삭제' };
 const PAGE_SIZE = 50;
 const fmtDT = (iso) => { if (!iso) return '-'; const d = new Date(iso); return `${d.getMonth() + 1}월 ${d.getDate()}일 ${fmtTime(iso)}`; };
 const untilTxt = (u) => (u.suspended_until ? `${fmtDT(u.suspended_until)}까지 정지` : '영구 정지');
@@ -3164,6 +3164,7 @@ async function showAdminUser(id) {
     admin: [B('관리자 해제', 'admin', 'line'), B('비밀번호 초기화', 'reset', 'line')],
   }[s];
   if (u.phone) btns.splice(btns.length - (s === 'admin' ? 0 : 1), 0, `<button class="btn md line" data-x="clearphone">휴대폰 번호 삭제</button>`);
+  if (Number(u.friend_count) > 0) btns.unshift(`<button class="btn md line" data-x="unfriend">${ic('userx', 18)}친구 삭제</button>`);   // v1.20
   if (s === 'active' || s === 'admin') btns.unshift(`<button class="btn md soft" data-x="connect">${ic('userplus', 18)}친구 연결</button>`);
   const cell = (k, v, wide) => `<div class="cell ${wide ? 'wide' : ''}"><span>${k}</span><b>${v}</b></div>`;
   openSheet({
@@ -3198,6 +3199,7 @@ async function showAdminUser(id) {
             x.disabled = false; toast('메모를 저장했어요'); return;
           }
           if (act === 'connect') { close(); showConnectFriends(u); return; }
+          if (act === 'unfriend') { close(); showRemoveFriends(u); return; }
           if (act === 'approve') {
             await api.adminSetStatus(u.id, 'active'); close(); toast(`${n}님의 가입을 승인했어요`);
           } else if (act === 'unsuspend') {
@@ -3678,6 +3680,63 @@ async function showConnectFriends(u) {
   });
 }
 
+// v1.20: 관리자: 회원의 친구 삭제 (고른 사람과 양쪽 친구 관계를 모두 끊음)
+async function showRemoveFriends(u) {
+  let rel;
+  try { rel = await api.adminUserFriends(u.id); } catch (e) { showErr(e); return; }
+  rel = (rel || []).filter((r) => r.id !== u.id);
+  if (!rel.length) { toast(`${u.display_name}님은 친구가 없어요`); return; }
+  const sel = [];
+  const relTxt = (r) => (r.added && r.added_me ? '서로 친구' : r.added ? `${u.display_name}님만 추가함` : '상대만 추가함 (친구 요청)');
+  openSheet({
+    title: `${u.display_name}님의 친구 삭제`,
+    body: `<div class="sub-text">고른 사람과 ${esc(u.display_name)}님의 친구 관계를 <b>양쪽 모두</b> 끊어요. 지난 대화는 남지만, 다시 친구가 되기 전에는 1:1 대화를 보낼 수 없어요. 회원에게 알림은 가지 않아요.</div>
+      <label class="search" style="margin:0 0 10px">${ic('search', 20, 'flex:none')}<input id="rfSearch" placeholder="이름·아이디 검색" autocapitalize="off" spellcheck="false"></label>
+      <div class="pick-list bleed" id="rfList" style="max-height:340px"></div>
+      <button class="btn danger" id="rfOk" disabled style="margin-top:14px">삭제할 친구를 고르세요</button>`,
+    onMount(sheet, close) {
+      const list = $('#rfList', sheet); const ok = $('#rfOk', sheet); const q = $('#rfSearch', sheet);
+      const draw = () => {
+        const t = q.value.trim().toLowerCase().replace(/^@/, '');
+        const shown = t ? rel.filter((x) => String(x.display_name || '').toLowerCase().includes(t) || String(x.username || '').includes(t)) : rel;
+        list.innerHTML = shown.length ? shown.map((x) => {
+          const on = sel.includes(x.id);
+          return `<button class="pick ${on ? 'on' : ''}" data-rf="${esc(x.id)}" role="checkbox" aria-checked="${on}">${av(x, 44)}
+            <span class="nm"><span class="cn-n">${esc(x.display_name || '(알 수 없음)')}</span><span class="cn-d">@${esc(x.username || '')} · ${esc(relTxt(x))}</span></span>
+            <span class="ck">${ic('check', 16)}</span></button>`;
+        }).join('') : '<div class="empty-line">찾는 친구가 없어요</div>';
+        ok.disabled = !sel.length;
+        ok.textContent = sel.length ? `${sel.length}명과 친구 삭제` : '삭제할 친구를 고르세요';
+      };
+      q.oninput = draw;
+      sheet.addEventListener('click', async (e) => {
+        const b = e.target.closest('[data-rf]');
+        if (b) { const id = b.dataset.rf; const i = sel.indexOf(id); if (i >= 0) sel.splice(i, 1); else sel.push(id); draw(); return; }
+        if (!e.target.closest('#rfOk') || !sel.length) return;
+        const names = sel.map((id) => (rel.find((x) => x.id === id) || {}).display_name).filter(Boolean);
+        const nm = names.map((x) => `${x}님`);
+        const who = nm.length > 2 ? `${nm.slice(0, 2).join(', ')} 외 ${nm.length - 2}명` : nm.join(', ');
+        if (!(await ask(`${u.display_name}님과 ${who}의 친구 관계를 끊을까요?`, '양쪽 모두의 친구 목록에서 빠지고, 다시 친구가 되기 전에는 1:1 대화를 보낼 수 없어요. 제재 이력에 기록돼요.', '친구 삭제', true))) return;
+        ok.disabled = true; ok.innerHTML = '<span class="spin-sm"></span>';
+        try {
+          const n = await api.adminRemoveFriends(u.id, sel);
+          close();
+          toast(n ? `${u.display_name}님과 ${n}명의 친구 관계를 끊었어요` : '이미 친구가 아니에요', { ms: 3200 });
+          if (u.id === S.uid || sel.includes(S.uid)) { loadFriends().then(() => { if (S.tab === 'friends' && !S.room) renderMain(); }).catch(() => {}); }
+          adminAfterChange();
+        } catch (ex) { draw(); showErr(ex); }
+      });
+      draw();
+    },
+  });
+}
+
+// v1.20: 관리자가 내 친구 관계를 끊었을 때 (알림 없이 목록만 바꿈)
+function onUnfriended() {
+  loadFriends().then(() => { if (S.tab === 'friends' && !S.room && $('#main')) renderMain(); }).catch(() => {});
+  loadRequests(); refreshRoomsSoon();
+}
+
 // 관리자가 나를 누군가와 친구로 연결해 줬을 때
 function onConnected(p) {
   cacheProfile({ id: p.friend_id, display_name: p.display_name, username: p.username });
@@ -3917,8 +3976,9 @@ if (window.visualViewport) {
       const kb = Math.abs(vv.scale - 1) < 0.01 && window.innerHeight - vv.height > 80;
       if (kb) {
         app.style.height = Math.round(vv.height) + 'px';
+        app.style.top = Math.max(0, Math.round(vv.offsetTop)) + 'px';   // v1.20.1: 보이는 영역 위치에 맞춤
         if (window.scrollY) window.scrollTo(0, 0);
-      } else if (app.style.height) app.style.height = '';
+      } else if (app.style.height || app.style.top) { app.style.height = ''; app.style.top = ''; }
       document.documentElement.classList.toggle('kb-open', kb);
     });
   };
