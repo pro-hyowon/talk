@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.18.2';
+const VERSION = '1.19';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -51,6 +51,8 @@ const S = {
   installEvt: null,
   tmpSeq: 0,
   pushOn: false,
+  keepDays: 0,   // v1.19: 채팅 사진·파일 보관 기간(일). 0 = 계속 보관 (또는 데이터베이스가 예전 버전)
+  keepFrom: 0,   // v1.19: 보관 기간을 적용하기 시작한 때(ms). 그 전에 올린 파일도 이때부터 보관 기간만큼은 남음
   admin: null,
   adminFromMore: false,
   lastTouch: 0,
@@ -478,7 +480,7 @@ async function enterApp(id) {
   cacheProfile(S.me);
   buildShell();
   S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport, onInquiry, onInquiryAdmin });
-  await Promise.all([loadFriends(), loadRooms(), loadBlocks()]).catch(showErr);
+  await Promise.all([loadFriends(), loadRooms(), loadBlocks(), loadAppInfo()]).catch(showErr);
   loadSuggestions();
   loadRequests();
   loadMyInquiries().then(() => { const b = $('#inqBadge'); if (b) b.innerHTML = inqBadgeHtml(); });   // v1.18
@@ -487,6 +489,50 @@ async function enterApp(id) {
   touchLastSeen();
   enablePush({ silent: true }).then(() => { if (S.tab === 'more' && !S.room) renderMain(); }).catch((e) => console.warn('push', e));
   maybeAskNotif();
+  setTimeout(sweepExpired, 8000);   // v1.19: 화면이 다 뜬 뒤 천천히
+}
+
+// v1.19: 사진·파일 보관 기간 (데이터베이스가 예전 버전이면 0 → '보관 기간 지남' 표시 안 함)
+async function loadAppInfo() {
+  if (!api.appInfo) return;
+  try {
+    const i = await api.appInfo();
+    S.keepDays = i && Number(i.media_keep_days) > 0 ? Number(i.media_keep_days) : 0;
+    S.keepFrom = i && i.media_keep_from ? Date.parse(i.media_keep_from) || 0 : 0;
+  } catch { S.keepDays = 0; S.keepFrom = 0; }
+}
+// 보관 기간이 지나 저장 공간에서 지워진(또는 곧 지워질) 사진·파일인가?
+function mediaExpired(m) {
+  if (!m || !isNum(m.id) || (m.kind !== 'image' && m.kind !== 'file')) return false;
+  if (m.media_gone_at) return true;
+  if (!S.keepDays) return false;
+  const t = Date.parse(m.created_at);
+  return Number.isFinite(t) && Date.now() - Math.max(t, S.keepFrom) > S.keepDays * 864e5;
+}
+// 지워지기까지 남은 날 (보관 기간이 없으면 null)
+function mediaDaysLeft(m) {
+  if (!S.keepDays || !m || !isNum(m.id)) return null;
+  const t = Date.parse(m.created_at); if (!Number.isFinite(t)) return null;
+  return Math.max(0, Math.ceil((Math.max(t, S.keepFrom) + S.keepDays * 864e5 - Date.now()) / 864e5));
+}
+// v1.19: 보관 기간이 지난 사진·파일을 저장 공간에서 지움 — 회원 앱은 내 방 것을 6시간에 한 번 조금씩,
+//        관리자 앱은 아무도 안 여는 방에 남은 것까지 12시간에 한 번 (서버 비용 없이 앱들이 나눠서 정리)
+function sweepDue(key, ms) {
+  try {
+    const last = Number(localStorage.getItem(key)) || 0;
+    if (Date.now() - last < ms) return false;
+    localStorage.setItem(key, String(Date.now()));
+    return true;
+  } catch { if (S[key]) return false; S[key] = true; return true; }
+}
+async function sweepExpired() {
+  if (!S.entered || !S.keepDays || !api.sweepExpiredMedia) return;
+  if (sweepDue('kkiri-sweep:' + S.uid, 6 * 3600e3)) {
+    try { await api.sweepExpiredMedia(); } catch (e) { console.warn('sweep', e); }
+  }
+  if (S.entered && S.me && S.me.is_admin && api.adminExpiredMedia && sweepDue('kkiri-sweep-admin:' + S.uid, 12 * 3600e3)) {
+    cleanExpired(true);
+  }
 }
 
 // v1.18.2: 아직 알림 권한을 묻지 않은 기기면 들어오자마자 한 번 안내 → "알림 받기" 한 번이면 켜짐
@@ -962,6 +1008,7 @@ async function openRoom(id) {
     if (info.is_notice) { setupNoticeComposer(); $('#roomMuteBtn').hidden = false; } else $('#roomMenuBtn').hidden = false;
     setMembers(members);
     S.room.msgs = msgs;
+    S.room.syncedId = msgs.reduce((a, m) => (isNum(m.id) && m.id > a ? m.id : a), 0);   // v1.19: 서버에서 직접 받아 온 마지막 번호
     S.room.hasMore = msgs.length >= 50;
     msgs.slice(-5).forEach((m) => { if (m.kind === 'sticker') markAnim(m); });
     renderRoomHeader();
@@ -1018,7 +1065,8 @@ function renderRoomHeader() {
 const isNoticeRoom = () => !!(S.room && S.room.info && S.room.info.is_notice);
 function unreadCount(m) {
   if (!isNum(m.id) || isNoticeRoom() || m.kind === 'deleted') return 0;
-  return S.room.members.filter((mb) => mb.last_read_id < m.id).length;
+  // v1.19: 나는 세지 않음 (보고 있으니 읽은 것 — 내 읽음 신호는 서버가 나에게 다시 보내지 않음)
+  return S.room.members.filter((mb) => mb.id !== S.uid && mb.last_read_id < m.id).length;
 }
 
 function sameGroup(a, b) {
@@ -1043,7 +1091,9 @@ function msgHtml(m, prev, next) {
   const first = notice || !sameGroup(prev, m) || (prev && dayKey(prev.created_at) !== dayKey(m.created_at));
   const p = profileOf(m.sender_id);
   const hidden = !notice && !mine && m.kind !== 'deleted' && isBlocked(m.sender_id);   // v1.17: 차단한 사람의 메시지는 가림
+  const gone = !hidden && mediaExpired(m);   // v1.19: 보관 기간이 지난 사진·파일
   const content = hidden ? `<div class="bubble deleted blocked">${ic('userx', 15, 'flex:none')}차단한 사용자의 메시지예요</div>`
+    : gone ? expiredBubble(m)
     : m.kind === 'image'
     ? `<button class="bubble photo" data-act="view-img" data-id="${esc(m.id)}" aria-label="사진 크게 보기"><img alt="사진" ${m.localUrl ? `src="${esc(m.localUrl)}"` : ''} data-path="${esc(m.content)}"></button>`
     : m.kind === 'deleted' ? `<div class="bubble deleted">${ic('ban', 15, 'flex:none')}삭제된 메시지예요</div>`
@@ -1229,10 +1279,10 @@ function markReadSoon() {
 }
 
 // ---------- 읽음 표시 ----------
-// 작은 방: 서버가 실시간으로 알려 줌 / 큰 방(21명 이상): 5초마다 확인 (실시간 전송량 절약)
+// 작은 방: 서버가 내 개인 채널로 실시간으로 알려 줌 / 큰 방(21명 이상): 5초마다 확인 (실시간 전송량 절약)
 function watchReads() {
   const R = S.room; if (!R) return;
-  if (api.watchRoom) R.unwatch = api.watchRoom(R.id, onMemberUpdate);
+  // v1.19: 방 채널(room:<방ID>)은 더 이상 쓰지 않음 — 읽음 신호는 내 개인 채널로만 옴 (실시간 전달량 절약)
   const live = !api.realtimeMode || api.realtimeMode() !== 'broadcast';
   R.pollReads = !live && R.members.length > READ_LIVE_MAX && !(R.info && R.info.is_notice);
   if (R.pollReads) R.pollTimer = setInterval(() => { if (!document.hidden) refreshReads(); }, 5000);
@@ -1434,7 +1484,7 @@ function showMsgMenu(m) {
   if (!local && !isNoticeRoom() && $('#msgInput') && !hiddenMsg) items.push(['reply', ic('reply', 22), '답장']);
   if (m.kind === 'text' && !hiddenMsg) items.push(['copy', ic('copy', 22), '복사']);
   if (m.kind === 'contact' && contactOf(m) && !hiddenMsg) items.push(['copy', ic('copy', 22), '이름·번호 복사']);
-  if (m.kind === 'file' && isNum(m.id) && !hiddenMsg) items.push(['save', ic('download', 22), '저장']);
+  if (m.kind === 'file' && isNum(m.id) && !hiddenMsg && !mediaExpired(m)) items.push(['save', ic('download', 22), '저장']);
   if (mineMsg) items.push(['delete', ic('ban', 22), local ? '보내기 취소' : '삭제']);
   const canReport = !mineMsg && !local && !isNoticeRoom() && !!m.sender_id && !!api.report;
   if (canReport) items.push(['report', ic('flag', 22), '신고']);
@@ -1630,11 +1680,20 @@ function fileKind(name) {
   return 'etc';
 }
 
+// v1.19: 보관 기간이 지나 지워진 사진·파일 (대화 흐름은 그대로 보이게)
+function expiredBubble(m) {
+  const f = m.kind === 'file' ? fileOf(m) : null;
+  const what = m.kind === 'image' ? '사진' : f ? f.name : '파일';
+  return `<div class="bubble expired">${ic(m.kind === 'image' ? 'image' : 'file', 20, 'flex:none')}<span class="ex-meta"><span class="ex-name">${esc(what)}</span><span class="ex-sub">보관 기간이 지나 삭제됐어요</span></span></div>`;
+}
+
 function fileBubble(m) {
   const f = fileOf(m);
   if (!f) return `<div class="bubble">${linkify(m.content)}</div>`;
   const ext = ((String(f.name).match(/\.([A-Za-z0-9]{1,5})$/) || [])[1] || '').toUpperCase();
-  const sub = m.pending ? `${fmtSize(f.size)} · 보내는 중` : m.failed ? `${fmtSize(f.size)} · 보내지 못했어요` : fmtSize(f.size);
+  const left = mediaDaysLeft(m);
+  const leftTxt = left === null || left > 3 ? '' : left <= 1 ? ' · 곧 삭제' : ` · ${left}일 뒤 삭제`;
+  const sub = m.pending ? `${fmtSize(f.size)} · 보내는 중` : m.failed ? `${fmtSize(f.size)} · 보내지 못했어요` : fmtSize(f.size) + leftTxt;
   return `<button class="bubble file" data-act="open-file" data-id="${esc(m.id)}"${f.path ? ` data-fpath="${esc(f.path)}" data-fname="${esc(f.name)}"` : ''} aria-label="${esc(f.name)} 파일 저장">
     <span class="f-ic k-${fileKind(f.name)}">${ext ? esc(ext.slice(0, 4)) : ic('file', 22)}</span>
     <span class="f-meta"><span class="f-name">${esc(f.name)}</span><span class="f-sub">${esc(sub)}</span></span>
@@ -1706,7 +1765,7 @@ function showAttach() {
         <button data-x="camera"><span class="tile mint">${ic('camera', 26)}</span>카메라</button>
         <button data-x="file"><span class="tile sky">${ic('file', 26)}</span>파일</button>
         <button data-x="contact"><span class="tile lemon">${ic('card', 26)}</span>연락처</button></div>
-      <div class="attach-note">사진은 자동으로 용량을 줄여 보내요 · 파일은 한 개 20MB까지</div>
+      <div class="attach-note">사진은 자동으로 용량을 줄여 보내요 · 파일은 한 개 20MB까지${S.keepDays ? `<br>사진·파일은 <b>${S.keepDays}일 동안</b> 보관돼요. 꼭 필요한 건 저장해 두세요` : ''}</div>
       <button class="btn gray" data-close style="margin-top:12px">닫기</button>`,
     onMount(sheet, close) {
       sheet.addEventListener('click', (e) => {
@@ -2387,10 +2446,14 @@ async function catchUp() {
   loadRequests();
   if (S.room) {
     const R = S.room;
+    // v1.19: 실시간으로 받은 것 말고 '서버에서 마지막으로 받아 온 번호' 다음부터 다시 받음
+    //        → 다른 기기에서 보낸 내 메시지(실시간으로 오지 않음)도 빠짐없이 채워짐
     const lastReal = [...R.msgs].reverse().find((m) => isNum(m.id));
+    const from = R.syncedId != null ? R.syncedId : (lastReal ? lastReal.id : 0);
     try {
-      const fresh = await api.getMessagesAfter(R.id, lastReal ? lastReal.id : 0);
+      const fresh = await api.getMessagesAfter(R.id, from);
       if (S.room === R) {
+        if (fresh.length) R.syncedId = Math.max(from, ...fresh.map((m) => Number(m.id) || 0));
         addMessages(fresh); refreshMembers(); markReadSoon();
         const first = R.msgs.find((m) => isNum(m.id)); if (first) loadReactions(R, first.id);
       }
@@ -2754,12 +2817,14 @@ function showImage(btn) {
   const m = S.room && S.room.msgs.find((x) => String(x.id) === btn.dataset.id);
   const p = m ? (m.sender_id === S.uid ? S.me : profileOf(m.sender_id)) : null;
   const when = m ? `${new Date(m.created_at).getMonth() + 1}월 ${new Date(m.created_at).getDate()}일 ${fmtTime(m.created_at)}` : '';
+  const left = m ? mediaDaysLeft(m) : null;   // v1.19
+  const keepTxt = left === null ? '' : left <= 1 ? ' · 곧 삭제돼요' : ` · ${left}일 뒤 삭제돼요`;
   const v = document.createElement('div');
   v.className = 'viewer';
   v.innerHTML = `<div class="vbar"><button class="ibtn" data-v="close" aria-label="닫기">${ic('x', 24)}</button>
-      <div class="vt"><b>${esc(p ? p.display_name : '사진')}</b><span>${esc(when)}</span></div><div style="width:44px"></div></div>
+      <div class="vt"><b>${esc(p ? p.display_name : '사진')}</b><span>${esc(when + keepTxt)}</span></div><div style="width:44px"></div></div>
     <div class="vimg"><img src="${esc(img.src)}" alt="사진"></div>
-    <div class="vfoot"><a class="save" href="${esc(img.src)}" download="minitalk-photo.jpg" target="_blank" rel="noopener">${ic('download', 20)}저장</a></div>`;
+    <div class="vfoot"><a class="save" href="${esc(img.src)}" download="kkiritalk-photo.jpg" target="_blank" rel="noopener">${ic('download', 20)}저장</a></div>`;
   v.addEventListener('click', (e) => { if (e.target.closest('[data-v=close]') || e.target.classList.contains('vimg')) v.remove(); });
   app.appendChild(v);
 }
@@ -2922,7 +2987,89 @@ async function renderHomeSec() {
     <div class="card adm-card"><div class="card-head">회원 구성</div>
       <div class="mix">${[['신규 7일', d.new7, 'new'], ['휴면 30일', d.dormant, 'dormant'], ['승인 대기', d.pending, 'pending'], ['정지', d.suspended, 'suspended'], ['관리자', d.admins, 'admin']]
     .map(([l, n, f]) => `<button data-act="admin-todo" data-s="members" data-f="${f}"><b>${n}</b><span>${l}</span></button>`).join('')}</div></div>
+    <div class="card adm-card" id="admUsage">${usageHtml(A.usage)}</div>
   </div>`;
+  loadUsage();
+}
+
+// ---------- v1.19: 사용량 (Supabase 요금제 한도와 비교) ----------
+const PLAN_LIMITS = {
+  free: { label: '무료', db: 500 * 1024 ** 2, storage: 1024 ** 3, mau: 50000, rt: 2e6 },
+  pro: { label: 'Pro', db: 8 * 1024 ** 3, storage: 100 * 1024 ** 3, mau: 100000, rt: 5e6 },
+};
+const BYTES_PER_MSG = 350;   // 메시지 1개가 데이터베이스에서 차지하는 대략적인 크기 (색인 포함, 실측 약 300바이트)
+const RT_PER_MSG = 6;        // 1:1 대화 기준 메시지 1개당 실시간 전달 수 (메시지·보낸 사람 읽음·상대 읽음 각각 보내기+받기)
+const KEEP_OPTIONS = [[3, '3일'], [7, '7일'], [14, '14일'], [30, '30일'], [90, '90일'], [0, '기간 없이 보관']];
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  return n >= 1024 ** 3 ? `${(n / 1024 ** 3).toFixed(n >= 10 * 1024 ** 3 ? 0 : 1).replace(/\.0$/, '')}GB` : fmtSize(n);
+}
+async function loadUsage() {
+  const A = S.admin; if (!A || !api.adminUsage) return;
+  try { A.usage = await api.adminUsage(); A.usageErr = null; }
+  catch (e) { A.usageErr = e.message || '불러오지 못했어요'; }
+  const box = $('#admUsage'); if (box && S.admin === A) box.innerHTML = usageHtml(A.usage);
+}
+function usageHtml(u) {
+  const A = S.admin || {};
+  if (!u) return `<div class="card-head">사용량</div><div class="empty-line">${A.usageErr ? esc(A.usageErr) : '불러오는 중…'}</div>`;
+  const L = PLAN_LIMITS[u.plan] || PLAN_LIMITS.free;
+  const st = u.storage || {};
+  const storage = Object.values(st).reduce((a, x) => a + (Number(x.bytes) || 0), 0);
+  const chat = ['chat-images', 'chat-files'].reduce((a, b) => a + (st[b] ? Number(st[b].bytes) || 0 : 0), 0);
+  const keep = Number(u.keep_days) || 0;
+  const dbDay = (Number(u.msgs_24h) || 0) * BYTES_PER_MSG;
+  const dbLeft = dbDay > 0 ? Math.max(0, Math.floor((L.db - Number(u.db_bytes)) / dbDay)) : null;
+  const steady = storage - chat + (Number(u.upload_24h) || 0) * keep;
+  const rtEst = (Number(u.msgs_24h) || 0) * 30 * RT_PER_MSG;
+  const dash = A.dash || {};   // 접속자 수는 현황판 숫자를 같이 씀 (같은 계산을 두 번 하지 않게)
+  const mau = Number(dash.active_30d) || 0; const dau = Number(dash.today_active) || 0;
+  const bar = (label, used, limit, val, sub) => {
+    const pct = limit > 0 ? Math.min(100, (used / limit) * 100) : 0;
+    const lv = pct >= 90 ? 'hot' : pct >= 70 ? 'warm' : '';
+    return `<div class="use-row ${lv}"><div class="use-top"><span class="use-l">${label}</span><span class="use-v">${val} <small>${Math.round(pct)}%</small></span></div>
+      <div class="use-bar" role="progressbar" aria-label="${esc(label)}" aria-valuenow="${Math.round(pct)}" aria-valuemin="0" aria-valuemax="100"><i style="width:${pct.toFixed(1)}%"></i></div>${sub ? `<div class="use-sub">${sub}</div>` : ''}</div>`;
+  };
+  const rows = [
+    bar('대화 내용 저장', Number(u.db_bytes), L.db, `${fmtBytes(u.db_bytes)} / ${fmtBytes(L.db)}`,
+      dbDay > 0 ? `하루 약 ${fmtBytes(dbDay)}씩 늘어요${dbLeft !== null ? (dbLeft > 3650 ? ' · 한참 여유 있어요' : ` · 이 속도면 약 ${dbLeft.toLocaleString()}일 뒤 가득 차요`) : ''}` : ''),
+    bar('사진·파일 저장', storage, L.storage, `${fmtBytes(storage)} / ${fmtBytes(L.storage)}`,
+      `최근 24시간 ${fmtBytes(u.upload_24h)} 올라옴 · ${keep ? `${keep}일 보관이면 약 ${fmtBytes(steady)} 정도로 유지돼요` : '보관 기간이 없어 계속 늘어나요'}`
+      + (Number(u.expired_files) ? `<br><b>기간 지난 파일 ${Number(u.expired_files).toLocaleString()}개 (${fmtBytes(u.expired_bytes)})</b> 정리 대기 <button class="link-btn" data-act="admin-clean-expired">지금 정리</button>` : '')),
+    bar('한 달 접속 회원', mau, L.mau, `${mau.toLocaleString()}명 / ${L.mau.toLocaleString()}명`, `오늘 ${dau.toLocaleString()}명 · 전체 회원 ${Number(u.users).toLocaleString()}명`),
+    bar('실시간 전달(예상)', rtEst, L.rt, `월 약 ${Math.round(rtEst).toLocaleString()}건 / ${L.rt.toLocaleString()}건`, `오늘 메시지 수로 어림한 값이에요 (단체방이 많으면 더 늘어요)`),
+  ];
+  const near = [Number(u.db_bytes) / L.db, storage / L.storage, mau / L.mau, rtEst / L.rt].some((x) => x >= 0.8);
+  return `<div class="card-head chart-head">사용량
+      <div class="seg mini">${Object.entries(PLAN_LIMITS).map(([k, v]) => `<button type="button" data-act="admin-plan" data-p="${k}" class="${u.plan === k ? 'on' : ''}">${v.label}</button>`).join('')}</div></div>
+    <div class="use-body">${rows.join('')}
+      ${near ? `<div class="use-warn">${ic('alert', 18, 'flex:none')}<span>${u.plan === 'pro' ? '포함된 양을 넘으면 Supabase 에서 추가 요금이 나와요.' : '무료 한도에 가까워졌어요. Supabase 를 Pro 요금제(월 25달러)로 바꿀 때가 됐어요.'}</span></div>` : ''}
+      <a class="use-link" href="https://supabase.com/dashboard/org/_/usage" target="_blank" rel="noopener">데이터 전송량 등 정확한 사용량은 Supabase 사용량 화면에서 ${ic('chev', 16, 'flex:none')}</a>
+      <p class="chart-note">막대는 ${L.label} 요금제 기준이에요. 위의 버튼으로 기준을 바꿀 수 있어요.</p></div>`;
+}
+// v1.19: 보관 기간이 지난 사진·파일 정리 (quiet = 관리자 앱이 하루 두 번 알아서, 묻지 않고)
+async function cleanExpired(quiet, btn) {
+  if (!api.adminExpiredMedia) return;
+  try {
+    if (btn) btn.disabled = true;
+    // 먼저 묻고 나서 목록을 받음 (목록을 받는 순간 '지움' 으로 표시되므로)
+    if (!quiet) {
+      const u = S.admin && S.admin.usage;
+      const what = u && Number(u.expired_files) ? `${Number(u.expired_files).toLocaleString()}개 (약 ${fmtBytes(u.expired_bytes)})` : '';
+      if (!(await ask(`기간 지난 사진·파일${what ? ` ${what}` : ''}을 지울까요?`, `보관 기간(${S.keepDays || '?'}일)이 지난 파일이에요. 대화에는 '보관 기간이 지나 삭제됐어요' 로 보여요. 되돌릴 수 없어요.`, '지우기', true))) return;
+    }
+    let removed = 0; let bytes = 0;
+    for (let round = 0; round < 5; round++) {
+      const list = await api.adminExpiredMedia(1000);
+      if (!list.length) break;
+      const n = await api.removeMedia(list);
+      removed += n; bytes += list.reduce((a, x) => a + (Number(x.size) || 0), 0);
+      if (!n || list.length < 1000) break;
+    }
+    if (!quiet) toast(removed ? `사진·파일 ${removed.toLocaleString()}개를 지웠어요 (약 ${fmtBytes(bytes)})` : '정리할 사진·파일이 없어요');
+    if (S.admin && S.admin.sec === 'home') loadUsage();
+  } catch (e) { if (!quiet) showErr(e); }
+  finally { if (btn && btn.isConnected) btn.disabled = false; }
 }
 // 막대그래프 (값에 맞게 눈금 · 날짜는 이틀마다)
 function chartSvg(series, key) {
@@ -3269,7 +3416,22 @@ function renderOpsSec() {
       <button class="item" data-act="admin-ads"><span class="tile lav">${ic('gift', 19)}</span><span class="label">광고 관리<span class="sub">광고 탭에 보일 이미지와 링크를 등록해요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="admin-words"><span class="tile peach">${ic('ban', 19)}</span><span class="label">금칙어 관리<span class="sub">욕설 등 부적절한 말을 * 로 가려요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="admin-clean" style="padding-top:14px;padding-bottom:14px"><span class="tile sky">${ic('file', 19)}</span><span class="label">남은 사진·파일 정리<span class="sub">없어진 대화방에 남아 있는 사진·파일을 저장 공간에서 지워요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+    </div>
+    <div class="card adm-card"><div class="card-head">저장 공간</div>
+      <div class="item" style="padding-top:14px;padding-bottom:14px"><span class="tile lav">${ic('image', 19)}</span><span class="label">사진·파일 보관 기간<span class="sub">지나면 저장 공간에서 지워져요</span></span>
+        <select id="keepDays" class="adm-select" style="width:auto;max-width:36%" aria-label="사진·파일 보관 기간">${(KEEP_OPTIONS.some(([v]) => v === S.keepDays) ? KEEP_OPTIONS : [...KEEP_OPTIONS, [S.keepDays, `${S.keepDays}일`]]).map(([v, l]) => `<option value="${v}" ${S.keepDays === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+      <button class="item" data-act="admin-clean-expired" style="padding-top:14px;padding-bottom:14px"><span class="tile peach">${ic('file', 19)}</span><span class="label">기간 지난 사진·파일 정리<span class="sub">관리자 앱이 하루 두 번 알아서 해요. 지금 바로 하려면 누르세요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
     </div></div>`;
+  const sel = $('#keepDays');
+  if (sel) sel.onchange = async () => {
+    const v = Number(sel.value); const prev = S.keepDays;
+    if (v && v < (prev || Infinity) && !(await ask(`보관 기간을 ${v}일로 줄일까요?`, prev ? `${v}일이 지난 사진·파일은 곧 지워지고 되돌릴 수 없어요.` : `지금 있는 사진·파일은 오늘부터 ${v}일 동안 남겨 두고, 그 뒤에 지워져요. 회원들에게 미리 공지해 주세요.`, prev ? '줄이기' : '기간 정하기', true))) { sel.value = String(prev); return; }
+    try {
+      await api.adminSetUsageSettings({ keepDays: v });
+      S.keepDays = v; await loadAppInfo(); if (S.admin) S.admin.usage = null;
+      toast(v ? `사진·파일을 ${v}일 동안 보관해요` : '사진·파일을 기간 없이 보관해요');
+    } catch (e) { sel.value = String(prev); showErr(e); }
+  };
   if (!d) api.adminDashboard().then((x) => { if (S.admin) { S.admin.dash = x; if (S.admin.sec === 'ops') renderOpsSec(); } }).catch(() => {});
 }
 
@@ -3684,6 +3846,13 @@ app.addEventListener('click', async (e) => {
     case 'admin-user': showAdminUser(el.dataset.id); break;
     case 'admin-notice': showBroadcast(); break;
     case 'admin-clean': cleanOrphans(false, el); break;
+    case 'admin-clean-expired': cleanExpired(false, el); break;
+    case 'admin-plan': {
+      const plan = el.dataset.p; if (!S.admin || !S.admin.usage || S.admin.usage.plan === plan) break;
+      try { await api.adminSetUsageSettings({ plan }); S.admin.usage.plan = plan; const b = $('#admUsage'); if (b) b.innerHTML = usageHtml(S.admin.usage); }
+      catch (ex) { showErr(ex); }
+      break;
+    }
     case 'admin-ads': showAdsAdmin(); break;
     case 'admin-reports': showReportsAdmin('open'); break;
     case 'admin-words': showWordsAdmin(); break;

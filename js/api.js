@@ -14,7 +14,7 @@ function friendly(error) {
   const map = [
     [/Invalid login credentials/i, '아이디 또는 비밀번호가 맞지 않아요'],
     [/banned/i, '이용이 정지된 계정이에요. 관리자에게 문의해 주세요'],
-    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad|block_user|unblock_user|my_blocks|report_content|agree_terms|my_media_files|delete_my_account|refresh_my_status|create_inquiry|my_inquiries|inquiry_thread|reply_inquiry|close_inquiry)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad|block_user|unblock_user|my_blocks|report_content|agree_terms|my_media_files|delete_my_account|refresh_my_status|create_inquiry|my_inquiries|inquiry_thread|reply_inquiry|close_inquiry|app_info|expired_media|admin_expired_media|admin_usage|admin_set_usage_settings)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found|'reply_to' column|relation "public\.ads"|table 'public\.ads'|public\.ads/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/already registered|already exists/i, '이미 사용 중인 아이디예요'],
     [/Database error saving new user/i, '가입할 수 없는 아이디예요. 영문 소문자·숫자·밑줄(_) 3~20자로 입력해 주세요'],
@@ -167,6 +167,25 @@ export function createApi() {
       }
       return removed;
     },
+    // v1.19: 앱 설정 (사진·파일 보관 기간). 데이터베이스가 예전 버전이면 null
+    async appInfo() {
+      const { data, error } = await sb.rpc('app_info');
+      if (error) return null;
+      return data || null;
+    },
+    // v1.19: 내 방에서 보관 기간이 지난 사진·파일을 저장 공간에서 지움 (한 번에 최대 3묶음)
+    async sweepExpiredMedia() {
+      let removed = 0;
+      for (let round = 0; round < 3; round++) {
+        const { data, error } = await sb.rpc('expired_media', { p_limit: 200 });
+        if (error || !data || !data.length) break;
+        removed += await api.removeMedia(data);   // (이미 없는 파일은 빠져서 200개보다 적게 올 수 있어 끝까지 확인)
+      }
+      return removed;
+    },
+    async adminExpiredMedia(limit = 1000) { return must(await sb.rpc('admin_expired_media', { p_limit: limit })) || []; },
+    async adminUsage() { return must(await sb.rpc('admin_usage')); },
+    async adminSetUsageSettings({ keepDays = null, plan = null }) { must(await sb.rpc('admin_set_usage_settings', { p_keep_days: keepDays, p_plan: plan })); },
     async kickFromRoom(roomId, userId) { must(await sb.rpc('kick_from_room', { p_room: roomId, p_user: userId })); },
     async markRead(roomId) { must(await sb.rpc('mark_read', { p_room: roomId })); },
     async getRoom(roomId) {

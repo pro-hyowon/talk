@@ -1,5 +1,5 @@
 -- =====================================================================
---  끼리톡(Kkiri Talk) v1.18 — Supabase 데이터베이스 설정 스크립트
+--  끼리톡(Kkiri Talk) v1.19 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -127,6 +127,9 @@ exception when others then
 end;
 $$;
 
+-- v1.19: 사진·파일이 보관 기간이 지나 저장 공간에서 지워진 때 (메시지 자체는 남고 '보관 기간 지남' 으로 보임)
+alter table public.messages add column if not exists media_gone_at timestamptz;
+
 -- v1.11: 답장 (어느 메시지에 대한 답장인지)
 alter table public.messages add column if not exists reply_to bigint references public.messages(id) on delete set null;
 
@@ -148,6 +151,27 @@ alter table public.messages add constraint messages_file_check check (
   case when kind = 'file' then public.valid_file_msg(content, room_id, sender_id)
        when kind = 'contact' then public.valid_contact_msg(content)
        else true end);
+-- v1.19: 사진 메시지는 그 방에 내가 올린 사진 경로만 (다른 방·다른 사람 사진을 가리키는 메시지 막기. 기존 메시지는 그대로)
+create or replace function public.valid_image_msg(p_content text, p_room uuid, p_sender uuid)
+returns boolean language sql immutable as $$
+  select coalesce(p_content, '') ~ '^[0-9a-f-]{36}/[0-9a-f-]{36}-[A-Za-z0-9._-]{1,80}$'
+     and split_part(p_content, '/', 1) = p_room::text
+     and (p_sender is null or split_part(p_content, '/', 2) like p_sender::text || '-%');
+$$;
+alter table public.messages drop constraint if exists messages_image_check;
+-- 새로 넣을 때만 확인 (예전 메시지를 고칠 때 — 보관 기간 표시, 탈퇴 처리 등 — 는 막지 않게 트리거로)
+create or replace function public.check_image_msg()
+returns trigger language plpgsql as $$
+begin
+  if new.kind = 'image' and not public.valid_image_msg(new.content, new.room_id, new.sender_id) then
+    raise exception '사진 정보가 올바르지 않아요' using errcode = '23514';
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists messages_image_guard on public.messages;
+create trigger messages_image_guard before insert on public.messages
+  for each row execute function public.check_image_msg();
 -- v1.12: 사진·파일 권한 확인을 빠르게 (메시지에 담긴 파일 경로로 찾기)
 create index if not exists messages_media_idx on public.messages
   (room_id, (case when kind = 'file' then content::jsonb ->> 'path' else content end))
@@ -182,6 +206,15 @@ create table if not exists private.app_settings (
 );
 insert into private.app_settings (id) values (1) on conflict (id) do nothing;
 revoke all on private.app_settings from public, anon, authenticated;
+-- v1.19: 채팅 사진·파일 보관 기간(일, 0 = 계속 보관) · 현황판 사용량 막대의 기준 요금제
+alter table private.app_settings add column if not exists media_keep_days integer not null default 7;
+alter table private.app_settings add column if not exists plan text not null default 'free';
+-- 보관 기간을 적용하기 시작한 때 (업데이트 전에 올린 파일도 이때부터 보관 기간만큼은 남겨 둠 → 회원에게 알릴 시간)
+alter table private.app_settings add column if not exists media_keep_from timestamptz not null default now();
+alter table private.app_settings drop constraint if exists app_settings_keep_check;
+alter table private.app_settings add constraint app_settings_keep_check check (media_keep_days between 0 and 365);
+alter table private.app_settings drop constraint if exists app_settings_plan_check;
+alter table private.app_settings add constraint app_settings_plan_check check (plan in ('free', 'pro'));
 
 -- 번호 조회 하루 사용량 (다른 사람 번호를 마구 대입해 보는 것을 막음)
 create table if not exists private.lookup_quota (
@@ -327,6 +360,10 @@ create table if not exists private.daily_active (
 create index if not exists daily_active_user_idx on private.daily_active(user_id);
 revoke all on private.daily_active from public, anon, authenticated;
 create index if not exists messages_created_idx on public.messages(created_at);
+create index if not exists reports_open_msg_idx on private.reports(message_id) where status = 'open';   -- v1.19
+-- v1.19: 아직 지우지 않은 사진·파일만 따로 (보관 기간이 지난 것을 빨리 찾기 — 지우고 나면 목록에서 빠져 작게 유지됨)
+create index if not exists messages_media_pending_idx on public.messages(room_id, created_at)
+  where kind in ('image', 'file') and media_gone_at is null;
 create index if not exists profiles_created_idx on public.profiles(created_at);
 
 -- 1:1 문의 (회원 ↔ 관리자)
@@ -1255,7 +1292,7 @@ begin
     begin
       perform realtime.send(jsonb_build_object('message_id', p_id, 'room_id', v_m.room_id, 'user_id', auth.uid(), 'emoji', v_new),
                             'reaction', 'user:' || m.user_id::text, true)
-         from room_members m where m.room_id = v_m.room_id;
+         from room_members m where m.room_id = v_m.room_id and m.user_id <> auth.uid();   -- v1.19: 누른 사람은 화면에 이미 반영됨
     exception when others then null;
     end;
   end if;
@@ -1922,7 +1959,7 @@ begin
   if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null then
     begin
       perform realtime.send(jsonb_build_object('id', p_id, 'room_id', v_m.room_id), 'deleted', 'user:' || m.user_id::text, true)
-         from room_members m where m.room_id = v_m.room_id;
+         from room_members m where m.room_id = v_m.room_id and m.user_id is distinct from auth.uid();   -- v1.19: 지운 사람은 화면에 이미 반영됨
     exception when others then null;
     end;
   end if;
@@ -2543,6 +2580,198 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------
+-- 6-4. v1.19: 사진·파일 보관 기간(기본 7일) · 저장 공간 사용량 · 실시간 전달량 절약
+--   · 보관 기간이 지난 채팅 사진·파일은 저장 공간에서 지움 (대화 내용은 남고 '보관 기간 지남' 으로 보임)
+--   · 지우는 일은 앱이 나눠서 함: 회원 앱이 열릴 때 내 방의 지난 파일을 조금씩, 관리자 앱이 남은 것을 한꺼번에
+--     (Supabase 는 SQL 로 파일을 지우면 실제 파일이 남으므로 반드시 저장소 기능으로 지워야 함)
+-- ---------------------------------------------------------------------
+
+-- 사진·파일 보관 기간(일). 0 = 기간 없이 계속 보관
+create or replace function public.media_keep_days()
+returns integer language sql stable security definer set search_path = public, private as $$
+  select coalesce((select media_keep_days from private.app_settings where id = 1), 7);
+$$;
+
+-- 이 시각보다 먼저 올린 사진·파일은 보관 기간이 지남 (보관 기간이 없거나 적용 시작 후 아직 기간이 안 지났으면 null)
+create or replace function public.media_cutoff()
+returns timestamptz language sql stable security definer set search_path = public, private as $$
+  select case when s.media_keep_days > 0 and s.media_keep_from < now() - make_interval(days => s.media_keep_days)
+              then now() - make_interval(days => s.media_keep_days) end
+    from private.app_settings s where s.id = 1;
+$$;
+
+-- 이 시각에 올린 파일은 보관 기간이 지났나? (저장소 권한 확인용)
+create or replace function public.chat_object_expired(p_created timestamptz)
+returns boolean language sql stable security definer set search_path = public as $$
+  select coalesce(p_created < public.media_cutoff(), false);
+$$;
+
+-- 처리 전 신고에 걸린 사진·파일인가? (증거로 남김 — 보관 기간이 지나도 지우지 않음)
+--   (파일 경로의 방 번호로 그 방의 메시지만 찾아봄 → 신고·파일이 많아도 빠름)
+create or replace function public.media_under_report(p_name text)
+returns boolean language sql stable security definer set search_path = public, private as $$
+  select exists (
+    select 1 from messages g join private.reports r on r.message_id = g.id and r.status = 'open'
+     where g.room_id = (case when p_name ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/' then split_part(p_name, '/', 1)::uuid end)
+       and g.kind in ('image', 'file')
+       and (case when g.kind = 'file' then g.content::jsonb ->> 'path' else g.content end) = p_name);
+$$;
+
+-- 관리자 정리 목록에 방금(10분 안) 오른 파일인가? (관리자도 그 파일만 지울 수 있게 — 다른 대화 사진은 못 봄)
+create table if not exists private.media_purge (
+  bucket   text not null,
+  name     text not null,
+  admin_id uuid,
+  at       timestamptz not null default now(),
+  primary key (bucket, name)
+);
+revoke all on private.media_purge from public, anon, authenticated;
+create or replace function public.admin_can_purge_media(p_bucket text, p_name text)
+returns boolean language sql stable security definer set search_path = public, private as $$
+  select public.is_admin()
+     and exists (select 1 from private.media_purge q
+                  where q.bucket = p_bucket and q.name = p_name and q.at > now() - interval '10 minutes');
+$$;
+
+-- 앱이 처음에 받는 설정 (보관 기간 → 지난 사진·파일을 '보관 기간 지남' 으로 표시)
+create or replace function public.app_info()
+returns jsonb language sql stable security definer set search_path = public, private as $$
+  select jsonb_build_object('media_keep_days', public.media_keep_days(),
+                            'media_keep_from', (select media_keep_from from private.app_settings where id = 1));
+$$;
+
+-- 회원 앱: 내 방에서 보관 기간이 지난 사진·파일을 몇 개씩 받아 저장 공간에서 지움
+--   (받는 순간 '지움' 으로 표시 → 여러 회원이 같은 파일을 겹쳐 지우지 않음. 혹시 못 지운 파일은 관리자 정리에서 지워짐)
+create or replace function public.expired_media(p_limit integer default 200)
+returns table (bucket text, name text)
+language plpgsql security definer set search_path = public, private as $$
+#variable_conflict use_column
+declare
+  v_me  uuid := auth.uid();
+  v_cut timestamptz := public.media_cutoff();
+begin
+  if v_me is null or v_cut is null or not public.is_active() then return; end if;
+  return query
+  with c as (
+    select g.id,
+           case when g.kind = 'image' then 'chat-images' else 'chat-files' end as b,
+           case when g.kind = 'file' then g.content::jsonb ->> 'path' else g.content end as p
+      from room_members m
+      join messages g on g.room_id = m.room_id
+     where m.user_id = v_me
+       and g.kind in ('image', 'file') and g.media_gone_at is null
+       and g.created_at < v_cut
+       and (g.id > m.history_from or g.sender_id = v_me)   -- 내가 볼 수 있던 것만 (지울 권한과 같게)
+       and not public.media_under_report(case when g.kind = 'file' then g.content::jsonb ->> 'path' else g.content end)   -- 처리 전 신고 증거는 남김
+     limit least(greatest(coalesce(p_limit, 200), 1), 500)
+     for update of g skip locked
+  ), u as (
+    update messages x set media_gone_at = now() from c where x.id = c.id
+    returning c.b, c.p
+  )
+  select u.b::text, u.p::text from u
+   where u.p is not null
+     and exists (select 1 from storage.objects o where o.bucket_id = u.b and o.name = u.p);
+end;
+$$;
+
+-- 관리자 앱: 보관 기간이 지난 채팅 사진·파일 전체 (아무도 열지 않는 방에 남은 것까지)
+--   함께 그 메시지를 '지움' 으로 표시하고, 10분 동안 관리자가 그 파일만 지울 수 있게 함
+drop function if exists public.admin_expired_media(integer);
+create or replace function public.admin_expired_media(p_limit integer default 1000)
+returns table (bucket text, name text, size bigint)
+language plpgsql security definer set search_path = public, private as $$
+#variable_conflict use_column
+declare
+  v_me  uuid := public.admin_guard();
+  v_cut timestamptz := public.media_cutoff();
+begin
+  if v_cut is null then return; end if;
+  delete from private.media_purge where at < now() - interval '1 day';
+  return query
+    with pick as (
+      select o.bucket_id::text as b, o.name::text as n, coalesce((o.metadata ->> 'size')::bigint, 0) as sz
+        from storage.objects o
+       where o.bucket_id in ('chat-images', 'chat-files')
+         and o.created_at < v_cut
+         and not public.media_under_report(o.name)
+       limit least(greatest(coalesce(p_limit, 1000), 1), 2000)
+    ), q as (
+      insert into private.media_purge (bucket, name, admin_id, at)
+      select k.b, k.n, v_me, now() from pick k
+      on conflict (bucket, name) do update set admin_id = excluded.admin_id, at = excluded.at
+      returning 1
+    ), mark as (
+      update messages g set media_gone_at = now()
+        from pick k
+       where g.room_id = (case when k.n ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/' then split_part(k.n, '/', 1)::uuid end)
+         and g.kind in ('image', 'file') and g.media_gone_at is null
+         and (case when g.kind = 'file' then g.content::jsonb ->> 'path' else g.content end) = k.n
+      returning g.id
+    )
+    select k.b, k.n, k.sz from pick k;
+end;
+$$;
+
+-- 관리자: 저장 공간 사용량 (현황판의 '사용량' 카드. 접속자 수는 현황판 숫자를 같이 씀)
+--   데이터 전송량·실시간 전달량은 데이터베이스에서 알 수 없어 Supabase 사용량 화면에서 확인
+drop function if exists public.admin_usage();
+create or replace function public.admin_usage()
+returns jsonb language plpgsql stable security definer set search_path = public, private as $$
+declare
+  v_cut timestamptz := public.media_cutoff();
+  v_st  jsonb;
+  v_up  bigint; v_exn bigint; v_exb bigint;
+begin
+  perform public.admin_guard();
+  -- 저장소는 한 번만 훑어서 버킷별 합계 · 최근 24시간 · 기간 지난 것을 함께 셈
+  select coalesce(jsonb_object_agg(x.b, jsonb_build_object('files', x.n, 'bytes', x.s)), '{}'::jsonb),
+         coalesce(sum(x.up), 0), coalesce(sum(x.exn), 0), coalesce(sum(x.exb), 0)
+    into v_st, v_up, v_exn, v_exb
+    from (
+      select o.bucket_id as b, count(*) as n, coalesce(sum((o.metadata ->> 'size')::bigint), 0) as s,
+             coalesce(sum((o.metadata ->> 'size')::bigint) filter (
+               where o.bucket_id in ('chat-images', 'chat-files') and o.created_at > now() - interval '1 day'), 0) as up,
+             count(*) filter (where o.bucket_id in ('chat-images', 'chat-files') and o.created_at < v_cut
+                                    and not public.media_under_report(o.name)) as exn,
+             coalesce(sum((o.metadata ->> 'size')::bigint) filter (
+               where o.bucket_id in ('chat-images', 'chat-files') and o.created_at < v_cut
+                 and not public.media_under_report(o.name)), 0) as exb
+        from storage.objects o group by o.bucket_id) x;
+  return jsonb_build_object(
+    'plan',          coalesce((select plan from private.app_settings where id = 1), 'free'),
+    'keep_days',     public.media_keep_days(),
+    'db_bytes',      pg_database_size(current_database()),
+    'users',         (select count(*) from profiles),
+    'msgs_24h',      (select count(*) from messages where created_at > now() - interval '1 day' and kind <> 'system'),
+    'storage',       v_st,
+    'upload_24h',    v_up,
+    'expired_files', v_exn,
+    'expired_bytes', v_exb);
+end;
+$$;
+
+-- 관리자: 보관 기간 · 기준 요금제 바꾸기 (null 이면 그대로)
+create or replace function public.admin_set_usage_settings(p_keep_days integer, p_plan text)
+returns void language plpgsql security definer set search_path = public, private as $$
+begin
+  perform public.admin_guard();
+  if p_keep_days is not null then
+    if p_keep_days not in (0, 3, 7, 14, 30, 90, 180, 365) then raise exception '보관 기간을 다시 골라 주세요'; end if;
+    -- '기간 없이' 였다가 기간을 정하면 지금부터 적용 (그동안 올린 파일도 정한 기간만큼은 남김)
+    update private.app_settings
+       set media_keep_from = case when media_keep_days = 0 and p_keep_days > 0 then now() else media_keep_from end,
+           media_keep_days = p_keep_days
+     where id = 1;
+  end if;
+  if p_plan is not null then
+    if p_plan not in ('free', 'pro') then raise exception '요금제를 다시 골라 주세요'; end if;
+    update private.app_settings set plan = p_plan where id = 1;
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
 -- 7. 보안 정책 (Row Level Security) — 본인·참여자만 볼 수 있게
 -- ---------------------------------------------------------------------
 alter table public.profiles     enable row level security;
@@ -2607,7 +2836,10 @@ grant update (display_name, status_message, avatar_url) on public.profiles to au
 grant select, insert, delete on public.friends to authenticated;
 grant select on public.rooms to authenticated;
 grant select on public.room_members to authenticated;
-grant select, insert on public.messages to authenticated;
+grant select on public.messages to authenticated;
+-- v1.19: 앱이 쓰는 칸만 직접 넣을 수 있게 (보낸 시각·보낸 사람·삭제 표시는 서버가 정함 → 시각을 속여 보관 기간을 앞당길 수 없음)
+revoke insert on public.messages from authenticated;
+grant insert (room_id, kind, content, reply_to) on public.messages to authenticated;
 -- v1.11: 공감은 보기만 직접, 누르기는 react_message() 로만
 alter table public.message_reactions enable row level security;
 revoke all on public.message_reactions from anon, authenticated;
@@ -2648,14 +2880,16 @@ declare
     'refresh_my_status()', 'create_inquiry(text, text, text)', 'my_inquiries()', 'inquiry_thread(bigint)',
     'reply_inquiry(bigint, text)', 'close_inquiry(bigint)',
     'admin_suspend(uuid, integer, text)', 'admin_set_note(uuid, text)', 'admin_dashboard()', 'admin_badges()',
-    'admin_member_page(text, text, text, integer, integer)', 'admin_member_detail(uuid)', 'admin_list_inquiries(text, integer, integer)'];
+    'admin_member_page(text, text, text, integer, integer)', 'admin_member_detail(uuid)', 'admin_list_inquiries(text, integer, integer)',
+    'app_info()', 'expired_media(integer)', 'admin_expired_media(integer)', 'admin_usage()', 'admin_set_usage_settings(integer, text)'];
   helper_fns text[] := array[
     'is_active()', 'is_active_user(uuid)', 'is_admin()', 'is_room_member(uuid)', 'is_room_member_text(text)',
     'shares_room_with(uuid)', 'is_notice_room(uuid)', 'admin_guard()',
     'is_mutual_friend(uuid, uuid)', 'can_post(uuid)', 'can_post_text(text)',
-    'valid_file_msg(text, uuid, uuid)', 'valid_contact_msg(text)',
+    'valid_file_msg(text, uuid, uuid)', 'valid_contact_msg(text)', 'valid_image_msg(text, uuid, uuid)',
     'can_see_message(uuid, bigint)', 'can_read_chat_object(text)', 'can_cleanup_folder(text)', 'is_orphan_folder(text)',
-    'admin_can_view_reported(text)', 'admin_can_purge(text)', 'kst_today()'];
+    'admin_can_view_reported(text)', 'admin_can_purge(text)', 'kst_today()', 'media_keep_days()', 'media_cutoff()', 'chat_object_expired(timestamptz)',
+    'media_under_report(text)', 'admin_can_purge_media(text, text)'];
 begin
   foreach f in array user_fns || helper_fns loop
     execute format('revoke execute on function public.%s from public, anon', f);
@@ -2735,7 +2969,10 @@ create policy "minitalk_chat_delete" on storage.objects for delete to authentica
     or public.can_cleanup_folder(split_part(name, '/', 1))     -- v1.12: 마지막으로 나간 사람의 정리
     or public.is_orphan_folder(split_part(name, '/', 1))       -- v1.12: 관리자의 남은 파일 정리
     or public.admin_can_view_reported(name)                    -- v1.17: 관리자의 신고된 사진·파일 삭제
-    or public.admin_can_purge(name)));                         -- v1.17: 관리자의 탈퇴 처리
+    or public.admin_can_purge(name)                            -- v1.17: 관리자의 탈퇴 처리
+    or (public.chat_object_expired(created_at)                 -- v1.19: 보관 기간이 지난 파일은 볼 수 있던 참여자·관리자가 정리
+        and not public.media_under_report(name)                --        (처리 전 신고 증거는 남김)
+        and (public.can_read_chat_object(name) or public.admin_can_purge_media(bucket_id, name)))));
 
 drop policy if exists "minitalk_chat_select" on storage.objects;
 create policy "minitalk_chat_select" on storage.objects for select to authenticated
@@ -2745,7 +2982,8 @@ create policy "minitalk_chat_select" on storage.objects for select to authentica
     or public.is_orphan_folder(split_part(name, '/', 1))
     or public.admin_can_view_reported(name)                    -- v1.17: 관리자가 신고된 사진 확인
     or public.admin_can_purge(name)                            -- v1.17: 관리자의 탈퇴 처리 (지우려면 보기 권한 필요)
-    or split_part(name, '/', 2) like (select auth.uid())::text || '-%'));   -- v1.17: 내가 올린 파일 (나간 방이어도 탈퇴 때 지울 수 있게)
+    or split_part(name, '/', 2) like (select auth.uid())::text || '-%'     -- v1.17: 내가 올린 파일 (나간 방이어도 탈퇴 때 지울 수 있게)
+    or public.admin_can_purge_media(bucket_id, name)));   -- v1.19: 관리자가 방금 정리 목록에 올린 기간 지난 파일만 (지우려면 보기 권한 필요)
 
 -- ---------------------------------------------------------------------
 -- 9. 실시간(Realtime) 전달 — v1.6: Broadcast 방식
@@ -2766,8 +3004,11 @@ begin
   v_payload := jsonb_build_object('id', new.id, 'room_id', new.room_id, 'sender_id', new.sender_id,
                                   'kind', new.kind, 'content', new.content, 'created_at', new.created_at,
                                   'reply_to', new.reply_to);
+  -- v1.19: 보낸 사람에게는 다시 보내지 않음 (보낸 화면에 이미 있음 → 실시간 전달량 절반). 시스템 안내는 모두에게
   perform realtime.send(v_payload, 'message', 'user:' || m.user_id::text, true)
-     from room_members m where m.room_id = new.room_id;
+     from room_members m
+    where m.room_id = new.room_id
+      and (new.kind = 'system' or new.sender_id is null or m.user_id <> new.sender_id);
   return new;
 exception when others then
   raise warning 'rt_on_message 실패: %', sqlerrm;   -- 실시간 전달 문제로 메시지 저장이 막히면 안 됨
@@ -2780,7 +3021,7 @@ create trigger messages_broadcast
   after insert on public.messages
   for each row execute function public.rt_on_message();
 
--- 읽음 표시: 20명 이하 방만 실시간으로 (그 방을 보고 있는 사람에게만, room:<방ID> 채널)
+-- 읽음 표시: 20명 이하 방만 실시간으로 (다른 참여자의 개인 채널 user:<회원ID> 로)
 --   21명 이상 방은 앱이 5초마다 확인 (실시간 전송량이 인원 수의 제곱으로 늘어나는 것을 막음)
 create or replace function public.rt_on_read()
 returns trigger language plpgsql security definer set search_path = public as $$
@@ -2790,14 +3031,12 @@ begin
   if (select count(*) from (select 1 from room_members where room_id = new.room_id limit 21) x) > 20 then
     return new;
   end if;
-  perform realtime.send(
-    jsonb_build_object('room_id', new.room_id, 'user_id', new.user_id, 'last_read_id', new.last_read_id),
-    'read', 'room:' || new.room_id::text, true);
-  -- v1.16.1: 각 참여자 개인 채널로도 보냄 (방 채널 연결이 늦거나 끊겨도 '1' 이 바로 사라지게)
+  -- v1.19: 읽은 사람을 뺀 참여자의 개인 채널로만 보냄 (방 채널로 한 번 더 보내던 것과 읽은 본인에게 보내던 것을 없앰
+  --        → 1:1 방에서 읽음 1번에 7건 → 2건). '1' 은 여전히 바로 사라짐
   perform realtime.send(
     jsonb_build_object('room_id', new.room_id, 'user_id', new.user_id, 'last_read_id', new.last_read_id),
     'read', 'user:' || m.user_id::text, true)
-     from room_members m where m.room_id = new.room_id;
+     from room_members m where m.room_id = new.room_id and m.user_id <> new.user_id;
   return new;
 exception when others then
   raise warning 'rt_on_read 실패: %', sqlerrm;
