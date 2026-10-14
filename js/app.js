@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.23';
+const VERSION = '1.25';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -210,13 +210,13 @@ function onSheetGone(sheet, fn) {
 }
 
 // 확인 팝업 (취소 / 확인)
-function ask(title, message, okLabel = '확인', danger = false) {
+function ask(title, message, okLabel = '확인', danger = false, noLabel = '취소') {
   return new Promise((resolve) => {
     let done = false;
     openSheet({
       title, bare: true,
       body: `<div class="confirm"><h3>${esc(title)}</h3>${message ? `<p>${esc(message)}</p>` : ''}</div>
-        <div class="two"><button class="btn gray" data-no>취소</button><button class="btn ${danger ? 'danger' : ''}" data-yes>${esc(okLabel)}</button></div>`,
+        <div class="two"><button class="btn gray" data-no>${esc(noLabel)}</button><button class="btn ${danger ? 'danger' : ''}" data-yes>${esc(okLabel)}</button></div>`,
       onMount(sheet, close) {
         $('[data-yes]', sheet).onclick = () => { done = true; close(); resolve(true); };
         $('[data-no]', sheet).onclick = () => { done = true; close(); resolve(false); };
@@ -405,7 +405,7 @@ function renderAuth(mode = 'login') {
         ${fieldHtml('username', '아이디', { ph: signup ? '영문 소문자·숫자' : '아이디', help: signup ? '영문 소문자·숫자·밑줄(_) 3~20자' : '', auto: 'username', max: 20 })}
         ${fieldHtml('password', '비밀번호', { type: 'password', ph: signup ? '6자 이상' : '비밀번호', auto: signup ? 'new-password' : 'current-password' })}
         ${signup ? fieldHtml('password2', '비밀번호 확인', { type: 'password', ph: '한 번 더 입력', auto: 'new-password' }) : ''}
-        ${signup ? fieldHtml('phone', '휴대폰 번호 (선택)', { type: 'tel', ph: '010-1234-5678', help: '친구가 휴대폰 번호로 나를 찾을 때 쓰여요. 다른 사람에게는 보이지 않아요', auto: 'tel', max: 16 }) : ''}
+        ${signup ? fieldHtml('phone', '휴대폰 번호 <span class="rec-tag">권장</span>', { type: 'tel', ph: '010-1234-5678', help: '번호를 넣으면 친구가 내 휴대폰 번호로 나를 바로 찾아 추가할 수 있어요. 번호는 다른 회원에게 보이지 않아요', auto: 'tel', max: 16 }) : ''}
       </div>
       ${signup ? `<div class="field agree-field" data-field="agree"><label class="agree"><input type="checkbox" name="agree" value="yes" id="f-agree">
         <span><a href="./terms.html" target="_blank" rel="noopener">이용약관</a>과 <a href="./privacy.html" target="_blank" rel="noopener">개인정보처리방침</a>에 동의하며, 만 14세 이상이에요 <b>(필수)</b></span></label>
@@ -438,6 +438,12 @@ function renderAuth(mode = 'login') {
     if (signup && f.agree !== 'yes') errs.agree = '약관에 동의해야 가입할 수 있어요';
     ['displayName', 'username', 'password', 'password2', 'phone', 'agree'].forEach((k) => setFieldErr(form, k, errs[k] || ''));
     if (Object.keys(errs).length) return;
+    // v1.25: 휴대폰 번호는 권장 — 비워 두면 한 번만 안내하고, 그래도 원하면 번호 없이 가입
+    if (signup && !phone && !form.dataset.noPhoneOk) {
+      const skip = await ask('휴대폰 번호 없이 가입할까요?', '번호를 넣으면 친구가 내 휴대폰 번호로 나를 쉽게 찾을 수 있어요. 번호는 나중에 더보기 → 휴대폰 번호에서 등록할 수도 있어요.', '번호 없이 가입', false, '번호 넣기');
+      if (!skip) { const pi = $('#f-phone'); if (pi) pi.focus(); return; }
+      form.dataset.noPhoneOk = '1';
+    }
     const btn = $('#authBtn');
     btn.disabled = true; btn.innerHTML = '<span class="spin-sm" style="width:18px;height:18px;border-width:2.5px;border-color:rgba(12,59,48,.25);border-top-color:#0C3B30"></span>';
     try {
