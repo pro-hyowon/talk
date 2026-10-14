@@ -1,0 +1,11 @@
+.git
+.github
+.assetsignore
+wrangler.jsonc
+vercel.json
+README.md
+STORE-GUIDE.md
+supabase
+tools
+node_modules
+.wrangler
