@@ -1,6 +1,12 @@
 // 끼리톡 — 약관·방침 페이지에 앱 이름·운영자·문의 이메일을 설정 파일(js/config.js)에서 채워 넣음
 import { CONFIG } from './config.js';
 
+// v1.26: 예전 주소(vercel.app)로 열면 새 주소의 같은 페이지로 이동
+if (/(^|\.)vercel\.app$/i.test(location.hostname)) {
+  const home = String(CONFIG.HOME_URL || 'https://kkiritalk.com').replace(/\/+$/, '');
+  location.replace(home + location.pathname + location.search + location.hash);
+}
+
 const OLD = '미니톡';   // 예전 이름이 설정에 남아 있으면 새 이름으로
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === OLD ? '끼리톡' : CONFIG.APP_NAME;
 const EMAIL = String(CONFIG.CONTACT_EMAIL || '').trim();

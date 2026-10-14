@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.25';
+const VERSION = '1.26';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -20,6 +20,46 @@ const isNum = (v) => typeof v === 'number';
 // 아이콘 모음을 한 번만 문서에 넣고 <use>로 불러 씀
 document.body.insertAdjacentHTML('afterbegin', `<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>${SPRITE}</defs></svg>`);
 const ic = (name, size = 24, style = '') => `<svg width="${size}" height="${size}" aria-hidden="true"${style ? ` style="${style}"` : ''}><use href="#mt-${name}"></use></svg>`;
+
+// v1.26: 새 주소로 이사 — 예전 주소(vercel.app)로 열면 안내 화면을 보여 주고 새 주소로 보냄
+//  · 예전 주소의 알림 구독·오프라인 저장을 정리해서, 같은 알림이 두 번 오지 않게 함
+//  · 초대 링크 등 주소 뒤에 붙은 내용(?…, #…)은 그대로 새 주소로 넘김
+const HOME_URL = String(window.__moveTo || CONFIG.HOME_URL || 'https://kkiritalk.com').replace(/\/+$/, '');
+if (window.__moveTo || /(^|\.)vercel\.app$/i.test(location.hostname)) {
+  await moveToNewHome();
+}
+async function moveToNewHome() {
+  const target = HOME_URL + location.pathname + location.search + location.hash;
+  const host = HOME_URL.replace(/^https?:\/\//, '');
+  const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  app.innerHTML = `<div class="screen blocked"><div class="center">
+      <div class="big-icon mint">${ic('share', 44)}</div>
+      <h2>${esc(APP)} 주소가 바뀌었어요</h2>
+      <p>이제 <b>${esc(host)}</b> 에서 만나요.<br>친구와 대화는 그대로예요.</p>
+      <div class="info-card move-card">
+        <div>${ic('check', 18, 'flex:none;color:var(--mint-text)')}<span>새 주소에서 <b>한 번만 다시 로그인</b>해 주세요.</span></div>
+        <div>${ic('check', 18, 'flex:none;color:var(--mint-text)')}<span>홈 화면에 추가해 둔 앱은 <b>예전 아이콘을 지우고</b>, 새 주소에서 다시 '홈 화면에 추가' 해 주세요.</span></div>
+        <div>${ic('check', 18, 'flex:none;color:var(--mint-text)')}<span>알림도 새 주소에서 다시 켜 주세요.</span></div>
+      </div>
+    </div>
+    <div class="btn-col"><a class="btn" id="moveGo" href="${esc(target)}">새 주소로 가기</a>
+      <div class="foot-note" id="moveNote">${standalone ? '' : '잠시 뒤 자동으로 이동해요'}</div></div></div>`;
+  // 예전 주소의 알림 구독을 끊고(서버는 다음 발송 때 자동으로 지움), 서비스 워커·저장된 파일을 정리
+  const cleanup = (async () => {
+    try {
+      const regs = (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) ? await navigator.serviceWorker.getRegistrations() : [];
+      for (const r of regs) {
+        try { const sub = r.pushManager && await r.pushManager.getSubscription(); if (sub) await sub.unsubscribe(); } catch {}
+        try { await r.unregister(); } catch {}
+      }
+    } catch {}
+    try { if (window.caches) for (const k of await caches.keys()) await caches.delete(k); } catch {}
+  })();
+  const go = async () => { await Promise.race([cleanup, new Promise((r) => setTimeout(r, 2500))]); location.replace(target); };
+  $('#moveGo').onclick = (e) => { e.preventDefault(); go(); };
+  if (!standalone) setTimeout(go, 4000);
+  await new Promise(() => {});   // 여기서 멈춤 — 예전 주소에서는 앱을 시작하지 않음
+}
 
 let api = null;
 try {

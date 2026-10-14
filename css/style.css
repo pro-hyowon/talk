@@ -1026,3 +1026,9 @@ html.kb-open .composer { padding-bottom: 8px; }
 
 /* v1.25: 가입 화면 '권장' 표시 */
 .rec-tag { display: inline-block; margin-left: 4px; padding: 1px 7px; border-radius: 7px; font-size: 11px; font-weight: 600; vertical-align: 1px; background: var(--mint-100); color: var(--mint-text); }
+
+/* v1.26: 주소 이사 안내 화면 */
+.move-card { display: flex; flex-direction: column; gap: 12px; padding: 16px 18px; font-size: 14px; line-height: 1.55; color: var(--ink2); }
+.move-card > div { display: flex; gap: 10px; align-items: flex-start; }
+.move-card svg { margin-top: 2px; }
+a.btn { text-decoration: none; }

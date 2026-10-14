@@ -101,6 +101,17 @@ SUPABASE_ANON_KEY: 'sb_publishable_xxxxxxxx',
 
 ## 이전 버전에서 업그레이드할 때
 
+**v1.26 (새 주소 kkiritalk.com 으로 이사)** — SQL 은 다시 실행하지 않아도 돼요.
+1. `js/config.js` 를 제외한 나머지 파일을 GitHub 저장소에 올립니다(덮어쓰기). 바뀐 파일: `js/app.js`, `js/legal.js`, `css/style.css`, `sw.js`, `README.md`
+2. GitHub 에 올리면 Cloudflare(kkiritalk.com)와 Vercel(예전 주소) 두 곳에 모두 반영돼요.
+- **예전 주소(…vercel.app)** 로 열면 "주소가 바뀌었어요" 안내가 나오고 잠시 뒤 **kkiritalk.com** 으로 자동 이동해요(버튼으로 바로 이동 가능). 홈 화면 앱으로 연 경우에는 안내를 읽을 수 있게 버튼을 눌러야 이동해요.
+  - 초대 링크처럼 주소 뒤에 붙은 내용도 그대로 새 주소로 넘어가요. 예전에 보낸 초대 링크도 계속 쓸 수 있어요.
+  - 이동하면서 예전 주소의 알림 구독과 저장된 파일을 정리해요(같은 알림이 두 번 오지 않게).
+  - 약관·개인정보처리방침 페이지도 예전 주소로 열면 새 주소의 같은 페이지로 넘어가요.
+- 회원은 새 주소에서 **한 번만 다시 로그인**하고, 홈 화면 앱은 예전 아이콘을 지우고 새로 추가, 알림도 다시 켜야 해요. 공지사항으로 미리 알려 주세요.
+- Vercel 프로젝트는 지우지 마세요. 예전 주소로 들어오는 사람을 새 주소로 보내 주는 역할을 해요(몇 달 뒤 지워도 돼요).
+- 다른 주소로 또 옮길 일이 생기면 `js/config.js` 에 `HOME_URL: 'https://새주소',` 를 넣으면 돼요(없으면 kkiritalk.com).
+
 **v1.25.1 (Cloudflare 로 옮기기 준비)** — 앱·SQL 변경 없음.
 1. 새 파일 4개 `wrangler.jsonc`, `.assetsignore`, `_headers`, `_redirects` 와 `README.md` 를 GitHub 저장소 **맨 바깥(index.html 이 있는 곳)** 에 올립니다. `.assetsignore` 처럼 점(.)으로 시작하는 파일도 빠지지 않게 확인하세요.
 2. Cloudflare → Compute → Workers & Pages → Create application → GitHub 저장소 `talk` 연결 → Project name **kkiritalk**(wrangler.jsonc 의 "name" 과 같아야 해요), Build command 비움, Deploy command `npx wrangler deploy` 그대로 → Deploy.
