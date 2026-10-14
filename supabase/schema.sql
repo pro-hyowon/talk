@@ -1,5 +1,5 @@
 -- =====================================================================
---  끼리톡(Kkiri Talk) v1.20 — Supabase 데이터베이스 설정 스크립트
+--  끼리톡(Kkiri Talk) v1.21 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -133,6 +133,9 @@ alter table public.messages add column if not exists media_gone_at timestamptz;
 -- v1.11: 답장 (어느 메시지에 대한 답장인지)
 alter table public.messages add column if not exists reply_to bigint references public.messages(id) on delete set null;
 
+-- v1.21: 오래된 글을 지울 때 이 글에 단 답장을 빨리 찾기 (없으면 지울 때마다 전체를 훑어 느려짐)
+create index if not exists messages_reply_to_idx on public.messages(reply_to) where reply_to is not null;
+
 -- v1.11: 공감 (메시지마다 한 사람당 하나: 하트·좋아요·웃음·놀람·슬픔·체크)
 create table if not exists public.message_reactions (
   message_id bigint not null references public.messages(id) on delete cascade,
@@ -211,6 +214,12 @@ alter table private.app_settings add column if not exists media_keep_days intege
 alter table private.app_settings add column if not exists plan text not null default 'free';
 -- 보관 기간을 적용하기 시작한 때 (업데이트 전에 올린 파일도 이때부터 보관 기간만큼은 남겨 둠 → 회원에게 알릴 시간)
 alter table private.app_settings add column if not exists media_keep_from timestamptz not null default now();
+-- v1.21: 대화(글) 보관 기간(일, 0 = 계속 보관) · 적용 시작 시각 · 마지막 정리 시각
+alter table private.app_settings add column if not exists msg_keep_days integer not null default 90;
+alter table private.app_settings add column if not exists msg_keep_from timestamptz not null default now();
+alter table private.app_settings add column if not exists msg_purged_at timestamptz;
+alter table private.app_settings drop constraint if exists app_settings_msg_keep_check;
+alter table private.app_settings add constraint app_settings_msg_keep_check check (msg_keep_days between 0 and 3650);
 alter table private.app_settings drop constraint if exists app_settings_keep_check;
 alter table private.app_settings add constraint app_settings_keep_check check (media_keep_days between 0 and 365);
 alter table private.app_settings drop constraint if exists app_settings_plan_check;
@@ -1333,6 +1342,14 @@ begin
   -- v1.17: 처리한 지 1년 지난 신고 기록 삭제 (앱을 여는 김에 정리 — 따로 예약 작업이 필요 없게)
   if to_regclass('private.reports') is not null then
     execute 'delete from private.reports where status = ''done'' and handled_at < now() - interval ''1 year''';
+  end if;
+  -- v1.21: 보관 기간이 지난 글 지우기 (2분에 한 번, 조금씩 — 따로 예약 작업이 필요 없게)
+  --        정리가 늦어지거나 실패해도 앱 열기(접속 기록)는 그대로 되게 따로 감쌈
+  if to_regprocedure('public.purge_old_messages(integer, boolean)') is not null then
+    begin
+      perform public.purge_old_messages(1000, false);
+    exception when query_canceled or others then null;
+    end;
   end if;
 end;
 $$;
@@ -2682,12 +2699,93 @@ returns boolean language sql stable security definer set search_path = public, p
                   where q.bucket = p_bucket and q.name = p_name and q.at > now() - interval '10 minutes');
 $$;
 
+-- v1.21: 대화(글) 보관 기간(일). 0 = 기간 없이 계속 보관
+create or replace function public.msg_keep_days()
+returns integer language sql stable security definer set search_path = public, private as $$
+  select coalesce((select msg_keep_days from private.app_settings where id = 1), 90);
+$$;
+
+-- 이 시각보다 먼저 보낸 글은 보관 기간이 지남 (보관 기간이 없거나 적용 시작 후 아직 기간이 안 지났으면 null)
+create or replace function public.msg_cutoff()
+returns timestamptz language sql stable security definer set search_path = public, private as $$
+  select case when s.msg_keep_days > 0 and s.msg_keep_from < now() - make_interval(days => s.msg_keep_days)
+              then now() - make_interval(days => s.msg_keep_days) end
+    from private.app_settings s where s.id = 1;
+$$;
+
+-- 지울 수 있는 글만 따로 (오래된 것부터 빨리 찾기 — 공지사항·파일이 남은 사진 메시지가 많아져도 느려지지 않게)
+create index if not exists messages_purge_idx on public.messages(created_at)
+  where kind not in ('image', 'file') or media_gone_at is not null;
+
+-- 보관 기간이 지난 글을 서버에서 지움 (한 번에 p_limit 개까지, 오래된 것부터)
+--   · 공지사항 방의 글, 처리 전 신고에 걸린 글은 남김
+--   · 사진·파일 메시지는 파일이 먼저 지워진 뒤에 지움 (파일이 남은 채 메시지만 없어지지 않게 — 사진·파일 보관 기간을 따름)
+--   · p_force = false 면 2분에 한 번만 실제로 지움 (회원 앱이 열릴 때마다 불리므로)
+--   · 동시에 한 곳에서만 지움 (다른 곳이 지우는 중이면 기다리지 않고 바로 끝냄)
+create or replace function public.purge_old_messages(p_limit integer default 1000, p_force boolean default false)
+returns integer language plpgsql security definer set search_path = public, private as $$
+declare
+  v_cut   timestamptz := public.msg_cutoff();
+  v_total integer := 0;
+  v_n     integer;
+  v_lim   integer := least(greatest(coalesce(p_limit, 1000), 1), 20000);
+  v_start timestamptz := clock_timestamp();
+begin
+  if v_cut is null then return 0; end if;
+  if not pg_try_advisory_xact_lock(7270121) then return 0; end if;
+  if not coalesce(p_force, false) then
+    update private.app_settings set msg_purged_at = now()
+     where id = 1 and (msg_purged_at is null or msg_purged_at < now() - interval '2 minutes');
+    if not found then return 0; end if;
+  end if;
+  loop   -- 5천 개씩 나눠 지움 (5초가 넘으면 멈추고 다음에 이어서)
+    with d as (
+      delete from messages g
+       where g.id in (
+         select x.id from messages x
+          where x.created_at < v_cut
+            and (x.kind not in ('image', 'file') or x.media_gone_at is not null)
+            and not exists (select 1 from rooms r where r.id = x.room_id and r.is_notice)
+            and not exists (select 1 from private.reports p where p.message_id = x.id and p.status = 'open')
+          order by x.created_at
+          limit least(5000, v_lim - v_total))
+      returning g.id
+    )
+    select count(*) into v_n from d;
+    v_total := v_total + v_n;
+    exit when v_n = 0 or v_total >= v_lim or clock_timestamp() - v_start > interval '5 seconds';
+  end loop;
+  -- 채팅 목록 미리보기에 남은 옛 글도 비움 (마지막 글이 지워진 방만)
+  if v_total > 0 then
+    update rooms r set last_message = ''
+     where r.id in (select x.id from rooms x
+                     where not x.is_notice and x.last_message_at < v_cut and coalesce(x.last_message, '') <> ''
+                       and not exists (select 1 from messages m
+                                        where m.room_id = x.id and m.kind <> 'system'
+                                          and m.created_at >= x.last_message_at - interval '1 second')
+                     limit 5000);
+  end if;
+  return v_total;
+end;
+$$;
+
+-- 관리자: 지금 바로 정리 (한 번에 2만 개까지, 5초 안에서)
+create or replace function public.admin_purge_messages()
+returns integer language plpgsql security definer set search_path = public as $$
+begin
+  perform public.admin_guard();
+  return public.purge_old_messages(20000, true);
+end;
+$$;
+
 -- 앱이 처음에 받는 설정 (보관 기간 → 지난 사진·파일을 '보관 기간 지남' 으로 표시)
 create or replace function public.app_info()
 returns jsonb language sql stable security definer set search_path = public, private as $$
   select jsonb_build_object('media_keep_days', public.media_keep_days(),
                             'media_keep_from', (select media_keep_from from private.app_settings where id = 1),
-                            'db_version', '1.20');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
+                            'msg_keep_days', public.msg_keep_days(),
+                            'msg_keep_from', (select msg_keep_from from private.app_settings where id = 1),
+                            'db_version', '1.21');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
 $$;
 
 -- 회원 앱: 내 방에서 보관 기간이 지난 사진·파일을 몇 개씩 받아 저장 공간에서 지움
@@ -2769,8 +2867,9 @@ drop function if exists public.admin_usage();
 create or replace function public.admin_usage()
 returns jsonb language plpgsql stable security definer set search_path = public, private as $$
 declare
-  v_cut timestamptz := public.media_cutoff();
-  v_st  jsonb;
+  v_cut  timestamptz := public.media_cutoff();
+  v_mcut timestamptz := public.msg_cutoff();
+  v_st   jsonb;
   v_up  bigint; v_exn bigint; v_exb bigint;
 begin
   perform public.admin_guard();
@@ -2797,21 +2896,37 @@ begin
     'storage',       v_st,
     'upload_24h',    v_up,
     'expired_files', v_exn,
-    'expired_bytes', v_exb);
+    'expired_bytes', v_exb,
+    'msg_keep_days', public.msg_keep_days(),
+    'old_msgs',      case when v_mcut is null then 0
+                          else (select count(*) from (select 1 from messages x
+                                 where x.created_at < v_mcut
+                                   and (x.kind not in ('image', 'file') or x.media_gone_at is not null)
+                                   and not exists (select 1 from rooms r where r.id = x.room_id and r.is_notice)
+                                   and not exists (select 1 from private.reports p where p.message_id = x.id and p.status = 'open')
+                                 limit 100001) z) end);   -- purge_old_messages 가 지울 것과 같은 조건
 end;
 $$;
 
--- 관리자: 보관 기간 · 기준 요금제 바꾸기 (null 이면 그대로)
-create or replace function public.admin_set_usage_settings(p_keep_days integer, p_plan text)
+-- 관리자: 보관 기간(사진·파일 / 대화 글) · 기준 요금제 바꾸기 (null 이면 그대로)
+drop function if exists public.admin_set_usage_settings(integer, text);
+create or replace function public.admin_set_usage_settings(p_keep_days integer, p_plan text, p_msg_keep_days integer default null)
 returns void language plpgsql security definer set search_path = public, private as $$
 begin
   perform public.admin_guard();
   if p_keep_days is not null then
     if p_keep_days not in (0, 3, 7, 14, 30, 90, 180, 365) then raise exception '보관 기간을 다시 골라 주세요'; end if;
-    -- '기간 없이' 였다가 기간을 정하면 지금부터 적용 (그동안 올린 파일도 정한 기간만큼은 남김)
+    -- 기간을 새로 정하거나 줄이면 지금부터 적용 (이미 있는 파일도 새 기간만큼은 남김 → 회원에게 알릴 시간)
     update private.app_settings
-       set media_keep_from = case when media_keep_days = 0 and p_keep_days > 0 then now() else media_keep_from end,
+       set media_keep_from = case when p_keep_days > 0 and (media_keep_days = 0 or p_keep_days < media_keep_days) then now() else media_keep_from end,
            media_keep_days = p_keep_days
+     where id = 1;
+  end if;
+  if p_msg_keep_days is not null then
+    if p_msg_keep_days not in (0, 7, 14, 30, 90, 180, 365) then raise exception '대화 보관 기간을 다시 골라 주세요'; end if;
+    update private.app_settings
+       set msg_keep_from = case when p_msg_keep_days > 0 and (msg_keep_days = 0 or p_msg_keep_days < msg_keep_days) then now() else msg_keep_from end,
+           msg_keep_days = p_msg_keep_days
      where id = 1;
   end if;
   if p_plan is not null then
@@ -2931,7 +3046,7 @@ declare
     'reply_inquiry(bigint, text)', 'close_inquiry(bigint)',
     'admin_suspend(uuid, integer, text)', 'admin_set_note(uuid, text)', 'admin_dashboard()', 'admin_badges()',
     'admin_member_page(text, text, text, integer, integer)', 'admin_member_detail(uuid)', 'admin_list_inquiries(text, integer, integer)',
-    'app_info()', 'expired_media(integer)', 'admin_expired_media(integer)', 'admin_usage()', 'admin_set_usage_settings(integer, text)'];
+    'app_info()', 'expired_media(integer)', 'admin_expired_media(integer)', 'admin_usage()', 'admin_set_usage_settings(integer, text, integer)', 'admin_purge_messages()'];
   helper_fns text[] := array[
     'is_active()', 'is_active_user(uuid)', 'is_admin()', 'is_room_member(uuid)', 'is_room_member_text(text)',
     'shares_room_with(uuid)', 'is_notice_room(uuid)', 'admin_guard()',
@@ -2939,7 +3054,7 @@ declare
     'valid_file_msg(text, uuid, uuid)', 'valid_contact_msg(text)', 'valid_image_msg(text, uuid, uuid)',
     'can_see_message(uuid, bigint)', 'can_read_chat_object(text)', 'can_cleanup_folder(text)', 'is_orphan_folder(text)',
     'admin_can_view_reported(text)', 'admin_can_purge(text)', 'kst_today()', 'media_keep_days()', 'media_cutoff()', 'chat_object_expired(timestamptz)',
-    'media_under_report(text)', 'admin_can_purge_media(text, text)'];
+    'media_under_report(text)', 'admin_can_purge_media(text, text)', 'msg_keep_days()', 'msg_cutoff()'];
 begin
   foreach f in array user_fns || helper_fns loop
     execute format('revoke execute on function public.%s from public, anon', f);
@@ -2957,6 +3072,8 @@ begin
   execute 'revoke execute on function public.lift_expired_suspensions(uuid) from public, anon, authenticated';
   execute 'revoke execute on function public.notify_admins_inquiry() from public, anon, authenticated';
   execute 'grant execute on function public.invite_preview(text) to anon';   -- 로그인 전 초대 화면용
+  execute 'revoke execute on function public.purge_old_messages(integer, boolean) from public, anon, authenticated';   -- v1.21 내부용
+  execute 'grant execute on function public.app_info() to anon';   -- v1.21: 약관 페이지가 보관 기간을 보여 주게 (설정값만 있음)
 end;
 $$;
 

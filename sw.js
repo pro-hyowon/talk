@@ -1,5 +1,5 @@
 // 끼리톡 서비스 워커 — 앱 화면 캐시(오프라인에서도 열림) + 푸시 알림 수신·클릭 처리
-const CACHE = 'kkiritalk-v1.20.2';
+const CACHE = 'kkiritalk-v1.23';
 const SHELL = [
   './',
   './index.html',
@@ -13,6 +13,8 @@ const SHELL = [
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
+  './sounds/kkitok.mp3',          // v1.23: 끼톡 알림음
+  './sounds/kkitok-melody.mp3',
 ];
 
 self.addEventListener('install', (e) => {

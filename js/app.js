@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.20.2';
+const VERSION = '1.23';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -54,6 +54,8 @@ const S = {
   keepDays: 0,   // v1.19: 채팅 사진·파일 보관 기간(일). 0 = 계속 보관 (또는 데이터베이스가 예전 버전)
   keepFrom: 0,   // v1.19: 보관 기간을 적용하기 시작한 때(ms). 그 전에 올린 파일도 이때부터 보관 기간만큼은 남음
   dbVersion: null,   // v1.20.2: 설치된 데이터베이스(schema.sql) 버전 — 앱보다 예전이면 관리자에게 안내
+  msgKeepDays: 0,    // v1.21: 대화(글) 보관 기간(일). 0 = 계속 보관
+  msgKeepFrom: 0,    // v1.21: 대화 보관 기간을 적용하기 시작한 때(ms)
   admin: null,
   adminFromMore: false,
   lastTouch: 0,
@@ -501,7 +503,17 @@ async function loadAppInfo() {
     S.keepDays = i && Number(i.media_keep_days) > 0 ? Number(i.media_keep_days) : 0;
     S.keepFrom = i && i.media_keep_from ? Date.parse(i.media_keep_from) || 0 : 0;
     S.dbVersion = i && i.db_version ? String(i.db_version) : null;
-  } catch { S.keepDays = 0; S.keepFrom = 0; S.dbVersion = null; }
+    S.msgKeepDays = i && Number(i.msg_keep_days) > 0 ? Number(i.msg_keep_days) : 0;
+    S.msgKeepFrom = i && i.msg_keep_from ? Date.parse(i.msg_keep_from) || 0 : 0;
+  } catch { S.keepDays = 0; S.keepFrom = 0; S.dbVersion = null; S.msgKeepDays = 0; S.msgKeepFrom = 0; }
+}
+// v1.21: 보관 기간 안내 (v1.22: 대화방 메뉴(삼선)에서 보여 줌)
+function keepNoteText() {
+  if (!S.room || isNoticeRoom() || (!S.msgKeepDays && !S.keepDays)) return '';
+  const parts = [];
+  if (S.msgKeepDays) parts.push(`대화는 ${S.msgKeepDays}일`);
+  if (S.keepDays) parts.push(`사진·파일은 ${S.keepDays}일`);
+  return `${parts.join(', ')} 동안 보관되고, 지나면 서버에서 자동으로 지워져요. 중요한 내용은 따로 저장해 두세요`;
 }
 // 보관 기간이 지나 저장 공간에서 지워진(또는 곧 지워질) 사진·파일인가?
 function mediaExpired(m) {
@@ -535,6 +547,128 @@ async function sweepExpired() {
   if (S.entered && S.me && S.me.is_admin && api.adminExpiredMedia && sweepDue('kkiri-sweep-admin:' + S.uid, 12 * 3600e3)) {
     cleanExpired(true);
   }
+}
+
+// ---------------------------------------------------------------------
+// v1.22: 알림 소리 — 앱을 보고 있을 때 울릴 소리를 고름 (기기마다 저장)
+//   앱을 닫아 두었을 때 오는 휴대폰 알림의 소리는 웹앱이 정할 수 없어 휴대폰 설정에서 고르도록 안내
+// ---------------------------------------------------------------------
+const SOUNDS = [['kkitok', '끼톡! (기본)'], ['kkitok2', '끼톡 멜로디'], ['dingdong', '띵동'], ['pop', '뽁'], ['chime', '차임벨'], ['tok', '톡톡'], ['bell', '맑은 종'], ['none', '소리 없음']];
+// v1.23: 끼리톡 전용 알림음 (파일) — 휴대폰 알림음으로도 쓸 수 있게 내려받기 제공
+const SOUND_FILES = { kkitok: ['./sounds/kkitok.mp3', 'kkitok.mp3'], kkitok2: ['./sounds/kkitok-melody.mp3', 'kkitok-melody.mp3'] };
+const soundBufs = new Map();
+async function loadSoundBuf(name) {
+  if (soundBufs.has(name)) return soundBufs.get(name);
+  const ctx = getAudio(); if (!ctx || !SOUND_FILES[name]) return null;
+  const p = fetch(SOUND_FILES[name][0]).then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error('sound'))))
+    .then((ab) => new Promise((res, rej) => { const q = ctx.decodeAudioData(ab, res, rej); if (q && q.then) q.then(res, rej); }))
+    .catch(() => { soundBufs.delete(name); return null; });
+  soundBufs.set(name, p);
+  return p;
+}
+const SOUND_KEY = 'kkiri-sound'; const VIB_KEY = 'kkiri-vibrate';
+const soundLabel = (k) => (SOUNDS.find((x) => x[0] === k) || SOUNDS[0])[1];
+function soundPref() { try { const v = localStorage.getItem(SOUND_KEY); return SOUNDS.some((x) => x[0] === v) ? v : 'kkitok'; } catch { return S.sound || 'kkitok'; } }
+function vibratePref() { try { return localStorage.getItem(VIB_KEY) !== '0'; } catch { return S.vibrate !== false; } }
+function setSoundPref(k) { S.sound = k; try { localStorage.setItem(SOUND_KEY, k); } catch { /* 저장 안 됨 */ } }
+function setVibratePref(on) { S.vibrate = on; try { localStorage.setItem(VIB_KEY, on ? '1' : '0'); } catch { /* 저장 안 됨 */ } }
+let audioCtx = null;
+function getAudio() {
+  if (!audioCtx) { const C = window.AudioContext || window.webkitAudioContext; if (!C) return null; try { audioCtx = new C(); } catch { return null; } }
+  if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  return audioCtx;
+}
+// 휴대폰은 화면을 한 번 눌러야 소리를 낼 수 있어서, 처음 누를 때 미리 준비해 둠
+document.addEventListener('pointerdown', () => { if (!audioCtx) getAudio(); const k = soundPref(); if (SOUND_FILES[k]) loadSoundBuf(k); }, { once: true, capture: true });
+// 소리를 파일 없이 만들어 냄 (음 높이·길이·파형)
+function tone(ctx, freq, start, dur, { type = 'sine', vol = 0.22, to = null } = {}) {
+  const o = ctx.createOscillator(); const g = ctx.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, start);
+  if (to) o.frequency.exponentialRampToValueAtTime(to, start + dur);
+  g.gain.setValueAtTime(0.0001, start);
+  g.gain.exponentialRampToValueAtTime(vol, start + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+  o.connect(g).connect(ctx.destination);
+  o.start(start); o.stop(start + dur + 0.02);
+}
+function playSound(name) {
+  document.documentElement.dataset.lastSound = name;   // (테스트 확인용)
+  if (name === 'none') return;
+  if (SOUND_FILES[name]) {   // 끼톡: 녹음 파일 재생 (못 불러오면 '띵동' 으로 대신)
+    const ctx = getAudio();
+    if (!ctx) { try { const a = new Audio(SOUND_FILES[name][0]); a.volume = 0.9; a.play().catch(() => {}); } catch { /* 없음 */ } return; }
+    loadSoundBuf(name).then((buf) => {
+      if (!buf) { playSound('dingdong'); document.documentElement.dataset.lastSound = name; return; }
+      try { const src = ctx.createBufferSource(); const g = ctx.createGain(); g.gain.value = 0.9; src.buffer = buf; src.connect(g).connect(ctx.destination); src.start(); } catch { /* 없음 */ }
+    });
+    return;
+  }
+  const ctx = getAudio(); if (!ctx) return;
+  const t = ctx.currentTime + 0.01;
+  try {
+    if (name === 'pop') tone(ctx, 1400, t, 0.09, { to: 380, vol: 0.3 });
+    else if (name === 'chime') { [1047, 1319, 1568].forEach((f, i) => tone(ctx, f, t + i * 0.11, 0.45, { type: 'triangle', vol: 0.18 })); }
+    else if (name === 'tok') { tone(ctx, 1800, t, 0.05, { type: 'square', vol: 0.08 }); tone(ctx, 1800, t + 0.12, 0.05, { type: 'square', vol: 0.08 }); }
+    else if (name === 'bell') { tone(ctx, 1568, t, 0.9, { vol: 0.2 }); tone(ctx, 3136, t, 0.5, { vol: 0.05 }); }
+    else { tone(ctx, 880, t, 0.22, { vol: 0.22 }); tone(ctx, 660, t + 0.18, 0.32, { vol: 0.22 }); }   // 띵동
+  } catch { /* 소리를 못 내는 기기 */ }
+}
+let lastAlertAt = 0;
+function alertFeedback() {
+  if (Date.now() - lastAlertAt < 1200) return;   // 한꺼번에 여러 개 와도 한 번만
+  lastAlertAt = Date.now();
+  playSound(soundPref());
+  if (vibratePref() && navigator.vibrate) { try { navigator.vibrate([60, 50, 60]); } catch { /* 없음 */ } }
+}
+function phoneKind() {
+  const ua = navigator.userAgent || '';
+  if (/iPhone|iPad|iPod/i.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) return 'ios';
+  if (/Android/i.test(ua)) return /SM-|Samsung/i.test(ua) ? 'samsung' : 'android';
+  return 'pc';
+}
+const PHONE_GUIDE = {
+  samsung: ['갤럭시', `<ol><li>휴대폰 <b>설정</b> → <b>애플리케이션</b> → <b>${esc(APP)}</b></li><li><b>알림</b> → <b>알림 카테고리</b>(또는 '일반 알림')를 누름</li><li><b>소리</b>를 눌러 휴대폰 기본 알림음이나 원하는 소리를 고름 (진동도 여기서)</li></ol><p>빠른 방법: 홈 화면의 ${esc(APP)} 아이콘을 길게 누르고 <b>ⓘ(앱 정보)</b> → <b>알림</b></p>`],
+  android: ['안드로이드', `<ol><li>휴대폰 <b>설정</b> → <b>앱</b> → <b>${esc(APP)}</b></li><li><b>알림</b> → 알림 종류(예: '일반')를 누름</li><li><b>소리</b>에서 휴대폰 기본 알림음이나 원하는 소리를 고름</li></ol><p>홈 화면에 설치하지 않고 크롬에서 쓰는 중이면: 설정 → 앱 → <b>Chrome</b> → 알림 → 사이트 목록에서 ${esc(APP)} 주소 → 소리</p>`],
+  ios: ['아이폰', `<p>아이폰은 홈 화면에 추가한 앱의 알림 소리를 따로 고를 수 없고, 아이폰 기본 알림음이 울려요.</p><ol><li><b>설정</b> → <b>알림</b> → <b>${esc(APP)}</b></li><li><b>사운드</b>를 켜거나 끌 수 있어요</li></ol>`],
+  pc: ['컴퓨터', '<p>컴퓨터는 운영체제(윈도우·맥) 알림 설정에서 브라우저 알림 소리를 바꿀 수 있어요.</p>'],
+};
+function showSoundSettings() {
+  const kind = phoneKind();
+  const canVib = 'vibrate' in navigator && kind !== 'ios' && kind !== 'pc';
+  openSheet({
+    title: '알림 소리',
+    body: `<div class="snd-sec">앱을 보고 있을 때</div>
+      <p class="sheet-desc" style="margin-top:0">${esc(APP)}을 켜 둔 채 다른 화면을 보고 있을 때 새 메시지가 오면 울려요. 눌러서 들어 보세요.</p>
+      <div class="card snd-list">${SOUNDS.map(([k, l]) => `<button class="snd-row ${soundPref() === k ? 'on' : ''}" data-snd="${k}" role="radio" aria-checked="${soundPref() === k}"><span>${esc(l)}</span><span class="ck">${ic('check', 16)}</span></button>`).join('')}
+        ${canVib ? `<div class="snd-row vib"><span>진동도 함께</span><button class="switch ${vibratePref() ? 'on' : ''}" data-vib role="switch" aria-checked="${vibratePref()}" aria-label="진동"></button></div>` : ''}</div>
+      <div class="snd-sec">앱을 닫아 두었을 때 (휴대폰 알림)</div>
+      <p class="sheet-desc" style="margin-top:0">휴대폰에 뜨는 알림의 소리는 <b>휴대폰 설정</b>에서 바꿀 수 있어요. 휴대폰 기본 알림음이나 다른 소리를 고를 수 있어요.</p>
+      <div class="snd-guide"><b>${PHONE_GUIDE[kind][0]}</b>${PHONE_GUIDE[kind][1]}</div>
+      ${kind === 'ios' ? '' : `<div class="snd-sec">휴대폰 알림음을 '끼톡!' 으로 바꾸기</div>
+      <p class="sheet-desc" style="margin-top:0">소리 파일을 받아 두면 위 방법의 <b>소리</b> 화면에서 고를 수 있어요. (목록 맨 위의 <b>+</b> 또는 <b>내 소리 추가</b>를 누르고 '다운로드(Download)' 폴더의 kkitok 파일 선택)</p>
+      <div class="snd-dl">${Object.entries(SOUND_FILES).map(([k, [u, fn]]) => `<a class="btn line sm" href="${u}" download="${fn}" data-dl="${k}">${ic('download', 16)}${esc(soundLabel(k).replace(' (기본)', ''))} 받기</a>`).join('')}</div>`}
+      <details class="snd-other"><summary>다른 휴대폰은?</summary>${Object.entries(PHONE_GUIDE).filter(([k]) => k !== kind && k !== 'pc').map(([, [n, h]]) => `<div class="snd-guide"><b>${n}</b>${h}</div>`).join('')}</details>
+      <button class="btn" data-close style="margin-top:14px">확인</button>`,
+    onMount(sheet) {
+      sheet.addEventListener('click', (e) => {
+        const r = e.target.closest('[data-snd]');
+        if (r) {
+          setSoundPref(r.dataset.snd);
+          $$('[data-snd]', sheet).forEach((b) => { const on = b === r; b.classList.toggle('on', on); b.setAttribute('aria-checked', on); });
+          playSound(r.dataset.snd);
+          if (S.tab === 'more' && !S.room) renderMain();
+          return;
+        }
+        const v = e.target.closest('[data-vib]');
+        if (v) {
+          const on = !vibratePref(); setVibratePref(on);
+          v.classList.toggle('on', on); v.setAttribute('aria-checked', on);
+          if (on && navigator.vibrate) { try { navigator.vibrate([60, 50, 60]); } catch { /* 없음 */ } }
+          if (S.tab === 'more' && !S.room) renderMain();
+        }
+      });
+    },
+  });
 }
 
 // v1.18.2: 아직 알림 권한을 묻지 않은 기기면 들어오자마자 한 번 안내 → "알림 받기" 한 번이면 켜짐
@@ -857,6 +991,7 @@ function renderMore(head, body) {
       <button class="item" data-act="change-password"><span class="tile lav">${ic('lock', 19)}</span><span class="label">비밀번호 변경</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <div class="item"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림<span class="sub">${notifSub(on)}</span></span>
         <button class="switch ${on ? 'on' : ''}" data-act="notif" role="switch" aria-checked="${on}" aria-label="새 메시지 알림"></button></div>
+      <button class="item" data-act="notif-sound"><span class="tile lemon">${ic('bell', 19)}</span><span class="label">알림 소리<span class="sub">${esc(soundLabel(soundPref()))}${vibratePref() && 'vibrate' in navigator ? ' · 진동' : ''} · 휴대폰 알림음 바꾸기</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       ${isStandalone() ? '' : `<button class="item" data-act="install"><span class="tile mint">${ic('install', 19)}</span><span class="label">홈 화면에 설치</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>`}
     </div>
     <div class="card">
@@ -2486,6 +2621,7 @@ function maybeNotify(m) {
     }
   } else {
     toastMsg({ person: r && r.is_notice ? null : (sender || { id: m.sender_id, display_name: '?' }), title, body: text.split('\n')[0], onClick: () => goRoom(m.room_id) });
+    alertFeedback();   // v1.22: 앱을 보고 있을 때 고른 알림 소리·진동
   }
 }
 
@@ -2664,6 +2800,7 @@ function onFriend(p) {
     return;
   }
   toastMsg({ person, title: '친구 요청', body: text, onClick: () => go('#/friends') });
+  alertFeedback();
 }
 // 실시간: 단체방에서 내보내짐
 function onKicked(p) { kickedOut(p.room_id, p.title); }
@@ -2754,6 +2891,7 @@ function showRoomMenu() {
     body: `<button class="menu-row invite bleed" data-x="invite" style="width:calc(100% + 40px)"><span class="circ">${ic('userplus', 22)}</span><span>대화상대 초대${R.info.is_group ? '' : '<span class="sub">새 단체방으로 만들어져요</span>'}</span></button>
       <div class="card-line mute-line"><span class="label">${ic(isMuted(R.id) ? 'belloff' : 'bell', 20, 'flex:none;vertical-align:-4px;margin-right:8px')}이 채팅방 알림<span class="sub">끄면 새 메시지가 와도 알림이 울리지 않아요. 안 읽은 숫자는 그대로 보여요</span></span>
         <button class="switch ${isMuted(R.id) ? '' : 'on'}" data-x="mute" role="switch" aria-checked="${!isMuted(R.id)}" aria-label="이 채팅방 알림"></button></div>
+      ${keepNoteText() ? `<div class="keep-info">${ic('clock', 18, 'flex:none')}<span><b>보관 기간 안내</b>${esc(keepNoteText())}</span></div>` : ''}
       <div class="sec" style="padding:12px 0 4px">참여자 ${members.length}</div>
       <div class="bleed">${members.map((p) => `<div class="menu-row mem"><button class="mem-main" data-x="profile" data-id="${esc(p.id)}">${av(p, 42)}<span style="font-size:15px">${esc(p.display_name)}</span>${p.id === S.uid ? '<span class="chip me">나</span>' : ''}${R.info.is_group && p.id === R.info.created_by ? '<span class="chip owner">방장</span>' : ''}</button>
         ${canKick && p.id !== S.uid ? `<button class="kick-btn" data-x="kick" data-id="${esc(p.id)}">내보내기</button>` : ''}</div>`).join('')}</div>
@@ -2996,7 +3134,7 @@ async function renderHomeSec() {
 }
 
 // ---------- v1.20.2: 데이터베이스(schema.sql) 버전 확인 ----------
-const DB_VERSION_NEEDED = '1.20';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
+const DB_VERSION_NEEDED = '1.21';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
 const verNum = (v) => String(v || '0').split('.').reduce((a, x, i) => a + (Number(x) || 0) / (1000 ** i), 0);
 const dbOutdated = () => verNum(S.dbVersion) < verNum(DB_VERSION_NEEDED);
 function dbUpdateCard() {
@@ -3013,6 +3151,7 @@ const PLAN_LIMITS = {
 const BYTES_PER_MSG = 350;   // 메시지 1개가 데이터베이스에서 차지하는 대략적인 크기 (색인 포함, 실측 약 300바이트)
 const RT_PER_MSG = 6;        // 1:1 대화 기준 메시지 1개당 실시간 전달 수 (메시지·보낸 사람 읽음·상대 읽음 각각 보내기+받기)
 const KEEP_OPTIONS = [[3, '3일'], [7, '7일'], [14, '14일'], [30, '30일'], [90, '90일'], [0, '기간 없이 보관']];
+const MSG_KEEP_OPTIONS = [[7, '7일'], [14, '14일'], [30, '30일'], [90, '90일'], [180, '180일'], [365, '1년'], [0, '기간 없이 보관']];   // v1.21
 function fmtBytes(n) {
   n = Number(n) || 0;
   return n >= 1024 ** 3 ? `${(n / 1024 ** 3).toFixed(n >= 10 * 1024 ** 3 ? 0 : 1).replace(/\.0$/, '')}GB` : fmtSize(n);
@@ -3031,6 +3170,7 @@ function usageHtml(u) {
   const storage = Object.values(st).reduce((a, x) => a + (Number(x.bytes) || 0), 0);
   const chat = ['chat-images', 'chat-files'].reduce((a, b) => a + (st[b] ? Number(st[b].bytes) || 0 : 0), 0);
   const keep = Number(u.keep_days) || 0;
+  const msgKeep = Number(u.msg_keep_days) || 0;   // v1.21
   const dbDay = (Number(u.msgs_24h) || 0) * BYTES_PER_MSG;
   const dbLeft = dbDay > 0 ? Math.max(0, Math.floor((L.db - Number(u.db_bytes)) / dbDay)) : null;
   const steady = storage - chat + (Number(u.upload_24h) || 0) * keep;
@@ -3045,7 +3185,9 @@ function usageHtml(u) {
   };
   const rows = [
     bar('대화 내용 저장', Number(u.db_bytes), L.db, `${fmtBytes(u.db_bytes)} / ${fmtBytes(L.db)}`,
-      dbDay > 0 ? `하루 약 ${fmtBytes(dbDay)}씩 늘어요${dbLeft !== null ? (dbLeft > 3650 ? ' · 한참 여유 있어요' : ` · 이 속도면 약 ${dbLeft.toLocaleString()}일 뒤 가득 차요`) : ''}` : ''),
+      (msgKeep && dbDay > 0 ? `하루 약 ${fmtBytes(dbDay)}씩 늘고, 대화 ${msgKeep}일 보관이면 글은 약 ${fmtBytes(dbDay * msgKeep)} 정도로 유지돼요`
+        : dbDay > 0 ? `하루 약 ${fmtBytes(dbDay)}씩 늘어요${dbLeft !== null ? (dbLeft > 3650 ? ' · 한참 여유 있어요' : ` · 이 속도면 약 ${dbLeft.toLocaleString()}일 뒤 가득 차요`) : ''}` : (msgKeep ? `대화 ${msgKeep}일 보관` : ''))
+      + (Number(u.old_msgs) ? `<br><b>기간 지난 대화 ${Number(u.old_msgs) > 100000 ? '10만' : Number(u.old_msgs).toLocaleString()}개${Number(u.old_msgs) > 100000 ? ' 이상' : ''}</b> 정리 대기 <button class="link-btn" data-act="admin-purge-msgs">지금 정리</button>` : '')),
     bar('사진·파일 저장', storage, L.storage, `${fmtBytes(storage)} / ${fmtBytes(L.storage)}`,
       `최근 24시간 ${fmtBytes(u.upload_24h)} 올라옴 · ${keep ? `${keep}일 보관이면 약 ${fmtBytes(steady)} 정도로 유지돼요` : '보관 기간이 없어 계속 늘어나요'}`
       + (Number(u.expired_files) ? `<br><b>기간 지난 파일 ${Number(u.expired_files).toLocaleString()}개 (${fmtBytes(u.expired_bytes)})</b> 정리 대기 <button class="link-btn" data-act="admin-clean-expired">지금 정리</button>` : '')),
@@ -3436,11 +3578,26 @@ function renderOpsSec() {
       <div class="item" style="padding-top:14px;padding-bottom:14px"><span class="tile lav">${ic('image', 19)}</span><span class="label">사진·파일 보관 기간<span class="sub">지나면 저장 공간에서 지워져요</span></span>
         <select id="keepDays" class="adm-select" style="width:auto;max-width:36%" aria-label="사진·파일 보관 기간">${(KEEP_OPTIONS.some(([v]) => v === S.keepDays) ? KEEP_OPTIONS : [...KEEP_OPTIONS, [S.keepDays, `${S.keepDays}일`]]).map(([v, l]) => `<option value="${v}" ${S.keepDays === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
       <button class="item" data-act="admin-clean-expired" style="padding-top:14px;padding-bottom:14px"><span class="tile peach">${ic('file', 19)}</span><span class="label">기간 지난 사진·파일 정리<span class="sub">관리자 앱이 하루 두 번 알아서 해요. 지금 바로 하려면 누르세요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <div class="item" style="padding-top:14px;padding-bottom:14px"><span class="tile sky">${ic('chat', 19)}</span><span class="label">대화(글) 보관 기간<span class="sub">지나면 서버에서 지워져요 (공지사항은 남겨요)</span></span>
+        <select id="msgKeepDays" class="adm-select" style="width:auto;max-width:36%" aria-label="대화 보관 기간">${(MSG_KEEP_OPTIONS.some(([v]) => v === S.msgKeepDays) ? MSG_KEEP_OPTIONS : [...MSG_KEEP_OPTIONS, [S.msgKeepDays, `${S.msgKeepDays}일`]]).map(([v, l]) => `<option value="${v}" ${S.msgKeepDays === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+      <button class="item" data-act="admin-purge-msgs" style="padding-top:14px;padding-bottom:14px"><span class="tile peach">${ic('chat', 19)}</span><span class="label">기간 지난 대화 정리<span class="sub">회원들이 앱을 열 때 알아서 조금씩 지워요. 지금 바로 하려면 누르세요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
     </div></div>`;
+  const msel = $('#msgKeepDays');
+  if (msel) msel.onchange = async () => {
+    const v = Number(msel.value); const prev = S.msgKeepDays;
+    if (v && v < (prev || Infinity) && !(await ask(prev ? `대화 보관 기간을 ${v}일로 줄일까요?` : `대화를 ${v}일 동안만 보관할까요?`,
+      `지금 있는 대화는 오늘부터 ${v}일 동안 남겨 두고, 그 뒤부터 ${v}일이 지난 대화(글)를 서버에서 지워요. 지운 대화는 되돌릴 수 없어요. 회원들에게 미리 공지해 주세요.`,
+      prev ? '줄이기' : '기간 정하기', true))) { msel.value = String(prev); return; }
+    try {
+      await api.adminSetUsageSettings({ msgKeepDays: v });
+      await loadAppInfo(); if (S.admin) S.admin.usage = null;
+      toast(v ? `대화를 ${v}일 동안 보관해요` : '대화를 기간 없이 보관해요');
+    } catch (e) { msel.value = String(prev); showErr(e); }
+  };
   const sel = $('#keepDays');
   if (sel) sel.onchange = async () => {
     const v = Number(sel.value); const prev = S.keepDays;
-    if (v && v < (prev || Infinity) && !(await ask(`보관 기간을 ${v}일로 줄일까요?`, prev ? `${v}일이 지난 사진·파일은 곧 지워지고 되돌릴 수 없어요.` : `지금 있는 사진·파일은 오늘부터 ${v}일 동안 남겨 두고, 그 뒤에 지워져요. 회원들에게 미리 공지해 주세요.`, prev ? '줄이기' : '기간 정하기', true))) { sel.value = String(prev); return; }
+    if (v && v < (prev || Infinity) && !(await ask(`보관 기간을 ${v}일로 줄일까요?`, `지금 있는 사진·파일은 오늘부터 ${v}일 동안 남겨 두고, 그 뒤부터 ${v}일이 지난 것을 지워요. 지운 파일은 되돌릴 수 없어요. 회원들에게 미리 공지해 주세요.`, prev ? '줄이기' : '기간 정하기', true))) { sel.value = String(prev); return; }
     try {
       await api.adminSetUsageSettings({ keepDays: v });
       S.keepDays = v; await loadAppInfo(); if (S.admin) S.admin.usage = null;
@@ -3925,6 +4082,19 @@ app.addEventListener('click', async (e) => {
     case 'admin-notice': showBroadcast(); break;
     case 'admin-clean': cleanOrphans(false, el); break;
     case 'admin-clean-expired': cleanExpired(false, el); break;
+    case 'notif-sound': showSoundSettings(); break;   // v1.22
+    case 'admin-purge-msgs': {   // v1.21
+      if (!S.msgKeepDays) { toast('대화 보관 기간이 \'기간 없이\' 로 되어 있어요'); break; }
+      if (!(await ask('기간 지난 대화를 지금 지울까요?', `보낸 지 ${S.msgKeepDays}일이 지난 대화(글)를 서버에서 지워요. 되돌릴 수 없어요.`, '지우기', true))) break;
+      el.disabled = true;
+      try {
+        const n = await api.adminPurgeMessages();
+        toast(n ? `지난 대화 ${n.toLocaleString()}개를 지웠어요${n >= 20000 ? ' (남은 것은 한 번 더 눌러 주세요)' : ''}` : '지울 대화가 없어요');
+        if (S.admin) S.admin.usage = null;
+      } catch (ex) { showErr(ex); }
+      if (el.isConnected) el.disabled = false;
+      break;
+    }
     case 'admin-plan': {
       const plan = el.dataset.p; if (!S.admin || !S.admin.usage || S.admin.usage.plan === plan) break;
       try { await api.adminSetUsageSettings({ plan }); S.admin.usage.plan = plan; const b = $('#admUsage'); if (b) b.innerHTML = usageHtml(S.admin.usage); }
