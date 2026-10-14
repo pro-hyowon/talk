@@ -2686,7 +2686,8 @@ $$;
 create or replace function public.app_info()
 returns jsonb language sql stable security definer set search_path = public, private as $$
   select jsonb_build_object('media_keep_days', public.media_keep_days(),
-                            'media_keep_from', (select media_keep_from from private.app_settings where id = 1));
+                            'media_keep_from', (select media_keep_from from private.app_settings where id = 1),
+                            'db_version', '1.20');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
 $$;
 
 -- 회원 앱: 내 방에서 보관 기간이 지난 사진·파일을 몇 개씩 받아 저장 공간에서 지움

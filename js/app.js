@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.20.1';
+const VERSION = '1.20.2';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -53,6 +53,7 @@ const S = {
   pushOn: false,
   keepDays: 0,   // v1.19: 채팅 사진·파일 보관 기간(일). 0 = 계속 보관 (또는 데이터베이스가 예전 버전)
   keepFrom: 0,   // v1.19: 보관 기간을 적용하기 시작한 때(ms). 그 전에 올린 파일도 이때부터 보관 기간만큼은 남음
+  dbVersion: null,   // v1.20.2: 설치된 데이터베이스(schema.sql) 버전 — 앱보다 예전이면 관리자에게 안내
   admin: null,
   adminFromMore: false,
   lastTouch: 0,
@@ -499,7 +500,8 @@ async function loadAppInfo() {
     const i = await api.appInfo();
     S.keepDays = i && Number(i.media_keep_days) > 0 ? Number(i.media_keep_days) : 0;
     S.keepFrom = i && i.media_keep_from ? Date.parse(i.media_keep_from) || 0 : 0;
-  } catch { S.keepDays = 0; S.keepFrom = 0; }
+    S.dbVersion = i && i.db_version ? String(i.db_version) : null;
+  } catch { S.keepDays = 0; S.keepFrom = 0; S.dbVersion = null; }
 }
 // 보관 기간이 지나 저장 공간에서 지워진(또는 곧 지워질) 사진·파일인가?
 function mediaExpired(m) {
@@ -2971,6 +2973,7 @@ async function renderHomeSec() {
   ].filter((t) => t[2] > 0);
   admMain().innerHTML = `<div class="adm-sec">
     <div class="adm-h"><h2>현황</h2><span class="adm-date">${fmtDate(new Date().toISOString())}</span></div>
+    ${dbOutdated() ? dbUpdateCard() : ''}
     <div class="kpis">
       ${tile('전체 회원', d.total, `사용 중 ${d.active} · 정지 ${d.suspended}`, 'members')}
       ${tile('오늘 접속', d.today_active, `7일 ${d.active_7d} · 30일 ${d.active_30d}`)}
@@ -2990,6 +2993,16 @@ async function renderHomeSec() {
     <div class="card adm-card" id="admUsage">${usageHtml(A.usage)}</div>
   </div>`;
   loadUsage();
+}
+
+// ---------- v1.20.2: 데이터베이스(schema.sql) 버전 확인 ----------
+const DB_VERSION_NEEDED = '1.20';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
+const verNum = (v) => String(v || '0').split('.').reduce((a, x, i) => a + (Number(x) || 0) / (1000 ** i), 0);
+const dbOutdated = () => verNum(S.dbVersion) < verNum(DB_VERSION_NEEDED);
+function dbUpdateCard() {
+  return `<div class="db-warn">${ic('alert', 20, 'flex:none')}<div><b>데이터베이스 업데이트가 필요해요</b>
+    <p>앱은 v${esc(VERSION)} 인데 데이터베이스는 ${S.dbVersion ? `v${esc(S.dbVersion)}` : '예전 버전'}이에요. 그래서 일부 기능(친구 삭제 등)이 안 돼요.</p>
+    <ol><li>Supabase 대시보드 → 왼쪽 <b>SQL Editor</b></li><li>새 <b>supabase/schema.sql</b> 파일 내용을 <b>전체</b> 복사해 붙여넣기</li><li><b>Run</b> → 아래에 <b>Success</b> 가 나오면 끝</li><li>앱을 껐다 켜기</li></ol></div></div>`;
 }
 
 // ---------- v1.19: 사용량 (Supabase 요금제 한도와 비교) ----------
@@ -3682,6 +3695,7 @@ async function showConnectFriends(u) {
 
 // v1.20: 관리자: 회원의 친구 삭제 (고른 사람과 양쪽 친구 관계를 모두 끊음)
 async function showRemoveFriends(u) {
+  if (dbOutdated()) { showDbUpdateNeeded(); return; }   // v1.20.2: 데이터베이스가 예전 버전이면 먼저 안내
   let rel;
   try { rel = await api.adminUserFriends(u.id); } catch (e) { showErr(e); return; }
   rel = (rel || []).filter((r) => r.id !== u.id);
@@ -3729,6 +3743,11 @@ async function showRemoveFriends(u) {
       draw();
     },
   });
+}
+
+// v1.20.2: 데이터베이스 업데이트 안내 (관리자용)
+function showDbUpdateNeeded() {
+  openSheet({ title: '데이터베이스 업데이트 필요', body: `${dbUpdateCard()}<button class="btn" data-close style="margin-top:14px">확인</button>` });
 }
 
 // v1.20: 관리자가 내 친구 관계를 끊었을 때 (알림 없이 목록만 바꿈)
