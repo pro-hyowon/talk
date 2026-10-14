@@ -1,8 +1,8 @@
 /* =====================================================================
    끼리톡 v1.3 — 클로드디자인 "끼리톡 UI 디자인 v1" 기준
    ===================================================================== */
-@font-face { font-family: 'GmarketSans'; font-weight: 500; font-display: swap; src: url('https://fastly.jsdelivr.net/gh/projectnoonnu/noonfonts_2001@1.1/GmarketSansMedium.woff') format('woff'); }
-@font-face { font-family: 'GmarketSans'; font-weight: 700; font-display: swap; src: url('https://fastly.jsdelivr.net/gh/projectnoonnu/noonfonts_2001@1.1/GmarketSansBold.woff') format('woff'); }
+@font-face { font-family: 'GmarketSans'; font-weight: 500; font-display: swap; src: url('../fonts/GmarketSansMedium.woff2') format('woff2'); }   /* v1.28: 외부 CDN 대신 앱에 포함 */
+@font-face { font-family: 'GmarketSans'; font-weight: 700; font-display: swap; src: url('../fonts/GmarketSansBold.woff2') format('woff2'); }
 
 :root {
   /* 주요 색 */
@@ -1032,3 +1032,56 @@ html.kb-open .composer { padding-bottom: 8px; }
 .move-card > div { display: flex; gap: 10px; align-items: flex-start; }
 .move-card svg { margin-top: 2px; }
 a.btn { text-decoration: none; }
+
+/* v1.27: 번호 도용·사기 주의 안내 */
+.found .safe-note { margin-top: 14px; display: flex; gap: 8px; align-items: flex-start; text-align: left; font-size: 13px; line-height: 1.5; color: #6B4E00; background: var(--lemon-100); border-radius: 14px; padding: 10px 12px; }
+.found .safe-note svg { margin-top: 1px; }
+.safety-bar { flex: none; display: flex; gap: 10px; align-items: flex-start; margin: 0; padding: 10px 8px 10px 14px; background: var(--lemon-100); color: #5C4300; font-size: 12.5px; line-height: 1.45; border-bottom: 1px solid #F3E2A6; }
+.safety-bar[hidden] { display: none; }
+.safety-bar svg { margin-top: 1px; }
+.safety-bar .tx { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.safety-bar .tx b { font-size: 13px; }
+.safety-bar .x { flex: none; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #8A6A10; margin-top: -4px; }
+.safety-bar .x:active { background: rgba(0,0,0,.06); }
+.claim-btn { width: 100%; margin-top: 12px; display: flex; gap: 6px; }
+
+/* v1.28: 친구 목록 ㄱㄴㄷ 색인 · 초성 검색 */
+.f-search { display: flex; align-items: center; gap: 8px; margin: 2px 16px 6px; padding: 0 6px 0 12px; height: 42px; border-radius: 12px; background: var(--field); }
+.f-search input { flex: 1; min-width: 0; border: 0; background: transparent; font: inherit; font-size: 15px; color: var(--ink); outline: none; height: 100%; }
+.f-search input::-webkit-search-cancel-button { display: none; }
+.f-search .ibtn.sm { width: 30px; height: 30px; }
+.f-search.in-sheet { margin: 8px 0 4px; }
+.idx-sec { padding: 10px 20px 4px; font-size: 13.5px; font-weight: 700; color: var(--mint-text); }
+.idx-bar { position: absolute; right: 0; width: 26px; z-index: 3; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 0; touch-action: none; user-select: none; -webkit-user-select: none; }
+.idx-bar[hidden] { display: none; }
+.idx-bar span { display: block; width: 26px; text-align: center; font-size: 12.5px; line-height: 1.45; font-weight: 700; color: var(--ink3); }
+.idx-bar span.off { color: var(--ink4); font-weight: 500; }
+.idx-bubble { position: absolute; left: 50%; top: 42%; transform: translate(-50%, -50%) scale(.9); width: 76px; height: 76px; border-radius: 22px; background: rgba(30,38,51,.78); color: #fff; font-size: 36px; font-weight: 700; display: flex; align-items: center; justify-content: center; opacity: 0; pointer-events: none; transition: opacity .15s, transform .15s; z-index: 4; }
+.idx-bubble.on { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+#friendList .row { padding-right: 30px; }
+
+.composer .hint-line.warn { color: #8A5E00; background: var(--lemon-100); border-radius: 8px; padding: 4px 8px; margin-top: 4px; align-items: flex-start; line-height: 1.4; }
+/* v1.28: [선택] 휴대폰 번호 동의 */
+.agree.sub-agree { margin-top: -6px; font-size: 13.5px; align-items: flex-start; }
+.agree.sub-agree[hidden] { display: none; }
+.agree .agree-note { display: block; font-size: 12px; color: var(--ink3); margin-top: 2px; font-weight: 400; }
+.consent-box { margin: 10px 0 4px; padding: 10px 12px; border-radius: 12px; background: var(--soft-bg); font-size: 12.5px; line-height: 1.55; color: var(--ink2); }
+/* v1.28: 로봇 확인 상자 */
+.cap-box { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; background: rgba(20,28,40,.35); }
+.cap-box[hidden] { display: none; }
+.cap-card { background: #fff; border-radius: 18px; padding: 18px 18px 14px; display: flex; flex-direction: column; align-items: center; gap: 12px; font-size: 15px; box-shadow: 0 10px 30px rgba(0,0,0,.15); }
+/* v1.28: 추가 이모티콘 */
+.bubble.sticker img.cst, .stk img.cst, .stk-big img.cst { display: block; object-fit: contain; }
+.stk img.cst { width: 76px; height: 76px; }
+.cst-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 12px; }
+.cst-cell { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 8px 4px 6px; border-radius: 14px; background: var(--soft-bg); min-width: 0; }
+.cst-cell.off { opacity: .5; }
+.cst-cell img { width: 72px; height: 72px; object-fit: contain; }
+.cst-t { font-size: 11.5px; color: var(--ink2); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cst-act { display: flex; align-items: center; justify-content: center; gap: 0; flex-wrap: nowrap; }
+.cst-act .ibtn.sm { width: 24px; height: 28px; flex: none; }
+.cst-tb { font-size: 11.5px; padding: 4px 5px; border-radius: 8px; color: var(--ink2); white-space: nowrap; flex: none; }
+.cst-tb:active { background: rgba(0,0,0,.06); }
+.cst-grid .empty-line { grid-column: 1 / -1; }
+.susp-reason { font-size: 14px; color: var(--ink2); background: #fff; border-radius: 12px; padding: 8px 12px; }
+.susp-reason[hidden] { display: none; }

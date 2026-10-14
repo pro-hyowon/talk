@@ -1,5 +1,5 @@
 // 끼리톡 — 서버(Supabase) 통신 모듈
-import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+import { createClient } from './vendor/supabase.js';   // v1.28: supabase-js 2.117.3 을 앱에 포함 (외부 CDN 없이 — 개인정보·속도·오프라인)
 import { CONFIG } from './config.js';
 
 const PAGE = 50;
@@ -13,9 +13,11 @@ function friendly(error) {
   const msg = (error && (error.message || error.error_description)) || String(error);
   const map = [
     [/Invalid login credentials/i, '아이디 또는 비밀번호가 맞지 않아요'],
+    [/captcha/i, '로봇이 아닌지 확인하지 못했어요. 잠시 후 다시 시도해 주세요'],   // v1.28
+    [/너무 빨리 보내고/, '메시지를 너무 빨리 보내고 있어요. 잠시 후 다시 보내 주세요'],
     [/banned/i, '이용이 정지된 계정이에요. 관리자에게 문의해 주세요'],
-    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|admin_remove_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad|block_user|unblock_user|my_blocks|report_content|agree_terms|my_media_files|delete_my_account|refresh_my_status|create_inquiry|my_inquiries|inquiry_thread|reply_inquiry|close_inquiry|app_info|expired_media|admin_expired_media|admin_usage|admin_set_usage_settings|admin_purge_messages)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
-    [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found|'reply_to' column|relation "public\.ads"|table 'public\.ads'|public\.ads/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|claim_phone|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|admin_remove_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad|block_user|unblock_user|my_blocks|report_content|agree_terms|my_media_files|delete_my_account|refresh_my_status|create_inquiry|my_inquiries|inquiry_thread|reply_inquiry|close_inquiry|app_info|expired_media|admin_expired_media|admin_usage|admin_set_usage_settings|admin_purge_messages|admin_add_sticker|admin_set_sticker|admin_delete_sticker|admin_move_sticker|admin_log_action)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found|'reply_to' column|relation "public\.ads"|table 'public\.ads'|public\.ads|custom_stickers/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/already registered|already exists/i, '이미 사용 중인 아이디예요'],
     [/Database error saving new user/i, '가입할 수 없는 아이디예요. 영문 소문자·숫자·밑줄(_) 3~20자로 입력해 주세요'],
     [/Password should be at least/i, '비밀번호는 6자 이상이어야 해요'],
@@ -59,11 +61,11 @@ export function createApi() {
         if (next !== uid) { uid = next; cb(uid); }
       });
     },
-    async signUp({ username, password, displayName }) {
+    async signUp({ username, password, displayName, captchaToken }) {
       const data = must(await sb.auth.signUp({
         email: toEmail(username),
         password,
-        options: { data: { username: username.trim().toLowerCase(), display_name: displayName.trim(), agree_terms: 'yes' } },   // v1.17: 약관 동의
+        options: { data: { username: username.trim().toLowerCase(), display_name: displayName.trim(), agree_terms: 'yes' }, ...(captchaToken ? { captchaToken } : {}) },   // v1.17: 약관 동의 · v1.28: 로봇 확인
       }));
       if (!data.session) {
         throw new Error('관리자 설정이 필요해요: Supabase > Authentication > Email 에서 "Confirm email"을 꺼 주세요');
@@ -71,17 +73,17 @@ export function createApi() {
       uid = data.session.user.id;
       return uid;
     },
-    async signIn({ username, password }) {
-      const data = must(await sb.auth.signInWithPassword({ email: toEmail(username), password }));
+    async signIn({ username, password, captchaToken }) {
+      const data = must(await sb.auth.signInWithPassword({ email: toEmail(username), password, ...(captchaToken ? { options: { captchaToken } } : {}) }));
       uid = data.session.user.id;
       return uid;
     },
     async signOut() { await sb.auth.signOut(); uid = null; },
-    async changePassword(current, password) {
+    async changePassword(current, password, captchaToken) {
       const { data } = await sb.auth.getUser();
       const email = data && data.user && data.user.email;
-      const check = await sb.auth.signInWithPassword({ email, password: current });
-      if (check.error) throw new Error('현재 비밀번호가 맞지 않아요');
+      const check = await sb.auth.signInWithPassword({ email, password: current, ...(captchaToken ? { options: { captchaToken } } : {}) });
+      if (check.error) throw (/captcha/i.test(check.error.message || '') ? friendly(check.error) : new Error('현재 비밀번호가 맞지 않아요'));
       must(await sb.auth.updateUser({ password }));
     },
 
@@ -111,8 +113,19 @@ export function createApi() {
       const rows = must(await sb.rpc('find_user', { p_username: query }));
       return rows[0] || null;
     },
+    async mySuspension() { try { return must(await sb.rpc('my_suspension'))[0] || null; } catch { return null; } },   // v1.28: 정지 사유
     async getMyPhone() { return must(await sb.rpc('get_my_phone'))[0] || null; },
-    async setMyPhone(phone, findable = true) { return must(await sb.rpc('set_my_phone', { p_phone: phone || '', p_findable: findable })); },
+    async setMyPhone(phone, findable = true) {
+      const r = must(await sb.rpc('set_my_phone', { p_phone: phone || '', p_findable: findable }));
+      if (r === '!dup') throw new Error('이미 다른 계정에 등록된 번호예요. 내 번호가 맞다면 확인을 요청해 주세요');   // v1.22: 서버가 오류 대신 표시를 돌려줌
+      return r;
+    },
+    async claimPhone(phone) {   // v1.22: '내 번호예요' 확인 요청 (서버가 결과 코드를 돌려줌)
+      const r = must(await sb.rpc('claim_phone', { p_phone: phone }));
+      const msg = { none: '이 번호는 다른 계정에 등록돼 있지 않아요. 바로 등록해 보세요', self: '이미 내 계정에 등록된 번호예요',
+        already: '이미 확인을 요청했어요. 관리자가 확인하면 1:1 문의로 알려 드려요', limit: '오늘은 더 요청할 수 없어요. 내일 다시 시도해 주세요' }[r];
+      if (r && r !== 'sent') throw new Error(msg || '요청하지 못했어요');
+    },
     async setPhoneFindable(on) { must(await sb.rpc('set_phone_findable', { p_on: on })); },
     async matchContacts(phones, names) { return must(await sb.rpc('match_contacts', { p_phones: phones, p_names: names })); },
     // v1.9: 번호마다 결과를 받음. 데이터베이스가 아직 예전 버전이면 예전 방식(찾은 수만)으로
@@ -194,7 +207,10 @@ export function createApi() {
     async kickFromRoom(roomId, userId) { must(await sb.rpc('kick_from_room', { p_room: roomId, p_user: userId })); },
     async markRead(roomId) { must(await sb.rpc('mark_read', { p_room: roomId })); },
     async getRoom(roomId) {
-      return must(await sb.from('rooms').select('id,is_group,is_notice,title,created_by').eq('id', roomId).maybeSingle());
+      return must(await sb.from('rooms').select('id,is_group,is_notice,title,created_by,created_at').eq('id', roomId).maybeSingle());
+    },
+    async getReads(roomId) {   // v1.27: 읽음 위치만 (프로필 없이 — 데이터 절약)
+      return must(await sb.from('room_members').select('user_id,last_read_id').eq('room_id', roomId));
     },
     async getMembers(roomId) {
       return must(await sb.from('room_members')
@@ -323,6 +339,18 @@ export function createApi() {
     async adminSaveAd(ad) { return must(await sb.rpc('admin_save_ad', { p_id: ad.id, p_title: ad.title || null, p_link: ad.link, p_image: ad.image, p_active: ad.active })); },
     async adminDeleteAd(id) { const path = must(await sb.rpc('admin_delete_ad', { p_id: id })); if (path) await api.removeAdImage(path); },
     async adminMoveAd(id, dir) { must(await sb.rpc('admin_move_ad', { p_id: id, p_dir: dir })); },
+    // v1.28: 관리자가 올리는 추가 이모티콘
+    async listCustomStickers() { return must(await sb.from('custom_stickers').select('id,title,image_path,active,sort').order('sort').order('id')) || []; },
+    stickerUrl(path) { return sb.storage.from('stickers').getPublicUrl(path).data.publicUrl; },
+    async uploadSticker(blob, ext) {
+      const path = `${crypto.randomUUID()}.${ext}`;
+      must(await sb.storage.from('stickers').upload(path, blob, { contentType: blob.type || 'image/png', cacheControl: '31536000' }));
+      return path;
+    },
+    async adminAddSticker(path, title) { return must(await sb.rpc('admin_add_sticker', { p_path: path, p_title: title || null })); },
+    async adminSetSticker(id, active, title) { must(await sb.rpc('admin_set_sticker', { p_id: id, p_active: active, p_title: title == null ? null : title })); },
+    async adminDeleteSticker(id) { const path = must(await sb.rpc('admin_delete_sticker', { p_id: id })); if (path) { try { await sb.storage.from('stickers').remove([path]); } catch { /* 무시 */ } } },
+    async adminMoveSticker(id, dir) { must(await sb.rpc('admin_move_sticker', { p_id: id, p_dir: dir })); },
     async adClick(id) { try { await sb.rpc('ad_click', { p_id: id }); } catch { /* 무시 */ } },
     // v1.17: 신고 · 금칙어
     async adminOpenReports() { return must(await sb.rpc('admin_open_reports')) || 0; },
@@ -410,9 +438,7 @@ export function createApi() {
           .on('broadcast', { event: 'unfriended' }, ({ payload }) => payload && onUnfriended && onUnfriended(payload))   // v1.20: 관리자가 친구 관계를 끊음
           .subscribe((status) => {
             if (status === 'SUBSCRIBED') joined = true;
-            if (!joined && status === 'CHANNEL_ERROR' && !closed) {
-              const old = ch; ch = null; sb.removeChannel(old); legacy(); return;
-            }
+            // v1.27: 연결 오류가 나도 예전 방식으로 바꾸지 않음 (라이브러리가 알아서 다시 연결 — 서버 부담·데이터 절약)
             if (onStatus) onStatus(status);
           });
       })();
@@ -430,5 +456,17 @@ export function createApi() {
 
     get uid() { return uid; },
   };
+  // v1.28: 관리자 기능을 쓸 때마다 서버에 기록 (누가·언제·무엇을·어디서 — 1년 보관, 개인정보 접근 기록)
+  for (const k of Object.keys(api)) {
+    if (!/^admin[A-Z]/.test(k)) continue;
+    const fn = api[k];
+    if (typeof fn !== 'function') continue;
+    api[k] = function (...args) {
+      const a0 = args[0];
+      const t = typeof a0 === 'string' || typeof a0 === 'number' ? String(a0) : a0 && typeof a0 === 'object' && a0.id ? String(a0.id) : null;
+      sb.rpc('admin_log_action', { p_action: k, p_target: t }).then(() => {}, () => {});
+      return fn.apply(api, args);
+    };
+  }
   return api;
 }

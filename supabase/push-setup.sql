@@ -47,7 +47,14 @@ returns void language plpgsql security definer set search_path = public as $$
 begin
   if auth.uid() is null then raise exception '로그인이 필요해요'; end if;
   if not public.is_active() then raise exception '사용할 수 없는 계정이에요'; end if;
-  if p_endpoint !~ '^https://' then raise exception '잘못된 알림 주소예요'; end if;
+  -- v1.22: 실제 알림 서버 주소만 받음, 한 사람당 기기 10대까지
+  if p_endpoint !~ '^https://(fcm\.googleapis\.com|android\.googleapis\.com|([a-z0-9-]+\.)*push\.services\.mozilla\.com|([a-z0-9-]+\.)*push\.apple\.com|([a-z0-9-]+\.)*notify\.windows\.com)/' then
+    raise exception '잘못된 알림 주소예요';
+  end if;
+  if (select count(*) from push_subscriptions where user_id = auth.uid() and endpoint <> p_endpoint) >= 10 then
+    delete from push_subscriptions where endpoint in (
+      select endpoint from push_subscriptions where user_id = auth.uid() and endpoint <> p_endpoint order by created_at limit 1);
+  end if;
   insert into push_subscriptions (endpoint, user_id, p256dh, auth, user_agent)
   values (p_endpoint, auth.uid(), p_p256dh, p_auth, left(p_user_agent, 200))
   on conflict (endpoint) do update
@@ -161,4 +168,5 @@ create trigger messages_push
 insert into private.push_config (id, function_url, secret, show_preview)
 values (1, 'https://YOUR_PROJECT_REF.supabase.co/functions/v1/send-push', 'YOUR_PUSH_SECRET', true)
 on conflict (id) do update
-  set function_url = excluded.function_url, secret = excluded.secret, show_preview = excluded.show_preview;
+  set function_url = excluded.function_url, secret = excluded.secret, show_preview = excluded.show_preview
+  where excluded.function_url not like '%YOUR_PROJECT_REF%';   -- v1.22: 값을 채우지 않은 채 다시 실행해도 기존 설정을 지우지 않음

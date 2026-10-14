@@ -1,5 +1,5 @@
 -- =====================================================================
---  끼리톡(Kkiri Talk) v1.21 — Supabase 데이터베이스 설정 스크립트
+--  끼리톡(Kkiri Talk) v1.23 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -84,11 +84,12 @@ create index if not exists friends_friend_idx on public.friends(friend_id);
 create index if not exists rooms_created_by_idx on public.rooms(created_by);
 -- v1.5 추가: 이모티콘 메시지 (content = 이모티콘 이름)
 alter table public.messages drop constraint if exists messages_kind_check;
-alter table public.messages add constraint messages_kind_check check (kind in ('text', 'image', 'sticker', 'file', 'contact', 'system', 'deleted'));
+-- v1.22: NOT VALID — 다시 실행할 때 전체 메시지를 다시 검사하느라 메시지 전송이 멈추지 않게 (새로 쓰는 메시지는 검사함)
+alter table public.messages add constraint messages_kind_check check (kind in ('text', 'image', 'sticker', 'file', 'contact', 'system', 'deleted')) not valid;
 -- v1.8: 삭제한 메시지 (kind = 'deleted' 로 바뀌고 내용은 지워짐)
 alter table public.messages add column if not exists deleted_at timestamptz;
 alter table public.messages drop constraint if exists messages_sticker_check;
-alter table public.messages add constraint messages_sticker_check check (kind <> 'sticker' or content ~ '^[a-z0-9_]{1,30}$');
+alter table public.messages add constraint messages_sticker_check check (kind <> 'sticker' or content ~ '^[a-z0-9_]{1,30}$') not valid;
 
 -- v1.10: 파일·연락처 메시지 (content = JSON)
 --   파일   {"path":"<방ID>/<내ID>-…","name":"원래 파일 이름","size":바이트,"type":"형식"}
@@ -149,11 +150,10 @@ create index if not exists message_reactions_room_idx on public.message_reaction
 create index if not exists message_reactions_user_idx on public.message_reactions(user_id);
 
 alter table public.messages drop constraint if exists messages_file_check;
-drop index if exists public.messages_media_idx;
 alter table public.messages add constraint messages_file_check check (
   case when kind = 'file' then public.valid_file_msg(content, room_id, sender_id)
        when kind = 'contact' then public.valid_contact_msg(content)
-       else true end);
+       else true end) not valid;
 -- v1.19: 사진 메시지는 그 방에 내가 올린 사진 경로만 (다른 방·다른 사람 사진을 가리키는 메시지 막기. 기존 메시지는 그대로)
 create or replace function public.valid_image_msg(p_content text, p_room uuid, p_sender uuid)
 returns boolean language sql immutable as $$
@@ -233,6 +233,7 @@ create table if not exists private.lookup_quota (
   primary key (user_id, day)
 );
 revoke all on private.lookup_quota from public, anon, authenticated;
+create index if not exists lookup_quota_day_idx on private.lookup_quota(day);   -- v1.22: 지난 기록 지울 때 전체를 훑지 않게
 
 -- v1.7: 친구 요청 알림 기록 (같은 사람에게 하루 한 번만 알림 — 친구 추가·삭제 반복으로 알림 도배 방지)
 create table if not exists private.friend_request_log (
@@ -274,6 +275,16 @@ create table if not exists public.ads (
   clicks      bigint not null default 0,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now()
+);
+
+-- v1.23: 관리자가 올리는 추가 이모티콘 (메시지에는 'c_번호' 로 저장 — 기본 이모티콘 이름 규칙과 같음)
+create table if not exists public.custom_stickers (
+  id          bigint generated always as identity primary key,
+  title       text check (title is null or char_length(title) <= 30),
+  image_path  text not null check (image_path ~ '^[a-z0-9-]{1,80}\.(png|webp|gif|jpg|jpeg)$'),
+  active      boolean not null default true,
+  sort        integer not null default 0,
+  created_at  timestamptz not null default now()
 );
 
 -- v1.14: 친구 초대 링크·QR 코드 (회원마다 하나, 새로 만들면 예전 링크는 더 이상 안 됨)
@@ -506,6 +517,7 @@ returns boolean language sql stable security definer set search_path = public as
   select public.is_active() and exists (
     select 1 from room_members a
     join room_members b on a.room_id = b.room_id
+    join rooms r on r.id = a.room_id and not r.is_notice   -- v1.22: 공지 방(모든 회원이 들어 있음)은 빼기 → 모르는 회원 정보가 보이지 않게
     where a.user_id = auth.uid() and b.user_id = p_user
   );
 $$;
@@ -676,6 +688,10 @@ begin
               where from_id = p_from and to_id = p_to and sent_at > now() - interval '1 day') then
     return;
   end if;
+  -- v1.22: 한 사람이 보내는 친구 요청 알림은 하루 50건까지 (친구 추가는 되지만 알림은 안 감)
+  if (select count(*) from private.friend_request_log where from_id = p_from and sent_at > now() - interval '1 day') >= 50 then
+    return;
+  end if;
   insert into private.friend_request_log (from_id, to_id, sent_at) values (p_from, p_to, now())
   on conflict (from_id, to_id) do update set sent_at = excluded.sent_at;
 
@@ -805,8 +821,10 @@ $$;
 
 -- 아이디 또는 휴대폰 번호로 사용자 찾기 (정확히 일치하는 1명, 사용 중인 회원만)
 --   번호는 '번호로 나를 찾을 수 있게' 를 켜 둔 회원만 찾을 수 있어요.
-create or replace function public.find_user(p_username text)
-returns table (id uuid, username text, display_name text, status_message text, avatar_url text)
+--   v1.22: 가입 시각도 돌려줌 (번호로 찾은 계정이 갓 만든 계정이면 앱이 주의 안내)
+drop function if exists public.find_user(text);
+create function public.find_user(p_username text)
+returns table (id uuid, username text, display_name text, status_message text, avatar_url text, created_at timestamptz)
 language plpgsql volatile security definer set search_path = public as $$
 declare
   v_phone text := public.norm_phone(p_username);
@@ -815,13 +833,13 @@ begin
   if v_phone is not null then
     perform public.use_lookup_quota(1);
     return query
-      select p.id, p.username, p.display_name, p.status_message, p.avatar_url
+      select p.id, p.username, p.display_name, p.status_message, p.avatar_url, p.created_at
         from user_phones up join profiles p on p.id = up.user_id
        where up.phone = v_phone and (up.findable or up.user_id = auth.uid()) and p.status = 'active'
        limit 1;
   else
     return query
-      select p.id, p.username, p.display_name, p.status_message, p.avatar_url
+      select p.id, p.username, p.display_name, p.status_message, p.avatar_url, p.created_at
         from profiles p
        where p.status = 'active' and p.username = lower(trim(both '@ ' from p_username))
        limit 1;
@@ -853,8 +871,14 @@ begin
   end if;
   if v_phone is null then raise exception '휴대폰 번호를 정확히 입력해 주세요 (예: 010-1234-5678)'; end if;
   perform public.use_lookup_quota(20);
+  -- v1.22: 오류로 끝내면 위의 횟수 기록까지 취소되므로, 표시('!dup')를 돌려줘서 앱이 안내 (번호 확인을 무제한으로 못 하게)
   if exists (select 1 from user_phones where phone = v_phone and user_id <> v_me) then
-    raise exception '이미 다른 계정에 등록된 번호예요. 내 번호가 맞다면 관리자에게 문의해 주세요';
+    return '!dup';
+  end if;
+  -- 이 번호에 '내 번호예요' 확인 요청이 14일 안에 들어와 있으면 검색 허용을 켤 수 없음
+  if exists (select 1 from private.phone_claims c where c.phone = v_phone and c.holder = v_me and c.inquiry_id is not null
+              and c.created_at > now() - interval '14 days') then
+    p_findable := false;
   end if;
   insert into user_phones (user_id, phone, findable) values (v_me, v_phone, coalesce(p_findable, true))
   on conflict (user_id) do update set phone = excluded.phone, findable = excluded.findable, updated_at = now();
@@ -864,8 +888,73 @@ $$;
 
 -- '번호로 나를 찾을 수 있게' 켜기·끄기
 create or replace function public.set_phone_findable(p_on boolean)
-returns void language sql security definer set search_path = public as $$
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  -- v1.22: '내 번호예요' 확인 요청이 들어온 번호는 14일 동안 검색 허용을 켤 수 없음 (관리자 확인 전까지)
+  if coalesce(p_on, true) and exists (
+      select 1 from user_phones up join private.phone_claims c on c.phone = up.phone and c.holder = up.user_id
+       where up.user_id = auth.uid() and c.inquiry_id is not null and c.created_at > now() - interval '14 days') then
+    raise exception '이 번호는 다른 회원이 본인 번호라고 확인을 요청해서, 관리자가 확인할 때까지 검색 허용을 켤 수 없어요. 내 번호가 맞다면 1:1 문의로 알려 주세요';
+  end if;
   update user_phones set findable = coalesce(p_on, true), updated_at = now() where user_id = auth.uid();
+end;
+$$;
+
+-- v1.22: 내 번호를 다른 사람이 먼저 등록했을 때 '내 번호예요' 확인 요청
+--   · 그 번호는 바로 번호 검색에서 숨김 (다른 사람이 내 번호로 검색해서 엉뚱한 사람을 찾지 않게)
+--   · 관리자에게 1:1 문의로 접수 → 관리자가 확인 후 도용이면 그 회원의 번호를 삭제(회원 관리 → 번호 삭제)
+--   · 남용 막기: 한 사람이 하루 3번까지, 같은 번호는 7일에 한 번
+create table if not exists private.phone_claims (
+  id          bigint generated always as identity primary key,
+  phone       text not null,
+  claimant    uuid not null references public.profiles(id) on delete cascade,
+  holder      uuid references public.profiles(id) on delete set null,
+  inquiry_id  bigint references private.inquiries(id) on delete set null,
+  created_at  timestamptz not null default now()
+);
+create index if not exists phone_claims_claimant_idx on private.phone_claims(claimant, created_at desc);
+create index if not exists phone_claims_phone_idx on private.phone_claims(phone);
+revoke all on private.phone_claims from public, anon, authenticated;
+
+drop function if exists public.claim_phone(text);
+create function public.claim_phone(p_phone text)
+returns text language plpgsql security definer set search_path = public as $$
+-- 결과: sent(요청함) / none(등록된 번호 아님) / self(내 번호) / already(이미 요청) / limit(오늘 횟수 다 씀)
+--   오류로 끝내지 않고 결과를 돌려줘서 횟수 기록이 취소되지 않게 함 (번호 확인을 무제한으로 못 하게)
+declare
+  v_me     uuid := auth.uid();
+  v_phone  text := public.norm_phone(p_phone);
+  v_holder uuid;
+  v_inq    bigint;
+begin
+  if v_me is null or not public.is_active() then raise exception '요청할 수 없는 계정이에요'; end if;
+  if v_phone is null then raise exception '휴대폰 번호를 정확히 입력해 주세요 (예: 010-1234-5678)'; end if;
+  perform public.use_lookup_quota(50);
+  if (select count(*) from private.phone_claims where claimant = v_me and created_at > now() - interval '1 day') >= 5 then
+    return 'limit';
+  end if;
+  select user_id into v_holder from user_phones where phone = v_phone;
+  if v_holder = v_me then return 'self'; end if;
+  if v_holder is not null and exists (select 1 from private.phone_claims where claimant = v_me and phone = v_phone
+                                       and inquiry_id is not null and created_at > now() - interval '7 days') then
+    return 'already';
+  end if;
+  if v_holder is null then
+    insert into private.phone_claims (phone, claimant) values (v_phone, v_me);   -- 시도도 하루 횟수에 셈
+    return 'none';
+  end if;
+  update user_phones set findable = false, updated_at = now() where user_id = v_holder;
+  delete from friend_suggestions where suggested_id = v_holder;
+  insert into private.inquiries (user_id, category, title) values (v_me, 'account', '휴대폰 번호 확인 요청')
+  returning id into v_inq;
+  insert into private.inquiry_messages (inquiry_id, sender_id, from_admin, body)
+  values (v_inq, v_me, false,
+    '내 휴대폰 번호(' || regexp_replace(v_phone, '^([0-9]{3})([0-9]{3,4})([0-9]{4})$', '\1-\2-\3') || ')가 다른 계정에 등록돼 있어요. 확인해 주세요.'
+    || E'\n\n[자동 접수] 그 번호는 지금부터 번호 검색에서 숨겨졌어요(14일 동안 그 회원이 다시 켤 수 없음). 관리자: 회원 관리에서 이 번호로 검색해 확인하고, 도용이면 그 회원의 번호를 삭제해 주세요.');
+  insert into private.phone_claims (phone, claimant, holder, inquiry_id) values (v_phone, v_me, v_holder, v_inq);
+  perform public.notify_admins_inquiry();
+  return 'sent';
+end;
 $$;
 
 -- 내 연락처 번호와 일치하는 회원을 추천 친구에 추가 → 일치한 사람 수
@@ -1006,7 +1095,7 @@ language sql stable security definer set search_path = public as $$
                and m.kind not in ('system', 'deleted') and m.sender_id is distinct from (select auth.uid())
                and not exists (select 1 from private.blocks b where b.user_id = me.user_id and b.blocked_id = m.sender_id)   -- v1.17
              limit 300) u),
-         (select count(*)::int from room_members x where x.room_id = r.id),
+         case when r.is_notice then 0 else (select count(*)::int from room_members x where x.room_id = r.id) end,   -- v1.22: 공지 방은 세지 않음 (회원 수만큼 느려짐)
          case when r.is_notice then '[]'::jsonb else
          coalesce((select jsonb_agg(jsonb_build_object('id', q.id, 'display_name', q.display_name, 'avatar_url', q.avatar_url)
                                     order by q.display_name)
@@ -1579,6 +1668,97 @@ begin
 end;
 $$;
 
+-- v1.23: 정지된 회원에게 정지 사유·기간 보여 주기 (약관 제7조 — 정지 사유와 기간을 앱 화면으로 알림)
+create or replace function public.my_suspension()
+returns table (reason text, until timestamptz, at timestamptz)
+language sql stable security definer set search_path = public as $$
+  select s.reason, p.suspended_until, s.created_at
+    from profiles p
+    left join lateral (select reason, created_at from private.sanctions x
+                        where x.user_id = p.id and x.action = 'suspend' order by x.id desc limit 1) s on true
+   where p.id = auth.uid() and p.status = 'suspended';
+$$;
+
+-- v1.23: 관리자 작업 기록 (누가·언제·무엇을·어디서) — 1년 보관 후 자동 삭제
+--   앱의 관리자 기능을 쓸 때마다 기록돼요. 보기: SQL Editor 에서  select * from private.admin_log order by id desc limit 100;
+create table if not exists private.admin_log (
+  id        bigint generated always as identity primary key,
+  admin_id  uuid,
+  action    text not null,
+  target    text,
+  ip        text,
+  at        timestamptz not null default now()
+);
+create index if not exists admin_log_at_idx on private.admin_log(at);
+revoke all on private.admin_log from public, anon, authenticated;
+create or replace function public.admin_log_action(p_action text, p_target text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_ip text;
+begin
+  if not public.is_admin() then return; end if;
+  begin
+    v_ip := left(split_part(coalesce(current_setting('request.headers', true)::json ->> 'x-forwarded-for', ''), ',', 1), 60);
+  exception when others then v_ip := null;
+  end;
+  insert into private.admin_log (admin_id, action, target, ip)
+  values (auth.uid(), left(coalesce(p_action, '?'), 60), left(p_target, 80), nullif(v_ip, ''));
+  if random() < 0.02 then delete from private.admin_log where at < now() - interval '1 year'; end if;
+end;
+$$;
+
+-- v1.23: 추가 이모티콘 관리 (관리자)
+create or replace function public.admin_add_sticker(p_path text, p_title text default null)
+returns bigint language plpgsql security definer set search_path = public as $$
+declare
+  v_me uuid := public.admin_guard();
+  v_id bigint;
+begin
+  if (select count(*) from custom_stickers) >= 500 then raise exception '이모티콘은 500개까지 올릴 수 있어요. 안 쓰는 것을 지워 주세요'; end if;
+  insert into custom_stickers (title, image_path, sort)
+  values (nullif(left(btrim(coalesce(p_title, '')), 30), ''), p_path, coalesce((select max(sort) from custom_stickers), 0) + 1)
+  returning id into v_id;
+  return v_id;
+end;
+$$;
+create or replace function public.admin_set_sticker(p_id bigint, p_active boolean, p_title text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare v_me uuid := public.admin_guard();
+begin
+  update custom_stickers set active = coalesce(p_active, active),
+         title = case when p_title is null then title else nullif(left(btrim(p_title), 30), '') end
+   where id = p_id;
+  if not found then raise exception '이모티콘을 찾을 수 없어요'; end if;
+end;
+$$;
+-- 지우면 그림 경로를 돌려줌 (앱이 저장소에서 파일도 지움). 예전에 보낸 메시지에는 '이모티콘' 빈 그림으로 보여요
+create or replace function public.admin_delete_sticker(p_id bigint)
+returns text language plpgsql security definer set search_path = public as $$
+declare
+  v_me   uuid := public.admin_guard();
+  v_path text;
+begin
+  delete from custom_stickers where id = p_id returning image_path into v_path;
+  return v_path;
+end;
+$$;
+create or replace function public.admin_move_sticker(p_id bigint, p_dir integer)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_me  uuid := public.admin_guard();
+  v_ids bigint[];
+  v_i   integer;
+  v_j   integer;
+begin
+  select array_agg(id order by sort, id) into v_ids from custom_stickers;
+  v_i := array_position(v_ids, p_id);
+  if v_i is null then raise exception '이모티콘을 찾을 수 없어요'; end if;
+  v_j := v_i + sign(p_dir)::int;
+  if v_j < 1 or v_j > cardinality(v_ids) then return; end if;
+  v_ids[v_i] := v_ids[v_j]; v_ids[v_j] := p_id;
+  update custom_stickers c set sort = x.ord from unnest(v_ids) with ordinality as x(id, ord) where c.id = x.id;
+end;
+$$;
+
 -- v1.16: 광고를 누른 수 세기
 create or replace function public.ad_click(p_id bigint)
 returns void language sql security definer set search_path = public as $$
@@ -1857,11 +2037,13 @@ begin
     on conflict do nothing
     returning id into v_room;
     if v_room is null then select id into v_room from rooms where is_notice; end if;
+    -- 공지 방을 처음 만들 때만 모든 회원을 넣음 (그 뒤 가입·승인되는 회원은 join_notice_room 으로 들어옴)
+    --   v1.22: 공지마다 전체 회원을 다시 넣지 않음 (회원이 많으면 매우 느려짐)
+    select coalesce(max(id), 0) into v_last from messages where room_id = v_room;
+    insert into room_members (room_id, user_id, last_read_id)
+    select v_room, p.id, v_last from profiles p
+     where p.status = 'active' and not exists (select 1 from room_members x where x.room_id = v_room and x.user_id = p.id);
   end if;
-  select coalesce(max(id), 0) into v_last from messages where room_id = v_room;
-  insert into room_members (room_id, user_id, last_read_id)
-  select v_room, p.id, v_last from profiles p where p.status = 'active'
-  on conflict (room_id, user_id) do nothing;
   insert into messages (room_id, sender_id, kind, content)
   values (v_room, v_me, 'text', left(trim(p_text), 2000));
   return v_room;
@@ -1992,6 +2174,10 @@ $$;
 create or replace function public.friend_block_check()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
+  -- v1.22: 본인이 직접 추가할 때 하루 200명까지 (친구 추가 알림 도배 막기)
+  if auth.uid() = new.user_id and (select count(*) from friends where user_id = new.user_id and created_at > now() - interval '1 day') >= 200 then
+    raise exception '오늘은 친구를 더 추가할 수 없어요. 내일 다시 시도해 주세요';
+  end if;
   if exists (select 1 from private.blocks where user_id = new.user_id and blocked_id = new.friend_id) then
     if auth.uid() = new.user_id then
       delete from private.blocks where user_id = new.user_id and blocked_id = new.friend_id;
@@ -2785,7 +2971,7 @@ returns jsonb language sql stable security definer set search_path = public, pri
                             'media_keep_from', (select media_keep_from from private.app_settings where id = 1),
                             'msg_keep_days', public.msg_keep_days(),
                             'msg_keep_from', (select msg_keep_from from private.app_settings where id = 1),
-                            'db_version', '1.21');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
+                            'db_version', '1.23');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
 $$;
 
 -- 회원 앱: 내 방에서 보관 기간이 지난 사진·파일을 몇 개씩 받아 저장 공간에서 지움
@@ -2979,7 +3165,8 @@ create policy "rooms_select_member" on public.rooms for select to authenticated
 
 drop policy if exists "room_members_select" on public.room_members;
 create policy "room_members_select" on public.room_members for select to authenticated
-  using (public.is_room_member(room_id));
+  using (public.is_room_member(room_id)
+         and (user_id = (select auth.uid()) or not public.is_notice_room(room_id)));   -- v1.22: 공지 방은 내 줄만 (회원 전체 목록이 보이지 않게, 데이터 절약)
 
 drop policy if exists "messages_select_member" on public.messages;
 create policy "messages_select_member" on public.messages for select to authenticated
@@ -3015,6 +3202,13 @@ create policy "reactions_select_member" on public.message_reactions for select t
 revoke all on public.user_phones, public.friend_suggestions from anon, authenticated;
 
 -- v1.16: 광고는 로그인한 회원이 보기만 (관리자는 숨긴 광고도 봄), 고치기는 관리자 함수로만
+-- v1.23: 추가 이모티콘 — 회원은 보기만 (예전 메시지가 숨긴 이모티콘도 보여 줄 수 있게 숨긴 것도 읽음)
+alter table public.custom_stickers enable row level security;
+revoke all on public.custom_stickers from anon, authenticated;
+grant select on public.custom_stickers to authenticated;
+drop policy if exists "custom_stickers_select" on public.custom_stickers;
+create policy "custom_stickers_select" on public.custom_stickers for select to authenticated using (true);
+
 alter table public.ads enable row level security;
 revoke all on public.ads from anon, authenticated;
 grant select on public.ads to authenticated;
@@ -3029,7 +3223,7 @@ declare
     'my_friends()', 'find_user(text)', 'my_rooms()', 'get_or_create_dm(uuid)',
     'create_group(text, uuid[])', 'invite_to_room(uuid, uuid[])', 'leave_room(uuid)',
     'mark_read(uuid)', 'touch_last_seen()',
-    'get_my_phone()', 'set_my_phone(text, boolean)', 'set_phone_findable(boolean)',
+    'get_my_phone()', 'set_my_phone(text, boolean)', 'set_phone_findable(boolean)', 'claim_phone(text)',
     'match_contacts(text[], text[])', 'match_contacts_detail(text[], text[])', 'my_suggestions()', 'dismiss_suggestion(uuid)', 'admin_clear_phone(uuid)',
     'my_friend_requests()', 'dismiss_request(uuid)', 'kick_from_room(uuid, uuid)', 'delete_message(bigint)', 'react_message(bigint, text)',
     'my_invite_code()', 'reset_invite_code()', 'invite_preview(text)', 'accept_invite(text)', 'set_room_muted(uuid, boolean)',
@@ -3046,11 +3240,12 @@ declare
     'reply_inquiry(bigint, text)', 'close_inquiry(bigint)',
     'admin_suspend(uuid, integer, text)', 'admin_set_note(uuid, text)', 'admin_dashboard()', 'admin_badges()',
     'admin_member_page(text, text, text, integer, integer)', 'admin_member_detail(uuid)', 'admin_list_inquiries(text, integer, integer)',
-    'app_info()', 'expired_media(integer)', 'admin_expired_media(integer)', 'admin_usage()', 'admin_set_usage_settings(integer, text, integer)', 'admin_purge_messages()'];
+    'app_info()', 'expired_media(integer)', 'admin_expired_media(integer)', 'admin_usage()', 'admin_set_usage_settings(integer, text, integer)', 'admin_purge_messages()', 'admin_log_action(text, text)',
+    'my_suspension()', 'admin_add_sticker(text, text)', 'admin_set_sticker(bigint, boolean, text)', 'admin_delete_sticker(bigint)', 'admin_move_sticker(bigint, integer)'];
   helper_fns text[] := array[
     'is_active()', 'is_active_user(uuid)', 'is_admin()', 'is_room_member(uuid)', 'is_room_member_text(text)',
     'shares_room_with(uuid)', 'is_notice_room(uuid)', 'admin_guard()',
-    'is_mutual_friend(uuid, uuid)', 'can_post(uuid)', 'can_post_text(text)',
+    'can_post(uuid)', 'can_post_text(text)',
     'valid_file_msg(text, uuid, uuid)', 'valid_contact_msg(text)', 'valid_image_msg(text, uuid, uuid)',
     'can_see_message(uuid, bigint)', 'can_read_chat_object(text)', 'can_cleanup_folder(text)', 'is_orphan_folder(text)',
     'admin_can_view_reported(text)', 'admin_can_purge(text)', 'kst_today()', 'media_keep_days()', 'media_cutoff()', 'chat_object_expired(timestamptz)',
@@ -3066,6 +3261,7 @@ begin
   execute 'revoke execute on function public.notify_friend_request(uuid, uuid) from public, anon, authenticated';
   execute 'revoke execute on function public.notify_connected(uuid, uuid, text) from public, anon, authenticated';
   execute 'revoke execute on function public.erase_message(bigint) from public, anon, authenticated';   -- v1.17 내부용
+  execute 'revoke execute on function public.is_mutual_friend(uuid, uuid) from public, anon, authenticated';   -- v1.22 내부용 (남의 친구 관계를 알아내지 못하게)
   execute 'revoke execute on function public.mask_banned(text) from public, anon, authenticated';
   execute 'revoke execute on function public.notify_admins_report() from public, anon, authenticated';
   execute 'revoke execute on function public.push_to_users(uuid[], text, text) from public, anon, authenticated';   -- v1.18 내부용
@@ -3106,6 +3302,20 @@ create policy "minitalk_ads_select" on storage.objects for select to authenticat
 drop policy if exists "minitalk_ads_delete" on storage.objects;
 create policy "minitalk_ads_delete" on storage.objects for delete to authenticated
   using (bucket_id = 'ads' and public.is_admin());
+
+-- v1.23: 관리자가 올리는 추가 이모티콘 그림 (공개, 한 장 1MB까지)
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('stickers', 'stickers', true, 1048576, array['image/png', 'image/webp', 'image/gif', 'image/jpeg'])
+on conflict (id) do nothing;
+drop policy if exists "minitalk_stickers_insert" on storage.objects;
+create policy "minitalk_stickers_insert" on storage.objects for insert to authenticated
+  with check (bucket_id = 'stickers' and public.is_admin());
+drop policy if exists "minitalk_stickers_select" on storage.objects;
+create policy "minitalk_stickers_select" on storage.objects for select to authenticated
+  using (bucket_id = 'stickers' and public.is_admin());
+drop policy if exists "minitalk_stickers_delete" on storage.objects;
+create policy "minitalk_stickers_delete" on storage.objects for delete to authenticated
+  using (bucket_id = 'stickers' and public.is_admin());
 
 drop policy if exists "minitalk_avatar_insert" on storage.objects;
 create policy "minitalk_avatar_insert" on storage.objects for insert to authenticated
@@ -3238,24 +3448,108 @@ exception when others then
 end
 $do$;
 
--- 예전 방식(Postgres Changes) 대비용 등록 — 위 설정이 안 될 때 앱이 자동으로 이 방식을 씀
+-- v1.22: 예전 방식(Postgres Changes)은 더 이상 쓰지 않음 → 등록 해제 (서버가 메시지마다 하던 추가 작업·정보 노출 줄이기)
 do $$
 begin
   begin
-    alter publication supabase_realtime add table public.messages;
-  exception when duplicate_object then null;
+    alter publication supabase_realtime drop table public.messages;
+  exception when others then null;
   end;
   begin
-    alter publication supabase_realtime add table public.room_members;
-  exception when duplicate_object then null;
+    alter publication supabase_realtime drop table public.room_members;
+  exception when others then null;
   end;
 end;
 $$;
+
+-- v1.23: 메시지 도배 막기 — 10초에 15개까지 (사진 10장 묶음 보내기는 괜찮음)
+create index if not exists messages_sender_time_idx on public.messages(sender_id, created_at);
+create or replace function public.message_rate_guard()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.sender_id is not null and new.kind <> 'system'
+     and (select count(*) from (select 1 from messages where sender_id = new.sender_id
+                                   and created_at > now() - interval '10 seconds' limit 15) x) >= 15 then
+    raise exception '메시지를 너무 빨리 보내고 있어요. 잠시 후 다시 보내 주세요';
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists messages_rate_guard on public.messages;
+create trigger messages_rate_guard before insert on public.messages
+  for each row execute function public.message_rate_guard();
+revoke execute on function public.message_rate_guard() from public, anon, authenticated;
+
+-- v1.22: 단체방은 300명까지 (메시지 하나마다 참여자 수만큼 실시간 전달이 생겨서 너무 큰 방은 서버에 부담. 공지 방은 제외)
+create or replace function public.room_member_cap()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_notice_room(new.room_id)
+     and (select count(*) from (select 1 from room_members where room_id = new.room_id limit 301) x) > 300 then
+    raise exception '단체방은 300명까지 들어올 수 있어요';
+  end if;
+  return null;
+end;
+$$;
+drop trigger if exists room_members_cap on public.room_members;
+create trigger room_members_cap after insert on public.room_members   -- 한 번에 여러 명을 넣어도 전부 센 뒤 확인
+  for each row execute function public.room_member_cap();
+revoke execute on function public.room_member_cap() from public, anon, authenticated;
+
+-- v1.22: 프로필 사진 주소는 우리 저장소의 '내 폴더' 사진만 (남의 서버 주소를 넣어 보는 사람의 접속 기록을 모으는 것 막기)
+create or replace function public.check_avatar_url()
+returns trigger language plpgsql set search_path = public as $$
+begin
+  if new.avatar_url is not null and new.avatar_url is distinct from old.avatar_url
+     and new.avatar_url !~ ('^https://[A-Za-z0-9.-]+(:[0-9]+)?/storage/v1/object/public/avatars/' || new.id::text || '/[A-Za-z0-9._-]+$') then
+    raise exception '프로필 사진 주소가 올바르지 않아요';
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists profiles_avatar_guard on public.profiles;
+create trigger profiles_avatar_guard before update of avatar_url on public.profiles
+  for each row execute function public.check_avatar_url();
+
+-- v1.22: 알림 구독 주소는 실제 알림 서버(구글·애플·모질라·마이크로소프트)만 받음
+--   (알림을 설정해 둔 경우에만 — push-setup.sql 을 다시 실행하지 않아도 이 파일로 적용)
+do $do$
+begin
+  if to_regclass('public.push_subscriptions') is not null then
+    execute $f$
+create or replace function public.save_push_subscription(
+  p_endpoint text, p_p256dh text, p_auth text, p_user_agent text default null)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then raise exception '로그인이 필요해요'; end if;
+  if not public.is_active() then raise exception '사용할 수 없는 계정이에요'; end if;
+  if p_endpoint !~ '^https://(fcm\.googleapis\.com|android\.googleapis\.com|([a-z0-9-]+\.)*push\.services\.mozilla\.com|([a-z0-9-]+\.)*push\.apple\.com|([a-z0-9-]+\.)*notify\.windows\.com)/' then
+    raise exception '잘못된 알림 주소예요';
+  end if;
+  if (select count(*) from push_subscriptions where user_id = auth.uid() and endpoint <> p_endpoint) >= 10 then
+    delete from push_subscriptions where endpoint in (
+      select endpoint from push_subscriptions where user_id = auth.uid() and endpoint <> p_endpoint order by created_at limit 1);
+  end if;
+  insert into push_subscriptions (endpoint, user_id, p256dh, auth, user_agent)
+  values (p_endpoint, auth.uid(), p_p256dh, p_auth, left(p_user_agent, 200))
+  on conflict (endpoint) do update
+    set user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,
+        user_agent = excluded.user_agent, created_at = now();
+end;
+$$;
+$f$;
+    execute 'revoke execute on function public.save_push_subscription(text, text, text, text) from public, anon';
+    execute 'grant execute on function public.save_push_subscription(text, text, text, text) to authenticated';
+  end if;
+end
+$do$;
 
 -- ---------------------------------------------------------------------
 -- 10. [관리자 지정] 'YOUR_ADMIN_ID' 를 내 아이디(앱에서 가입한 아이디)로 바꾸세요.
 --     먼저 앱에서 회원가입을 한 다음 실행해야 합니다. 여러 명이면 이 줄을 복사해 추가.
 -- ---------------------------------------------------------------------
-update public.profiles set is_admin = true, status = 'active' where username = lower('YOUR_ADMIN_ID');
+--     (v1.22: 'YOUR_ADMIN_ID' 그대로면 아무 일도 하지 않음 — 누군가 그 이름으로 가입해 관리자가 되는 것 막기)
+update public.profiles set is_admin = true, status = 'active'
+ where username = nullif(lower('YOUR_ADMIN_ID'), 'your_admin_id');
 
 -- 끝. "Success. No rows returned" 가 나오면 정상입니다.

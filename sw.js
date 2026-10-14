@@ -1,5 +1,5 @@
 // 끼리톡 서비스 워커 — 앱 화면 캐시(오프라인에서도 열림) + 푸시 알림 수신·클릭 처리
-const CACHE = 'kkiritalk-v1.26';
+const CACHE = 'kkiritalk-v1.28';
 const SHELL = [
   './',
   './index.html',
@@ -15,6 +15,9 @@ const SHELL = [
   './icons/icon-512.png',
   './sounds/kkitok.mp3',          // v1.23: 끼톡 알림음
   './sounds/kkitok-melody.mp3',
+  './js/vendor/supabase.js',      // v1.28: 외부 CDN 대신 앱에 포함
+  './fonts/GmarketSansMedium.woff2',
+  './fonts/GmarketSansBold.woff2',
 ];
 
 self.addEventListener('install', (e) => {
@@ -35,28 +38,23 @@ self.addEventListener('fetch', (e) => {
   const url = new URL(req.url);
 
   // 같은 사이트 파일: 항상 최신을 먼저 받고, 안 되면(오프라인) 캐시 사용
+  //   v1.27: 신호가 약해 4초 넘게 응답이 없으면 저장해 둔 것을 먼저 보여 줌 (첫 화면에서 멈춰 있지 않게)
   if (url.origin === self.location.origin) {
-    e.respondWith(
-      fetch(req)
-        .then((res) => {
-          if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
-          return res;
-        })
-        .catch(() => caches.match(req, { ignoreSearch: true }).then((r) => r || caches.match('./index.html'))),
-    );
+    const net = fetch(req).then((res) => {
+      if (res.ok && !res.redirected) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
+      return res;
+    });
+    const fallback = () => caches.match(req, { ignoreSearch: true }).then((r) => r || caches.match('./index.html'));
+    e.respondWith(new Promise((resolve) => {
+      let done = false;
+      const finish = (r) => { if (!done) { done = true; resolve(r); } };
+      const t = setTimeout(() => { caches.match(req, { ignoreSearch: true }).then((hit) => { if (hit) finish(hit); }); }, 4000);
+      net.then((res) => { clearTimeout(t); finish(res); }).catch(() => { clearTimeout(t); finish(fallback()); });
+    }));
     return;
   }
 
-  // 글꼴·라이브러리(CDN): 캐시 우선
-  if (url.hostname === 'cdn.jsdelivr.net' || url.hostname === 'fastly.jsdelivr.net') {
-    e.respondWith(
-      caches.match(req).then((hit) => hit || fetch(req).then((res) => {
-        if (res.ok || res.type === 'opaque') { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)); }
-        return res;
-      })),
-    );
-  }
-  // 그 외(Supabase 서버 통신 등)는 건드리지 않음
+  // 그 외(Supabase 서버 통신 등)는 건드리지 않음 (v1.28: 글꼴·라이브러리는 이제 앱에 포함 — 외부 CDN 없음)
 });
 
 // 서버에서 보낸 알림(Web Push) 받기

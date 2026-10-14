@@ -1,0 +1,5 @@
+G마켓 산스 (GmarketSans) — Medium, Bold
+Copyright © 2019 eBay Korea Co., Ltd. (현 주식회사 지마켓)
+공식 배포: https://corp.gmarket.com/fonts/
+이 글꼴은 SIL Open Font License, Version 1.1 에 따라 사용합니다. 라이선스 전문: https://openfontlicense.org
+(파일: noonfonts_2001 v1.1 배포본의 GmarketSansMedium.woff / GmarketSansBold.woff 를 내용 변경 없이 woff2 형식으로만 바꿈)

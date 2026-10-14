@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.26';
+const VERSION = '1.28';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -55,7 +55,11 @@ async function moveToNewHome() {
     } catch {}
     try { if (window.caches) for (const k of await caches.keys()) await caches.delete(k); } catch {}
   })();
-  const go = async () => { await Promise.race([cleanup, new Promise((r) => setTimeout(r, 2500))]); location.replace(target); };
+  const go = async () => {
+    await Promise.race([cleanup, new Promise((r) => setTimeout(r, 2500))]);
+    try { if (window.caches) for (const k of await caches.keys()) await caches.delete(k); } catch { /* 없음 */ }   // 그사이 다시 저장된 파일(글꼴 등)도 지움
+    location.replace(target);
+  };
   $('#moveGo').onclick = (e) => { e.preventDefault(); go(); };
   if (!standalone) setTimeout(go, 4000);
   await new Promise(() => {});   // 여기서 멈춤 — 예전 주소에서는 앱을 시작하지 않음
@@ -72,6 +76,7 @@ try {
 // 상태
 // ---------------------------------------------------------------------
 const S = {
+  cst: new Map(), cstAt: 0,   // v1.28: 추가 이모티콘 ('c_번호' → { url, title, active })
   uid: null,
   entered: false,
   me: null,
@@ -165,9 +170,12 @@ function initials(name) {
   if (/^[가-힣]+$/.test(n)) return n.length <= 2 ? n : n.slice(-2);
   return n.slice(0, 2).toUpperCase();
 }
+// v1.27: 프로필 사진은 우리 저장소 주소(또는 이 기기에서 방금 고른 사진)만 보여 줌 — 남의 서버 주소로 접속 기록을 모으는 것 막기
+const AV_PREFIX = String(CONFIG.SUPABASE_URL || '').replace(/\/+$/, '') + '/storage/v1/object/public/avatars/';
+const okAvatar = (u) => typeof u === 'string' && (u.startsWith(AV_PREFIX) || /^(blob:|data:image\/)/.test(u));
 function av(p, size = 48) {
   const st = `width:${size}px;height:${size}px`;
-  if (p && p.avatar_url) return `<span class="av" style="${st}"><img src="${esc(p.avatar_url)}" alt="" loading="lazy"></span>`;
+  if (p && p.avatar_url && okAvatar(p.avatar_url)) return `<span class="av" style="${st}"><img src="${esc(p.avatar_url)}" alt="" loading="lazy"></span>`;
   const fs = Math.max(10, Math.round(size * 0.3));
   return `<span class="av" style="${st};background:${avColor(p && p.id)};font-size:${fs}px">${esc(initials(p ? p.display_name : '?'))}</span>`;
 }
@@ -226,6 +234,53 @@ function toastMsg({ person, title, body, onClick }) {
 const showErr = (e) => toast(e && e.message ? e.message : '오류가 발생했어요.', { error: true });
 
 // 아래에서 올라오는 시트
+// v1.28: 휴대폰 '뒤로' 버튼으로 열린 창(아래에서 올라오는 창·사진 보기)부터 닫기
+//   창을 열 때 기록을 하나 쌓고, 뒤로 가기를 누르면 그 창을 닫음. 버튼으로 닫으면 쌓은 기록도 되돌림
+//   (화면 이동과 함께 닫힌 창의 기록은 다음 뒤로 가기 때 건너뜀)
+let ovSeq = 0;
+const ovOpen = new Map();   // 번호 → 닫기 함수
+let backPending = false; const pushQueue = []; let backTimer = null;
+function ovPush(close, el) {
+  const id = ++ovSeq; ovOpen.set(id, close); if (el) close.el = el;
+  const doPush = () => { try { history.pushState({ kkOv: id }, ''); } catch { /* 없음 */ } };
+  if (backPending) pushQueue.push(doPush); else doPush();   // 되돌리는 중이면 끝난 뒤에 쌓음
+  return id;
+}
+// 화면에서 이미 사라진 창은 목록에서 뺌
+function ovPrune() { for (const [id, c] of ovOpen) if (c.el && !c.el.isConnected) ovOpen.delete(id); }
+// 앱 안의 '뒤로' 버튼: 지금 기록이 이미 닫힌 창의 것이면 한 번 더 되돌림
+let leaveAfterSkip = false;
+function appBack() {
+  ovPrune();
+  const st = history.state || {};
+  const stale = st.kkDead || (st.kkOv && !ovOpen.has(st.kkOv));
+  const run = () => { if (stale) leaveAfterSkip = true; history.back(); };   // 닫힌 창 기록들을 건너뛴 뒤 한 번 더
+  if (backPending) pushQueue.push(run); else run();
+}
+// 창 기록을 되돌리는 중이면 화면 이동은 그다음에 (순서가 꼬여 방이 다시 열리는 것 막기)
+function afterBack(fn) { if (backPending) pushQueue.push(fn); else fn(); }
+function flushBack() { backPending = false; clearTimeout(backTimer); pushQueue.splice(0).forEach((f) => f()); }
+function ovDone(id, nav = false) {
+  if (!ovOpen.delete(id)) return;
+  try {
+    if (!(history.state && history.state.kkOv === id)) return;
+    if (nav) { history.replaceState({ kkDead: 1 }, ''); return; }
+    backPending = true; history.back();
+    backTimer = setTimeout(flushBack, 400);   // 되돌리기가 취소돼도 화면 이동이 오래 기다리지 않게
+  } catch { /* 없음 */ }
+}
+window.addEventListener('popstate', (e) => {
+  if (backPending) { flushBack(); return; }   // 버튼으로 닫으며 되돌린 것
+  ovPrune();
+  const st = e.state || {};
+  const keep = st.kkOv && ovOpen.has(st.kkOv) ? st.kkOv : 0;
+  [...ovOpen.keys()].filter((id) => id > keep).sort((x, y) => y - x).forEach((id) => {
+    const c = ovOpen.get(id); ovOpen.delete(id); try { c(true); } catch { /* 없음 */ }
+  });
+  if (st.kkDead || (st.kkOv && !keep)) { try { history.back(); } catch { /* 없음 */ } return; }   // 이미 닫힌 창의 기록은 건너뜀
+  if (leaveAfterSkip) { leaveAfterSkip = false; try { history.back(); } catch { /* 없음 */ } }
+});
+
 function openSheet({ title = '', body = '', bare = false, closeOnly = false, onMount }) {
   const layer = $('#layer') || app;
   const back = document.createElement('div');
@@ -234,16 +289,18 @@ function openSheet({ title = '', body = '', bare = false, closeOnly = false, onM
     ? `<div class="sheet-close-only"><button class="ibtn" data-close aria-label="닫기">${ic('x', 22)}</button></div>`
     : `<div class="sheet-head"><h3>${esc(title)}</h3><button class="ibtn" data-close aria-label="닫기">${ic('x', 22)}</button></div>`;
   back.innerHTML = `<div class="sheet-dim" data-close></div><div class="sheet" role="dialog" aria-label="${esc(title)}"><div class="handle"></div>${head}${body}</div>`;
-  const close = () => { back.remove(); document.removeEventListener('keydown', onKey); };
+  let ovId = 0;
+  const close = (fromPop) => { back.remove(); document.removeEventListener('keydown', onKey); if (fromPop !== true) ovDone(ovId); };
   const onKey = (e) => { if (e.key === 'Escape') close(); };
   back.addEventListener('click', (e) => { if (e.target.closest('[data-close]')) close(); });
   document.addEventListener('keydown', onKey);
   layer.appendChild(back);
+  ovId = ovPush(close, back); back.dataset.ov = ovId;
   const sheet = $('.sheet', back);
   if (onMount) onMount(sheet, close);
   return { el: sheet, close };
 }
-const closeAllSheets = () => $$('.sheet-back').forEach((x) => x.remove());
+const closeAllSheets = () => $$('.sheet-back').forEach((x) => { ovDone(Number(x.dataset.ov), true); x.remove(); });   // 화면 이동과 함께 닫음
 function onSheetGone(sheet, fn) {
   new MutationObserver((_, obs) => { if (!sheet.isConnected) { obs.disconnect(); fn(); } })
     .observe($('#layer') || app, { childList: true });
@@ -297,7 +354,7 @@ async function prepareChatImage(file) {
     if (file.size > 5 * 1024 * 1024) throw new Error('GIF는 5MB 이하만 보낼 수 있어요.');
     return { blob: file, ext: 'gif' };
   }
-  return { blob: await resizeImage(file, 1600), ext: 'jpg' };
+  return { blob: await resizeImage(file, 1280), ext: 'jpg' };   // v1.27: 1600 → 1280px (휴대폰 화면에는 충분, 데이터 약 35% 절약)
 }
 
 // ---------------------------------------------------------------------
@@ -435,6 +492,40 @@ function setFieldErr(root, name, msg) {
   e.innerHTML = msg ? `${ic('alert', 16, 'flex:none')}${esc(msg)}` : '';
 }
 
+// v1.28: 로봇(자동 가입 프로그램) 막기 — Cloudflare Turnstile (js/config.js 에 CAPTCHA_SITE_KEY 를 넣었을 때만)
+//   평소에는 아무것도 안 보이고, 의심스러울 때만 '사람인지 확인' 상자가 잠깐 뜸
+const CAPTCHA_KEY = String(window.__captchaKey || CONFIG.CAPTCHA_SITE_KEY || '').trim();
+let tsLoad = null;
+function loadTurnstile() {
+  if (window.turnstile) return Promise.resolve();
+  if (!tsLoad) {
+    tsLoad = new Promise((res, rej) => {
+      const sc = document.createElement('script');
+      sc.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'; sc.async = true;
+      sc.onload = () => res(); sc.onerror = () => { tsLoad = null; rej(new Error('로봇 확인 도구를 불러오지 못했어요. 인터넷 연결을 확인해 주세요')); };
+      document.head.appendChild(sc);
+    });
+  }
+  return tsLoad;
+}
+async function getCaptchaToken() {
+  if (!CAPTCHA_KEY) return null;
+  await loadTurnstile();
+  let box = $('#capBox');
+  if (!box) { document.body.insertAdjacentHTML('beforeend', '<div id="capBox" class="cap-box" hidden><div class="cap-card"><b>사람인지 확인할게요</b><div id="capWidget"></div></div></div>'); box = $('#capBox'); }
+  return new Promise((resolve, reject) => {
+    let wid = null; let done = false;
+    const end = (fn, v) => { if (done) return; done = true; clearTimeout(tm); box.hidden = true; try { if (wid != null) window.turnstile.remove(wid); } catch { /* 없음 */ } fn(v); };
+    const tm = setTimeout(() => end(reject, new Error('로봇 확인 시간이 지났어요. 다시 시도해 주세요')), 90000);
+    wid = window.turnstile.render('#capWidget', {
+      sitekey: CAPTCHA_KEY, appearance: 'interaction-only', language: 'ko',
+      callback: (t) => end(resolve, t),
+      'error-callback': () => end(reject, new Error('로봇이 아닌지 확인하지 못했어요. 다시 시도해 주세요')),
+      'before-interactive-callback': () => { box.hidden = false; },
+    });
+  });
+}
+
 function renderAuth(mode = 'login') {
   const signup = mode === 'signup';
   app.innerHTML = authShell(`
@@ -446,6 +537,7 @@ function renderAuth(mode = 'login') {
         ${fieldHtml('password', '비밀번호', { type: 'password', ph: signup ? '6자 이상' : '비밀번호', auto: signup ? 'new-password' : 'current-password' })}
         ${signup ? fieldHtml('password2', '비밀번호 확인', { type: 'password', ph: '한 번 더 입력', auto: 'new-password' }) : ''}
         ${signup ? fieldHtml('phone', '휴대폰 번호 <span class="rec-tag">권장</span>', { type: 'tel', ph: '010-1234-5678', help: '번호를 넣으면 친구가 내 휴대폰 번호로 나를 바로 찾아 추가할 수 있어요. 번호는 다른 회원에게 보이지 않아요', auto: 'tel', max: 16 }) : ''}
+        ${signup ? `<label class="agree sub-agree" id="phoneAgreeRow" hidden><input type="checkbox" name="phoneAgree" value="yes"><span><b>[선택]</b> 휴대폰 번호 수집·이용에 동의해요<span class="agree-note">목적: 번호로 친구 찾기 · 보관: 직접 지우거나 탈퇴할 때까지 · 동의하지 않으면 번호 없이 가입돼요</span></span></label>` : ''}
       </div>
       ${signup ? `<div class="field agree-field" data-field="agree"><label class="agree"><input type="checkbox" name="agree" value="yes" id="f-agree">
         <span><a href="./terms.html" target="_blank" rel="noopener">이용약관</a>과 <a href="./privacy.html" target="_blank" rel="noopener">개인정보처리방침</a>에 동의하며, 만 14세 이상이에요 <b>(필수)</b></span></label>
@@ -460,7 +552,11 @@ function renderAuth(mode = 'login') {
   showInviteBanner();
   $$('.seg button').forEach((b) => (b.onclick = () => renderAuth(b.dataset.mode)));
   const form = $('#authForm');
-  form.addEventListener('input', (e) => { if (e.target.name) setFieldErr(form, e.target.name, ''); });
+  form.addEventListener('input', (e) => {
+    if (e.target.name) setFieldErr(form, e.target.name, '');
+    if (e.target.name === 'phone') { const row = $('#phoneAgreeRow', form); if (row) row.hidden = !e.target.value.trim(); }   // v1.28: 번호를 넣을 때만 [선택] 동의
+  });
+  form.addEventListener('change', (e) => { if (e.target.name === 'phoneAgree') setFieldErr(form, 'phone', ''); });
   form.addEventListener('change', (e) => { if (e.target.name === 'agree') setFieldErr(form, 'agree', ''); });
   form.onsubmit = async (e) => {
     e.preventDefault();
@@ -475,6 +571,7 @@ function renderAuth(mode = 'login') {
     if (signup && (!f.password2 || f.password2 !== f.password)) errs.password2 = '비밀번호가 일치하지 않아요';
     const phone = signup ? (f.phone || '').trim() : '';
     if (phone && !normPhone(phone)) errs.phone = '휴대폰 번호를 정확히 입력해 주세요 (예: 010-1234-5678)';
+    else if (phone && f.phoneAgree !== 'yes') errs.phone = "번호를 등록하려면 아래 '[선택] 휴대폰 번호 수집·이용'에 동의해 주세요 (원하지 않으면 번호 칸을 비워 주세요)";
     if (signup && f.agree !== 'yes') errs.agree = '약관에 동의해야 가입할 수 있어요';
     ['displayName', 'username', 'password', 'password2', 'phone', 'agree'].forEach((k) => setFieldErr(form, k, errs[k] || ''));
     if (Object.keys(errs).length) return;
@@ -487,15 +584,16 @@ function renderAuth(mode = 'login') {
     const btn = $('#authBtn');
     btn.disabled = true; btn.innerHTML = '<span class="spin-sm" style="width:18px;height:18px;border-width:2.5px;border-color:rgba(12,59,48,.25);border-top-color:#0C3B30"></span>';
     try {
+      const captchaToken = await getCaptchaToken();
       const id = signup
-        ? await api.signUp({ username, password: f.password, displayName: f.displayName })
-        : await api.signIn({ username, password: f.password });
+        ? await api.signUp({ username, password: f.password, displayName: f.displayName, captchaToken })
+        : await api.signIn({ username, password: f.password, captchaToken });
       let phoneErr = null;
       if (phone && api.setMyPhone) {
         try { const v = await api.setMyPhone(phone, true); S.phone = { phone: v, findable: true }; } catch (pe) { phoneErr = pe; }
       }
       await enterApp(id);
-      if (phoneErr) toast(`가입은 됐지만 휴대폰 번호는 저장하지 못했어요. ${phoneErr.message} (더보기에서 다시 등록할 수 있어요)`, { error: true, ms: 6000 });
+      if (phoneErr) toast(`가입은 됐지만 휴대폰 번호는 저장하지 못했어요. ${phoneErr.message} (더보기 → 휴대폰 번호에서 다시 등록하거나 확인을 요청할 수 있어요)`, { error: true, ms: 7000 });
     } catch (ex) {
       const msg = ex.message || '오류가 발생했어요.';
       setFieldErr(form, /아이디/.test(msg) && signup ? 'username' : 'password', msg);
@@ -513,10 +611,13 @@ async function enterApp(id) {
     S.me = await api.getMyProfile();
   } catch (e) {
     S.entered = false; S.uid = null;
+    // v1.27: 인터넷이 안 될 때는 로그인 화면 대신 '연결되면 다시 시도' 화면 (로그인은 그대로 유지)
+    if (!navigator.onLine || /인터넷 연결|Failed to fetch|NetworkError|Load failed/i.test(e.message || '')) { renderOfflineStart(id); return; }
     renderAuth();
     showErr(e);
     return;
   }
+  loadImgCache();
   // v1.18: 정지 기간이 끝났으면 풀고 들어감
   if (S.me.status === 'suspended' && api.refreshMyStatus) {
     try { if ((await api.refreshMyStatus()) === 'active') S.me = await api.getMyProfile(); } catch { /* 예전 데이터베이스 */ }
@@ -528,8 +629,9 @@ async function enterApp(id) {
   }
   cacheProfile(S.me);
   buildShell();
-  S.unsub = api.subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport, onInquiry, onInquiryAdmin, onUnfriended });
+  S.unsub = api.subscribe(rtHandlers());
   await Promise.all([loadFriends(), loadRooms(), loadBlocks(), loadAppInfo()]).catch(showErr);
+  loadCustomStickers();   // v1.28
   loadSuggestions();
   loadRequests();
   loadMyInquiries().then(() => { const b = $('#inqBadge'); if (b) b.innerHTML = inqBadgeHtml(); });   // v1.18
@@ -746,12 +848,39 @@ function maybeAskNotif(tries = 0) {
             if (p !== 'granted') { toast('알림이 허용되지 않았어요. 나중에 더보기 → 알림에서 켤 수 있어요', { error: true, ms: 4500 }); return; }
             if (push.supported()) await enablePush({ silent: true });
             toast('알림을 켰어요');
+            maybeSoundTip();
           }).catch((e) => { console.warn('push', e); toast('알림을 켜지 못했어요. 더보기 → 알림에서 다시 시도해 주세요', { error: true }); })
             .finally(() => { if (S.tab === 'more' && !S.room) renderMain(); });
         };
       },
     });
   }, 1500);
+}
+
+// v1.27: 알림을 켠 안드로이드 휴대폰에 한 번만 — 앱을 닫아 두었을 때도 '끼톡!' 으로 울리게 하는 방법 안내
+//   (앱을 닫았을 때 오는 알림의 소리는 웹앱이 정할 수 없고, 휴대폰 설정에서 소리 파일을 골라야 함)
+const SND_TIP_KEY = 'kkiri-snd-tip';
+function maybeSoundTip() {
+  const kind = phoneKind();
+  if (kind !== 'samsung' && kind !== 'android') return;
+  try { if (localStorage.getItem(SND_TIP_KEY)) return; localStorage.setItem(SND_TIP_KEY, '1'); } catch { if (S.sndTip) return; }
+  S.sndTip = true;
+  setTimeout(() => {
+    if ($('.sheet-back')) return;
+    openSheet({
+      title: '끼톡 알림음', bare: true,
+      body: `<div class="confirm notif-ask"><span class="notif-ask-ic">${ic('bell', 30)}</span><h3>앱을 닫아도 '끼톡!' 으로 울리게 할까요?</h3>
+        <p>앱을 보고 있을 때는 '끼톡!' 이 울리지만, <b>앱을 닫아 두었을 때 오는 알림 소리는 휴대폰이 정해요.</b><br>소리 파일을 받아 휴대폰 설정에서 ${esc(APP)} 알림음으로 한 번만 골라 두면 늘 '끼톡!' 으로 울려요.</p></div>
+        <div class="btn-col" style="gap:8px"><a class="btn" href="${SOUND_FILES.kkitok[0]}" download="${SOUND_FILES.kkitok[1]}" data-tip-dl>${ic('download', 18)}끼톡 소리 받기</a>
+          <button class="btn line" data-tip-how>설정 방법 보기</button>
+          <button class="btn text" data-no>다음에</button></div>`,
+      onMount(sheet, close) {
+        $('[data-no]', sheet).onclick = () => { close(); toast('더보기 → 알림 소리에서 언제든 할 수 있어요'); };
+        $('[data-tip-how]', sheet).onclick = () => { close(); setTimeout(showSoundSettings, 250); };
+        $('[data-tip-dl]', sheet).addEventListener('click', () => { setTimeout(() => { close(); setTimeout(showSoundSettings, 250); toast("받은 파일(kkitok)을 휴대폰 알림 소리에서 골라 주세요", { ms: 4500 }); }, 400); });
+      },
+    });
+  }, 1800);
 }
 
 function touchLastSeen() {
@@ -766,13 +895,15 @@ function renderBlocked(status) {
   app.innerHTML = `<div class="screen blocked"><div class="center">
       <div class="big-icon ${pending ? 'lemon' : 'pink'}">${ic(pending ? 'clock' : 'ban', 44)}</div>
       <h2>${pending ? '가입 승인을 기다리고 있어요' : '이용이 정지된 계정이에요'}</h2>
-      ${!pending && S.me.suspended_until ? `<p class="until">${esc(fmtDT(S.me.suspended_until))}까지 정지돼요</p>` : ''}
-      <p>${pending ? `관리자가 확인한 뒤 ${esc(APP)}을 쓸 수 있어요. 승인 소식을 들으면 아래 버튼을 눌러 주세요.` : '정지 기간에는 친구 추가와 대화를 할 수 없어요. 자세한 내용은 관리자에게 문의해 주세요.'}</p>
+      ${!pending && S.me.suspended_until ? `<p class="until">${esc(fmtDT(S.me.suspended_until))}까지 정지돼요</p>` : !pending ? '<p class="until">기간을 정하지 않은 정지예요</p>' : ''}
+      ${!pending ? '<p class="susp-reason" id="suspReason" hidden></p>' : ''}
+      <p>${pending ? `관리자가 확인한 뒤 ${esc(APP)}을 쓸 수 있어요. 승인 소식을 들으면 아래 버튼을 눌러 주세요.` : `정지 기간에는 친구 추가와 대화를 할 수 없어요. 정지에 이의가 있으면 30일 안에 ${CONTACT ? `<b>${esc(CONTACT)}</b> 로` : '운영자에게'} 알려 주세요. 검토 결과를 알려 드려요.`}</p>
       <div class="info-card"><div class="kv"><span>아이디</span><span>@${esc(S.me.username)}</span></div>
         <div class="kv"><span>${pending ? '신청일' : '이름'}</span><span>${pending ? fmtDay(S.me.created_at) : esc(S.me.display_name)}</span></div></div>
     </div>
     <div class="btn-col">${pending ? '<button class="btn" id="recheckBtn">승인 상태 새로고침</button><button class="btn text" id="blockedLogout">로그아웃</button><button class="btn text danger-text" id="blockedWithdraw" style="font-size:14px">가입 취소 (회원 탈퇴)</button>'
-    : '<button class="btn line" id="blockedLogout" style="font-weight:700">로그아웃</button>'}</div>${legalLinksHtml()}</div>`;
+    : '<button class="btn line" id="blockedLogout" style="font-weight:700">로그아웃</button><button class="btn text danger-text" id="blockedWithdraw" style="font-size:14px">회원 탈퇴</button>'}</div>${legalLinksHtml()}</div>`;
+  if (!pending && api.mySuspension) api.mySuspension().then((x) => { const el = $('#suspReason'); if (el && x && x.reason) { el.textContent = '사유: ' + x.reason; el.hidden = false; } });
   setOffline(!navigator.onLine);
   const re = $('#recheckBtn');
   if (re) re.onclick = async () => {
@@ -815,12 +946,45 @@ function askTerms() {
   });
 }
 
+const rtHandlers = () => ({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport, onInquiry, onInquiryAdmin, onUnfriended });
+// v1.27: 앱을 1분 넘게 안 보고 있고 알림(푸시)이 켜져 있으면 실시간 연결을 잠시 끊음
+//   → 휴대폰 데이터·배터리와 서버 동시 연결 수 절약 (그동안 새 메시지는 휴대폰 알림으로 옴). 다시 보면 바로 연결하고 놓친 것을 받아 옴
+let rtPauseT = null;
+document.addEventListener('visibilitychange', () => {
+  if (!S.entered) return;
+  clearTimeout(rtPauseT);
+  if (document.hidden) {
+    rtPauseT = setTimeout(() => {
+      if (!document.hidden || !S.entered || !S.pushOn || !S.unsub) return;
+      try { S.unsub(); } catch { /* 무시 */ }
+      S.unsub = null; S.rtPaused = true; S.rtUp = false;
+    }, 60000);
+  } else if (S.rtPaused) {
+    S.rtPaused = false;
+    S.unsub = api.subscribe(rtHandlers());   // 연결되면 onStatus 가 놓친 것을 받아 옴
+  }
+});
+
+function renderOfflineStart(id) {
+  app.innerHTML = `<div class="screen blocked"><div class="center">
+      <div class="big-icon lemon">${ic('alert', 44)}</div>
+      <h2>인터넷에 연결되지 않았어요</h2>
+      <p>와이파이나 모바일 데이터를 확인해 주세요.<br>연결되면 자동으로 다시 시도해요.</p></div>
+    <div class="btn-col"><button class="btn" id="netRetry">다시 시도</button></div></div>`;
+  const retry = () => { window.removeEventListener('online', retry); if (!S.entered) enterApp(id); };
+  $('#netRetry').onclick = retry;
+  window.addEventListener('online', retry);
+}
+
 function leaveApp() {
   if (!S.entered) return;
+  if (backPending) flushBack();   // v1.28: 창 기록 되돌리기를 기다리지 않음
+  if (S.room) closeRoom();   // v1.27: 방 타이머·감시 정리
   if (S.unsub) { try { S.unsub(); } catch { /* 무시 */ } }
+  clearImgCache();
   Object.assign(S, {
     uid: null, entered: false, me: null, friends: [], rooms: [], roomsLoaded: false, room: null,
-    fromList: false, unsub: null, wasSubscribed: false, tab: 'friends', pushOn: false,
+    fromList: false, unsub: null, wasSubscribed: false, rtPaused: false, rtUp: false, tab: 'friends', pushOn: false, friendQuery: '',
     admin: null, adminFromMore: false, lastTouch: 0, pending: 0, suggestions: [], phone: undefined,
     requests: [], chatFilter: 'all', blocks: new Set(), myInq: [], inqUnread: 0, openReports: 0, openInquiries: 0,
   });
@@ -837,12 +1001,14 @@ function buildShell() {
   <div id="main" class="screen main">
     <div class="top" id="mainHeader"></div>
     <div class="scroll" id="mainBody"></div>
+    <div class="idx-bar" id="idxBar" hidden aria-label="이름 색인"></div>
     <nav class="tabbar">${tabs.map(([k, l, i]) => `<button data-act="tab" data-tab="${k}" aria-label="${l}"><span class="pill">${ic(i, 24)}${k === 'chats' ? '<span class="tab-badge" id="chatBadge"></span>' : k === 'friends' ? '<span class="tab-badge" id="friendBadge"></span>' : ''}</span><span class="lbl">${l}</span></button>`).join('')}</nav>
   </div>
   <div id="admin" class="screen admin" hidden></div>
   <div id="room" class="screen room" hidden></div>
   <div id="layer"></div>`;
   setOffline(!navigator.onLine);
+  wireFriendIndex();
 }
 
 // ---------------------------------------------------------------------
@@ -872,11 +1038,11 @@ function route() {
   if (S.tab === 'ads') loadAds();   // v1.16: 광고 탭을 열 때마다 새로 불러옴
 }
 window.addEventListener('hashchange', route);
-function go(hash) { if (location.hash !== hash) location.hash = hash; else route(); }
+function go(hash) { afterBack(() => { if (location.hash !== hash) location.hash = hash; else route(); }); }
 function goRoom(id) { closeAllSheets(); S.fromList = !(S.room); go('#/room/' + id); }
 function backFromRoom() {
-  if (S.fromList) { S.fromList = false; history.back(); }
-  else location.replace('#/' + (S.tab || 'chats'));
+  if (S.fromList) { S.fromList = false; appBack(); }   // v1.28: 닫힌 창의 기록은 건너뛰고 되돌림
+  else afterBack(() => location.replace('#/' + (S.tab || 'chats')));
 }
 
 // ---------------------------------------------------------------------
@@ -952,11 +1118,103 @@ function setBadge(n) {
 // ---------------------------------------------------------------------
 // 메인 탭 화면
 // ---------------------------------------------------------------------
+// v1.28: 친구 목록 ㄱㄴㄷ 순 정렬 · 색인(오른쪽 ㄱ~ㅎ 막대) · 이름/초성 검색 (예: ㄱㅁㅅ → 김민수)
+const CHO = 'ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ';
+const CHO_BASE = { 'ㄲ': 'ㄱ', 'ㄸ': 'ㄷ', 'ㅃ': 'ㅂ', 'ㅆ': 'ㅅ', 'ㅉ': 'ㅈ' };
+const IDX_ORDER = [...'ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎABCDEFGHIJKLMNOPQRSTUVWXYZ#'];
+const IDX_MIN_HEADERS = 10;   // 친구가 이만큼 넘으면 ㄱ·ㄴ… 머리글
+const IDX_MIN_BAR = 15;       // 이만큼 넘으면 오른쪽 색인 막대
+const SEARCH_MIN = 5;         // 이만큼 넘으면 친구 검색 칸
+function choOf(ch) {
+  const c = ch ? ch.charCodeAt(0) : 0;
+  if (c >= 0xAC00 && c <= 0xD7A3) return CHO[Math.floor((c - 0xAC00) / 588)];
+  return CHO.includes(ch) ? ch : null;
+}
+function idxKey(name) {
+  const ch = [...String(name || '').trim()][0] || '';
+  const k = choOf(ch); if (k) return CHO_BASE[k] || k;
+  const u = ch.toUpperCase(); return /^[A-Z]$/.test(u) ? u : '#';
+}
+const idxRank = (k) => { const i = IDX_ORDER.indexOf(k); return i < 0 ? IDX_ORDER.length : i; };
+function sortFriends(list) {
+  return list.slice().sort((a, b) => idxRank(idxKey(a.display_name)) - idxRank(idxKey(b.display_name))
+    || String(a.display_name || '').localeCompare(String(b.display_name || ''), 'ko'));
+}
+// 이름(띄어쓰기 무시)·아이디에 들어 있거나, 자음만 쓴 글자는 초성으로 비교 (ㄱㅁ, 김ㅁ 모두 '김민수' 찾음)
+function matchFriend(f, raw) {
+  const q = String(raw || '').toLowerCase().replace(/\s+/g, '');
+  if (!q) return true;
+  const name = [...String(f.display_name || '').toLowerCase().replace(/\s+/g, '')];
+  if (String(f.username || '').toLowerCase().includes(q.replace(/^@/, ''))) return true;
+  const qs = [...q];
+  for (let i = 0; i + qs.length <= name.length; i++) {
+    if (qs.every((c, j) => c === name[i + j] || (CHO.includes(c) && choOf(name[i + j]) === c))) return true;
+  }
+  return false;
+}
+function friendRowHtml(f) {
+  return `<button class="row" data-act="profile" data-id="${esc(f.id)}">${av(f, 48)}
+          <div class="meta"><div class="name">${esc(f.display_name)}</div>${f.mutual === false ? '<div class="desc">아직 상대방이 나를 추가하지 않았어요</div>' : f.status_message ? `<div class="desc">${esc(f.status_message)}</div>` : ''}</div></button>`;
+}
+function friendListHtml() {
+  const q = S.friendQuery || '';
+  const list = sortFriends(S.friends).filter((f) => matchFriend(f, q));
+  if (!list.length) return `<div class="empty-line">‘${esc(q)}’ 에 맞는 친구가 없어요</div>`;
+  const heads = !q && S.friends.length >= IDX_MIN_HEADERS;
+  let out = ''; let last = null;
+  for (const f of list) {
+    const k = idxKey(f.display_name);
+    if (heads && k !== last) { out += `<div class="idx-sec" data-k="${esc(k)}">${esc(k)}</div>`; last = k; }
+    out += friendRowHtml(f);
+  }
+  return out;
+}
+function updateIdxBar() {
+  const bar = $('#idxBar'); const body = $('#mainBody');
+  if (!bar || !body) return;
+  const show = S.tab === 'friends' && !S.room && !S.friendQuery && S.friends.length >= IDX_MIN_BAR;
+  bar.hidden = !show;
+  if (!show) { bar.innerHTML = ''; return; }
+  const have = new Set(S.friends.map((f) => idxKey(f.display_name)));
+  const keys = IDX_ORDER.filter((k) => /[ㄱ-ㅎ]/.test(k) || have.has(k));   // ㄱ~ㅎ 은 늘 보이고, 영문·# 은 있을 때만
+  bar.innerHTML = keys.map((k) => `<span data-k="${esc(k)}" class="${have.has(k) ? '' : 'off'}">${esc(k)}</span>`).join('');
+  bar.style.top = body.offsetTop + 'px'; bar.style.height = body.clientHeight + 'px';
+}
+function jumpToIdx(k) {
+  const body = $('#mainBody'); if (!body) return;
+  const secs = $$('.idx-sec', body);
+  const target = secs.find((x) => x.dataset.k === k) || secs.find((x) => idxRank(x.dataset.k) > idxRank(k)) || secs[secs.length - 1];
+  if (target) body.scrollTop = target.offsetTop - body.offsetTop - 4;
+  let bub = $('#idxBubble');
+  if (!bub) { $('#main').insertAdjacentHTML('beforeend', '<div class="idx-bubble" id="idxBubble"></div>'); bub = $('#idxBubble'); }
+  bub.textContent = k; bub.classList.add('on');
+  clearTimeout(bub._t); bub._t = setTimeout(() => bub.classList.remove('on'), 600);
+}
+function wireFriendIndex() {
+  const body = $('#mainBody'); const bar = $('#idxBar');
+  body.addEventListener('input', (e) => {
+    if (e.target.id !== 'friendQ') return;
+    S.friendQuery = e.target.value;
+    const box = $('#friendList'); if (box) box.innerHTML = friendListHtml();
+    const x = $('#friendQClear'); if (x) x.hidden = !S.friendQuery;
+    updateIdxBar();
+  });
+  let dragging = false;
+  const pick = (e) => { const el = document.elementFromPoint(e.clientX, e.clientY); const k = el && el.closest && el.closest('#idxBar [data-k]'); if (k) jumpToIdx(k.dataset.k); };
+  bar.addEventListener('pointerdown', (e) => { dragging = true; try { bar.setPointerCapture(e.pointerId); } catch { /* 없음 */ } pick(e); e.preventDefault(); });
+  bar.addEventListener('pointermove', (e) => { if (dragging) pick(e); });
+  const stop = () => { dragging = false; };
+  bar.addEventListener('pointerup', stop); bar.addEventListener('pointercancel', stop);
+  window.addEventListener('resize', () => updateIdxBar());
+}
+
 function renderMain() {
   const head = $('#mainHeader'); const body = $('#mainBody');
   if (!head) return;
   $$('.tabbar button').forEach((b) => b.classList.toggle('on', b.dataset.tab === S.tab));
   $('#main').classList.toggle('gray', S.tab === 'more');
+  const qFocus = document.activeElement && document.activeElement.id === 'friendQ' ? document.activeElement.selectionStart : null;
+  if (S.tab !== 'friends' && S.friendQuery) S.friendQuery = '';
   if (S.tab === 'friends') {
     head.innerHTML = `<h1>친구</h1><button class="ibtn" data-act="add-friend" aria-label="친구 추가">${ic('userplus', 24)}</button>`;
     const me = S.me;
@@ -974,13 +1232,16 @@ function renderMain() {
           <span class="meta"><span class="name">${esc(g.display_name)}</span><span class="desc">${esc([g.contact_name ? `내 연락처: ${g.contact_name}` : '내 연락처에 있는 친구', g.added_me ? '나를 친구로 추가했어요' : ''].filter(Boolean).join(' · '))}</span></span></button>
           <button class="mini-btn" data-act="sug-add" data-id="${esc(g.id)}">추가</button>
           <button class="ibtn sm" data-act="sug-hide" data-id="${esc(g.id)}" aria-label="추천에서 숨기기">${ic('x', 18)}</button></div>`).join('')}` : ''}
-      ${S.friends.length ? `<div class="sec">친구 ${S.friends.length}</div>${S.friends.map((f) => `
-        <button class="row" data-act="profile" data-id="${esc(f.id)}">${av(f, 48)}
-          <div class="meta"><div class="name">${esc(f.display_name)}</div>${f.mutual === false ? '<div class="desc">아직 상대방이 나를 추가하지 않았어요</div>' : f.status_message ? `<div class="desc">${esc(f.status_message)}</div>` : ''}</div></button>`).join('')}`
+      ${S.friends.length ? `<div class="sec">친구 ${S.friends.length}</div>
+        ${S.friends.length >= SEARCH_MIN ? `<div class="f-search">${ic('search', 18, 'flex:none;color:var(--ink3)')}<input id="friendQ" type="search" placeholder="이름·초성으로 찾기 (예: ㄱㅁㅅ)" value="${esc(S.friendQuery || '')}" autocomplete="off" aria-label="친구 검색"><button class="ibtn sm" id="friendQClear" data-act="friend-q-clear" aria-label="검색어 지우기" ${S.friendQuery ? '' : 'hidden'}>${ic('x', 16)}</button></div>` : ''}
+        <div id="friendList">${friendListHtml()}</div>`
     : (sugList().length || S.requests.length) ? '<div class="empty-line" style="padding-top:20px">아직 친구가 없어요. 받은 요청이나 추천 친구를 추가하거나 아이디·휴대폰 번호로 찾아보세요.</div>'
     : `<div class="empty-state" style="padding-top:28px"><div class="es-icon lav">${ic('logo', 64)}</div><b>아직 친구가 없어요</b><p>친구의 아이디나 휴대폰 번호로 찾아서 추가해 보세요.</p>
         <button class="btn sm" data-act="invite">${ic('share', 20)}친구 초대하기</button></div>`}`;
+    if (qFocus != null) { const qi = $('#friendQ'); if (qi) { qi.focus(); try { qi.setSelectionRange(qFocus, qFocus); } catch { /* 없음 */ } } }
+    requestAnimationFrame(updateIdxBar);
   } else if (S.tab === 'chats') {
+    updateIdxBar();
     head.innerHTML = `<h1>채팅</h1><button class="ibtn" data-act="new-chat" aria-label="새 채팅">${ic('chatplus', 24)}</button>`;
     if (!S.roomsLoaded) { body.innerHTML = '<div class="spinner"></div>'; return; }
     if (S.rooms.length) {
@@ -998,8 +1259,10 @@ function renderMain() {
     body.innerHTML = `<div class="empty-state" style="padding-top:72px"><div class="es-icon sky">${ic('chat', 52)}</div><b>대화 중인 채팅방이 없어요</b><p>친구를 골라 첫 대화를 시작해 보세요.</p>
         <button class="btn sm" data-act="new-chat">${ic('chatplus', 20)}새 채팅</button></div>`;
   } else if (S.tab === 'ads') {
+    updateIdxBar();
     renderAds(head, body);
   } else {
+    updateIdxBar();
     renderMore(head, body);
   }
 }
@@ -1166,6 +1429,7 @@ async function openRoom(id) {
       <div class="ttl" id="roomTitle"></div>
       <button class="ibtn" data-act="room-mute" id="roomMuteBtn" aria-label="이 방 알림 끄기" hidden>${ic('bell', 22)}</button>
       <button class="ibtn" data-act="room-menu" id="roomMenuBtn" aria-label="채팅방 메뉴" hidden>${ic('menu', 24)}</button></div>
+    <div class="safety-bar" id="safetyBar" role="note" hidden></div>
     <div class="msgs-wrap"><div class="msgs" id="msgs"><div class="spinner"></div></div>
       <button class="new-pill" id="newPill" data-act="to-bottom" hidden>새 메시지${ic('down', 16)}</button>
       <div class="stk-preview" id="stkPreview" hidden></div></div>
@@ -1186,15 +1450,19 @@ async function openRoom(id) {
   try {
     const [info, members, msgs] = await Promise.all([api.getRoom(id), api.getMembers(id), api.getMessages(id)]);
     if (token !== S.roomToken) return;
-    if (!info) { toast('대화방을 찾을 수 없어요', { error: true }); closeRoom(); location.replace('#/chats'); return; }
+    if (!info) { toast('대화방을 찾을 수 없어요', { error: true }); closeRoom(); afterBack(() => location.replace('#/chats')); return; }
     S.room.info = info;
     if (info.is_notice) { setupNoticeComposer(); $('#roomMuteBtn').hidden = false; } else $('#roomMenuBtn').hidden = false;
     setMembers(members);
-    S.room.msgs = msgs;
+    // v1.27: 불러오는 사이 실시간으로 도착한 메시지가 사라지지 않게 합침
+    const got = new Set(msgs.map((m) => m.id));
+    const early = S.room.msgs.filter((m) => !got.has(m.id));
+    S.room.msgs = early.length ? msgs.concat(early.filter((m) => isNum(m.id))).sort((a, b) => a.id - b.id).concat(early.filter((m) => !isNum(m.id))) : msgs;
     S.room.syncedId = msgs.reduce((a, m) => (isNum(m.id) && m.id > a ? m.id : a), 0);   // v1.19: 서버에서 직접 받아 온 마지막 번호
     S.room.hasMore = msgs.length >= 50;
     msgs.slice(-5).forEach((m) => { if (m.kind === 'sticker') markAnim(m); });
     renderRoomHeader();
+    updateSafetyBar();
     renderMsgs();
     scrollBottom();
     markReadSoon();
@@ -1213,7 +1481,7 @@ function setupNoticeComposer() {
     $('[data-act=attach]', comp).hidden = true;
     $('[data-act=stickers]', comp).hidden = true;
     $('#msgInput').placeholder = '모든 회원에게 보낼 공지를 입력하세요';
-    comp.insertAdjacentHTML('afterbegin', `<div class="hint-line">${ic('mega', 14)}관리자 공지 작성 · 모든 회원에게 전달돼요</div>`);
+    comp.insertAdjacentHTML('afterbegin', `<div class="hint-line">${ic('mega', 14)}관리자 공지 작성 · 모든 회원에게 알림으로 전달돼요</div><div class="hint-line warn">${ic('alert', 14)}서비스 안내만 보내 주세요. 광고·홍보·이벤트는 보낼 수 없어요(수신 동의 없는 광고 알림은 법으로 금지)</div>`);
   } else {
     comp.outerHTML = `<div class="notice-bar">${ic('lock', 18)}공지사항은 관리자만 작성할 수 있어요</div>`;
   }
@@ -1243,6 +1511,28 @@ function renderRoomHeader() {
   $('#roomTitle').innerHTML = `${info.is_notice ? `<span class="mega-dot">${ic('mega', 16)}</span>` : ''}<span class="t">${esc(name)}</span>${info.is_group && !info.is_notice ? `<span class="c">${S.room.members.length}</span>` : ''}${isMuted(S.room.id) ? `<span class="mute-ic" aria-label="알림 꺼짐">${ic('belloff', 16)}</span>` : ''}`;
   const mb = $('#roomMuteBtn');
   if (mb) { const m = isMuted(S.room.id); mb.innerHTML = ic(m ? 'belloff' : 'bell', 22); mb.setAttribute('aria-label', m ? '이 방 알림 켜기' : '이 방 알림 끄기'); mb.classList.toggle('off', m); }
+}
+
+// v1.27: 새로 시작한(14일 안) 1:1 대화나 서로 친구가 아닌 사람과의 대화 — 사칭·사기(돈·인증번호 요구) 주의 안내
+//   (휴대폰 번호는 문자 인증을 하지 않아 다른 사람이 가족·지인 번호로 가입했을 수 있음. 방마다 닫으면 다시 안 보임)
+const SAFE_KEY = 'kkiri-safe-ok';
+function safeDismissed(id) { try { return JSON.parse(localStorage.getItem(SAFE_KEY) || '[]').includes(id); } catch { return false; } }
+function dismissSafety(id) {
+  try { const a = JSON.parse(localStorage.getItem(SAFE_KEY) || '[]').filter((x) => x !== id); a.push(id); localStorage.setItem(SAFE_KEY, JSON.stringify(a.slice(-300))); } catch { /* 저장 안 됨 */ }
+}
+function updateSafetyBar() {
+  const el = $('#safetyBar'); const R = S.room;
+  if (!el || !R || !R.info) return;
+  let show = false; let notFriend = false;
+  if (!R.info.is_group && !R.info.is_notice && !safeDismissed(R.id)) {
+    const other = roomOthers()[0];
+    const f = other && S.friends.find((x) => x.id === other.id);
+    notFriend = !!other && !(f && f.mutual);
+    const fresh = !R.info.created_at || Date.now() - Date.parse(R.info.created_at) < 14 * 864e5;
+    show = !!other && (notFriend || fresh);
+  }
+  el.hidden = !show;
+  el.innerHTML = show ? `${ic('shield', 18, 'flex:none')}<div class="tx"><b>${notFriend ? '서로 친구가 아닌 사람과의 대화예요' : '새로 시작한 대화예요. 아는 사람이 맞나요?'}</b><span>가족·지인인 척하며 돈·상품권·인증번호를 요구하거나 링크·앱 설치를 권하면 사기일 수 있어요. 의심되면 전화로 확인하고, 프로필을 눌러 차단·신고하세요.</span></div><button class="x" data-act="safety-ok" aria-label="안내 닫기">${ic('x', 16)}</button>` : '';
 }
 
 const isNoticeRoom = () => !!(S.room && S.room.info && S.room.info.is_notice);
@@ -1278,9 +1568,9 @@ function msgHtml(m, prev, next) {
   const content = hidden ? `<div class="bubble deleted blocked">${ic('userx', 15, 'flex:none')}차단한 사용자의 메시지예요</div>`
     : gone ? expiredBubble(m)
     : m.kind === 'image'
-    ? `<button class="bubble photo" data-act="view-img" data-id="${esc(m.id)}" aria-label="사진 크게 보기"><img alt="사진" ${m.localUrl ? `src="${esc(m.localUrl)}"` : ''} data-path="${esc(m.content)}"></button>`
+    ? `<button class="bubble photo" data-act="view-img" data-id="${esc(m.id)}" aria-label="사진 크게 보기"><img alt="사진" loading="lazy" decoding="async" ${m.localUrl ? `src="${esc(m.localUrl)}"` : ''} data-path="${esc(m.content)}"></button>`
     : m.kind === 'deleted' ? `<div class="bubble deleted">${ic('ban', 15, 'flex:none')}삭제된 메시지예요</div>`
-    : m.kind === 'sticker' ? `<button class="bubble sticker" data-act="replay-sticker" aria-label="이모티콘 다시 움직이기">${stickerSvg(m.content, 120)}</button>`
+    : m.kind === 'sticker' ? `<button class="bubble sticker" data-act="replay-sticker" data-id="${esc(m.id)}" aria-label="이모티콘 다시 움직이기">${stkHtml(m.content, 120)}</button>`
     : m.kind === 'file' ? fileBubble(m)
     : m.kind === 'contact' ? contactBubble(m)
       : `<div class="bubble">${m.reply_to && !notice ? quoteHtml(m) : ''}${notice ? noticeText(m.content) : linkify(m.content)}</div>`;
@@ -1359,6 +1649,33 @@ function updateReadCounts() {
   });
 }
 
+// v1.27: 사진 주소를 기기에 5시간 기억 → 앱을 다시 열어도 같은 주소라 휴대폰에 저장된 사진을 다시 받지 않음 (데이터 절약)
+//        로그아웃하면 지움
+const IMG_TTL = 5 * 3600 * 1000;
+const imgCacheKey = () => 'kkiri-img-' + S.uid;
+function loadImgCache() {
+  try {
+    const o = JSON.parse(localStorage.getItem(imgCacheKey()) || '{}'); const now = Date.now();
+    for (const [p, v] of Object.entries(o)) if (v && typeof v.u === 'string' && /^https:/.test(v.u) && now - v.t < IMG_TTL) S.imgUrls.set(p, { url: v.u, t: v.t });
+  } catch { /* 저장 안 됨 */ }
+}
+let imgSaveT = null;
+function saveImgCacheSoon() {
+  clearTimeout(imgSaveT);
+  const key = imgCacheKey();
+  imgSaveT = setTimeout(() => {
+    if (!S.uid || key !== imgCacheKey()) return;
+    try {
+      const now = Date.now();
+      const ents = [...S.imgUrls.entries()].filter(([, v]) => /^https:/.test(v.url) && now - v.t < IMG_TTL).slice(-400);
+      localStorage.setItem(key, JSON.stringify(Object.fromEntries(ents.map(([p, v]) => [p, { u: v.url, t: v.t }]))));
+    } catch { /* 저장 공간 없음 */ }
+  }, 1500);
+}
+function clearImgCache() {
+  try { Object.keys(localStorage).filter((k) => k.startsWith('kkiri-img-')).forEach((k) => localStorage.removeItem(k)); } catch { /* 없음 */ }
+}
+
 async function hydrateImages() {
   const imgs = $$('#msgs img[data-path]').filter((i) => !i.getAttribute('src'));
   if (!imgs.length) return;
@@ -1370,6 +1687,7 @@ async function hydrateImages() {
     try {
       const urls = await api.imageUrls(need);
       for (const [p, u] of Object.entries(urls)) S.imgUrls.set(p, { url: u, t: now });
+      saveImgCacheSoon();
     } catch (e) { console.warn(e); }
   }
   imgs.forEach((img) => { const c = S.imgUrls.get(img.dataset.path); if (c && img.isConnected) img.src = c.url; });
@@ -1472,14 +1790,17 @@ function watchReads() {
   // v1.16.1: 실시간 읽음 신호가 늦거나 빠져도 '1' 이 남지 않게 — 내 메시지를 아직 안 읽은 사람이 있을 때만 확인
   //          (대화 중엔 4초마다, 1분 넘게 조용하면 20초마다)
   R.lastActivity = Date.now();
+  //   v1.27: 대화 중엔 10초, 1분 넘게 조용하면 30초마다, 10분 넘게 조용하면 멈춤(다시 대화하면 이어서) — 데이터·서버 요청 절약
   if (!R.pollReads && !(R.info && R.info.is_notice)) {
     let tick = 0;
     R.pendTimer = setInterval(() => {
       tick++;
       if (document.hidden || S.room !== R || !myReadPending(R)) return;
-      if (Date.now() - R.lastActivity > 60000 && tick % 5) return;
+      const idle = Date.now() - R.lastActivity;
+      if (idle > 600000) return;
+      if (idle > 60000 ? tick % 6 : tick % 2) return;
       refreshReads();
-    }, 4000);
+    }, 5000);
   }
 }
 function myReadPending(R) {
@@ -1496,9 +1817,9 @@ function stopWatchReads(R) {
 async function refreshReads() {
   const R = S.room; if (!R) return;
   try {
-    const rows = await api.getMembers(R.id);
+    const rows = await (api.getReads ? api.getReads(R.id) : api.getMembers(R.id));   // v1.27: 읽음 위치만 가볍게
     if (S.room !== R) return;
-    if (rows.length !== R.members.length) { setMembers(rows); renderRoomHeader(); renderMsgs(); return; }
+    if (rows.length !== R.members.length) { refreshMembers(); return; }
     rows.forEach((r) => { if (r.profiles) cacheProfile(r.profiles); const mb = R.members.find((x) => x.id === r.user_id); if (mb) mb.last_read_id = r.last_read_id; });
     updateReadCounts();
   } catch (e) { console.warn(e); }
@@ -1602,18 +1923,19 @@ function wireComposer() {
   wireSwipeReply(box, cancelLp, msgOf);
   // 길게 누른 뒤 손을 뗄 때 생기는 클릭(사진 열기 등)은 무시
   box.addEventListener('click', (e) => { if (S.room && S.room.suppressClick) { S.room.suppressClick = false; e.stopPropagation(); e.preventDefault(); } }, true);
+  // v1.27: 고른 순간의 방을 기억 → 보내는 도중 다른 방으로 옮겨도 나머지가 엉뚱한 방으로 가지 않음
   $('#photoInput').onchange = async (e) => {
-    const files = [...e.target.files]; e.target.value = '';
-    for (const f of files.slice(0, 10)) await sendPhoto(f);
+    const files = [...e.target.files]; e.target.value = ''; const R = S.room;
+    for (const f of files.slice(0, 10)) await sendPhoto(f, null, R);
   };
   $('#cameraInput').onchange = async (e) => {
-    const f = e.target.files[0]; e.target.value = '';
-    if (f) await sendPhoto(f);
+    const f = e.target.files[0]; e.target.value = ''; const R = S.room;
+    if (f) await sendPhoto(f, null, R);
   };
   $('#fileInput').onchange = async (e) => {
-    const files = [...e.target.files]; e.target.value = '';
+    const files = [...e.target.files]; e.target.value = ''; const R = S.room;
     if (files.length > 10) toast('파일은 한 번에 10개까지 보낼 수 있어요');
-    for (const f of files.slice(0, 10)) await sendFileMsg(f);
+    for (const f of files.slice(0, 10)) await sendFileMsg(f, null, R);
   };
 }
 
@@ -1728,9 +2050,27 @@ function markDeleted(roomId, id) {
 function onDeleted(p) { markDeleted(p.room_id, p.id); }
 
 // ---------- 이모티콘 ----------
+// v1.28: 관리자가 올린 추가 이모티콘 (메시지에는 'c_번호' 로 저장)
+async function loadCustomStickers(force = false) {
+  if (!api.listCustomStickers || (!force && Date.now() - S.cstAt < 10 * 60 * 1000)) return;
+  try {
+    const rows = await api.listCustomStickers();
+    S.cst = new Map(rows.map((r) => [`c_${r.id}`, { id: `c_${r.id}`, rid: r.id, url: api.stickerUrl(r.image_path), title: r.title || '이모티콘', active: r.active, path: r.image_path }]));
+    S.cstAt = Date.now();
+    if (S.room) $$('#msgs .bubble.sticker .cst-miss').forEach((x) => { const b = x.closest('.bubble'); const m = b && S.room.msgs.find((y) => String(y.id) === b.dataset.id); if (m) b.innerHTML = stkHtml(m.content, 120); });
+  } catch (e) { console.warn('stickers', e); }
+}
+const isCustom = (id) => /^c_\d+$/.test(String(id || ''));
+const stickerOk = (id) => (isCustom(id) ? !!(S.cst.get(id) || {}).active : STICKERS.some((x) => x.id === id));
+function stkHtml(id, size = 120) {
+  if (!isCustom(id)) return stickerSvg(id, size);
+  const c = S.cst.get(id);
+  if (!c) return `<span class="cst-miss">${stickerSvg('?', size)}</span>`;
+  return `<img class="cst" src="${esc(c.url)}" width="${size}" height="${size}" alt="${esc(c.title)}" loading="lazy" decoding="async" draggable="false">`;
+}
 const RECENT_KEY = 'minitalk-recent-stickers';
 function recentStickers() {
-  try { const v = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]'); return Array.isArray(v) ? v.filter((id) => STICKERS.some((x) => x.id === id)).slice(0, 8) : []; }
+  try { const v = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]'); return Array.isArray(v) ? v.filter(stickerOk).slice(0, 8) : []; }
   catch { return []; }
 }
 function rememberSticker(id) {
@@ -1742,9 +2082,13 @@ function toggleStickers(open) {
   const show = open === undefined ? panel.hidden : open;
   if (show) {
     const rec = recentStickers();
-    const cell = (s) => `<button class="stk" data-act="pick-sticker" data-id="${esc(s.id)}" aria-label="${esc(s.label)} 이모티콘">${stickerSvg(s.id, 76)}</button>`;
-    panel.innerHTML = `${rec.length ? `<div class="stk-sec">최근 사용</div><div class="stk-grid">${rec.map((id) => cell(STICKERS.find((x) => x.id === id))).join('')}</div><div class="stk-sec">전체</div>` : ''}
-      <div class="stk-grid">${STICKERS.map(cell).join('')}</div>`;
+    loadCustomStickers();
+    const label = (id) => (isCustom(id) ? (S.cst.get(id) || {}).title : (STICKERS.find((x) => x.id === id) || {}).label) || '이모티콘';
+    const cell = (id) => `<button class="stk" data-act="pick-sticker" data-id="${esc(id)}" aria-label="${esc(label(id))} 이모티콘">${stkHtml(id, 76)}</button>`;
+    const extra = [...S.cst.values()].filter((c) => c.active).map((c) => c.id);
+    panel.innerHTML = `${rec.length ? `<div class="stk-sec">최근 사용</div><div class="stk-grid">${rec.map(cell).join('')}</div>` : ''}
+      ${extra.length ? `<div class="stk-sec">새 이모티콘</div><div class="stk-grid">${extra.map(cell).join('')}</div>` : ''}
+      ${rec.length || extra.length ? '<div class="stk-sec">톡이</div>' : ''}<div class="stk-grid">${STICKERS.map((x) => cell(x.id)).join('')}</div>`;
     panel.scrollTop = 0;
     const ta = $('#msgInput'); if (ta) ta.blur();
   }
@@ -1758,7 +2102,7 @@ function pickSticker(id) {
   if (!S.room) return;
   S.room.pick = id;
   const pv = $('#stkPreview'); if (!pv) return;
-  pv.innerHTML = `<button class="stk-big" data-act="send" aria-label="이모티콘 보내기">${stickerSvg(id, 112)}</button>
+  pv.innerHTML = `<button class="stk-big" data-act="send" aria-label="이모티콘 보내기">${stkHtml(id, 112)}</button>
     <button class="ibtn sm stk-x" data-act="unpick-sticker" aria-label="선택 취소">${ic('x', 18)}</button>`;
   pv.hidden = false;
   $$('#stickerPanel .stk').forEach((b) => b.classList.toggle('on', b.dataset.id === id));
@@ -1796,9 +2140,9 @@ async function sendSticker(id, retryMsg) {
   }
 }
 
-async function sendPhoto(file, retryMsg) {
-  if (!S.room) return;
-  const R = S.room;
+async function sendPhoto(file, retryMsg, room) {
+  const R = room || S.room;
+  if (!R) return;
   let prepared;
   try { prepared = retryMsg ? retryMsg.prepared : await prepareChatImage(file); }
   catch (e) { showErr(e); return; }
@@ -1806,7 +2150,7 @@ async function sendPhoto(file, retryMsg) {
   const tmp = retryMsg || { id: 'tmp-' + (++S.tmpSeq), room_id: R.id, sender_id: S.uid, kind: 'image', content: '', localUrl, prepared, created_at: new Date().toISOString() };
   tmp.pending = true; tmp.failed = false;
   if (!retryMsg) R.msgs.push(tmp);
-  renderMsgs(); scrollBottom();
+  if (S.room === R) { renderMsgs(); scrollBottom(); }
   try {
     const real = await api.sendImage(R.id, prepared.blob, prepared.ext);
     S.imgUrls.set(real.content, { url: localUrl, t: Date.now() + 1e12 });
@@ -2013,9 +2357,9 @@ function showContactSend() {
   });
 }
 
-async function sendFileMsg(file, retryMsg) {
-  if (!S.room) return;
-  const R = S.room;
+async function sendFileMsg(file, retryMsg, room) {
+  const R = room || S.room;
+  if (!R) return;
   if (!retryMsg) {
     if (!file.size) { toast(`‘${file.name}’ 은(는) 빈 파일이라 보낼 수 없어요`, { error: true }); return; }
     if (file.size > FILE_MAX) { toast(`‘${file.name}’ 파일이 너무 커요. 20MB까지 보낼 수 있어요`, { error: true }); return; }
@@ -2083,7 +2427,7 @@ function renderAds(head, body) {
     return;
   }
   body.innerHTML = `<div class="ads-body">${ads.map((a) => `<button class="ad-card" data-act="open-ad" data-id="${esc(a.id)}" aria-label="${esc(a.title || '광고')} 열기">
-      <span class="ad-img"><img src="${esc(api.adImageUrl(a.image_path))}" alt="${esc(a.title || '광고')}" loading="lazy"><span class="ad-badge">AD</span></span>
+      <span class="ad-img"><img src="${esc(api.adImageUrl(a.image_path))}" alt="${esc(a.title || '광고')}" loading="lazy"><span class="ad-badge">광고</span></span>
       ${a.title ? `<span class="ad-meta"><b>${esc(a.title)}</b></span>` : ''}</button>`).join('')}</div>`;
 }
 
@@ -2092,8 +2436,88 @@ function openAd(id) {
   const url = a && safeLink(a.link_url);
   if (!url) { toast('열 수 없는 링크예요', { error: true }); return; }
   api.adClick(a.id);
-  const w = window.open(url, '_blank', 'noopener');
-  if (!w) location.href = url;   // 새 창이 막혔으면 이 화면에서 열기
+  // v1.27: 'noopener' 로 열면 창이 열려도 null 이 돌아와 앱 화면까지 광고로 넘어가던 문제 → 링크를 눌러 새 창으로만 엶
+  const link = document.createElement('a'); link.href = url; link.target = '_blank'; link.rel = 'noopener noreferrer';
+  document.body.appendChild(link); link.click(); link.remove();
+}
+
+// ---------- v1.28 관리자: 추가 이모티콘 ----------
+// 그림을 정사각형 360px 로 맞춤 (투명 배경 유지). 움직이는 GIF·WebP 는 1MB 이하면 그대로
+async function prepareSticker(file) {
+  if (!/^image\/(png|webp|gif|jpeg)$/.test(file.type)) throw new Error('PNG·WEBP·GIF·JPG 그림만 올릴 수 있어요');
+  if ((file.type === 'image/gif' || file.type === 'image/webp') && file.size <= 1024 * 1024) {
+    const head = new Uint8Array(await file.slice(0, 4096).arrayBuffer());
+    const txt = String.fromCharCode(...head);
+    const animated = file.type === 'image/gif' ? (txt.match(/\x21\xF9\x04/g) || []).length > 1 || file.size > 60 * 1024 : /ANIM/.test(txt);
+    if (animated) return { blob: file, ext: file.type === 'image/gif' ? 'gif' : 'webp' };
+  }
+  const src = await loadBitmap(file);
+  const side = 360; const sc = Math.min(1, side / Math.max(src.width, src.height));
+  const w = Math.round(src.width * sc); const h = Math.round(src.height * sc);
+  const c = document.createElement('canvas'); c.width = side; c.height = side;
+  c.getContext('2d').drawImage(src, Math.round((side - w) / 2), Math.round((side - h) / 2), w, h);
+  let blob = await new Promise((r) => c.toBlob(r, 'image/webp', 0.9));
+  if (!blob || blob.type !== 'image/webp') blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+  if (!blob) throw new Error('그림을 읽을 수 없어요');
+  if (blob.size > 1024 * 1024) throw new Error('그림이 너무 커요 (1MB 이하)');
+  return { blob, ext: blob.type === 'image/webp' ? 'webp' : 'png' };
+}
+async function showStickersAdmin() {
+  let list = [];
+  try { list = await api.listCustomStickers(); } catch (e) { showErr(e); return; }
+  const cell = (c, i) => `<div class="cst-cell ${c.active ? '' : 'off'}">
+      <img src="${esc(api.stickerUrl(c.image_path))}" alt="${esc(c.title || '')}">
+      <span class="cst-t">${esc(c.title || '(이름 없음)')}${c.active ? '' : ' · 숨김'}</span>
+      <span class="cst-act"><button class="ibtn sm" data-x="left" data-id="${esc(c.id)}" aria-label="앞으로" ${i === 0 ? 'disabled' : ''}>${ic('back', 16)}</button>
+        <button class="cst-tb" data-x="toggle" data-id="${esc(c.id)}">${c.active ? '숨기기' : '보이기'}</button>
+        <button class="cst-tb danger-text" data-x="del" data-id="${esc(c.id)}">삭제</button></span></div>`;
+  openSheet({
+    title: '이모티콘 관리',
+    body: `<div class="sub-text">그림 파일(PNG·WEBP·GIF)을 고르면 바로 모든 회원의 이모티콘 창 <b>'새 이모티콘'</b> 칸에 나와요. 여러 장을 한 번에 고를 수 있어요.</div>
+      <div class="consent-box">· 투명 배경 정사각형 그림 추천 (자동으로 360×360 에 맞춰요) · 움직이는 GIF·WEBP 는 1MB 이하면 그대로 움직여요<br>· <b>직접 만들었거나 상업적으로 써도 되는 그림만</b> 올려 주세요. 다른 회사 캐릭터·연예인 사진·남의 그림은 안 돼요</div>
+      <div class="cst-grid" id="cstGrid">${list.length ? list.map(cell).join('') : '<div class="empty-line">아직 올린 이모티콘이 없어요</div>'}</div>
+      <input type="file" id="cstFile" accept="image/png,image/webp,image/gif,image/jpeg" multiple hidden>
+      <div class="field-err" id="err-cst" style="margin-top:6px"></div>
+      <button class="btn" data-x="add" style="margin-top:12px">${ic('plus', 20)}그림 올리기</button>`,
+    onMount(sheet) {
+      const grid = $('#cstGrid', sheet); const errEl = $('#err-cst', sheet);
+      const reload = async () => { list = await api.listCustomStickers(); grid.innerHTML = list.length ? list.map(cell).join('') : '<div class="empty-line">아직 올린 이모티콘이 없어요</div>'; loadCustomStickers(true); };
+      $('#cstFile', sheet).onchange = async (e) => {
+        const files = [...e.target.files].slice(0, 30); e.target.value = '';
+        if (!files.length) return;
+        const btn = $('[data-x=add]', sheet); btn.disabled = true;
+        let ok = 0; const bad = [];
+        for (const [i, f] of files.entries()) {
+          btn.innerHTML = `<span class="spin-sm"></span> ${i + 1}/${files.length}`;
+          try {
+            const p = await prepareSticker(f);
+            const path = await api.uploadSticker(p.blob, p.ext);
+            await api.adminAddSticker(path, f.name.replace(/\.[^.]+$/, '').slice(0, 30));
+            ok++;
+          } catch (ex) { bad.push(`${f.name}: ${ex.message}`); }
+        }
+        btn.disabled = false; btn.innerHTML = `${ic('plus', 20)}그림 올리기`;
+        errEl.innerHTML = bad.length ? `${ic('alert', 16, 'flex:none')}${esc(bad.join(' / '))}` : '';
+        if (ok) toast(`이모티콘 ${ok}개를 올렸어요`);
+        try { await reload(); } catch (ex) { showErr(ex); }
+      };
+      sheet.addEventListener('click', async (e) => {
+        const x = e.target.closest('[data-x]'); if (!x || x.disabled) return;
+        if (x.dataset.x === 'add') { $('#cstFile', sheet).click(); return; }
+        const c = list.find((y) => String(y.id) === x.dataset.id); if (!c) return;
+        x.disabled = true;
+        try {
+          if (x.dataset.x === 'left') await api.adminMoveSticker(c.id, -1);
+          if (x.dataset.x === 'toggle') await api.adminSetSticker(c.id, !c.active);
+          if (x.dataset.x === 'del') {
+            if (!(await ask('이 이모티콘을 지울까요?', '이모티콘 창에서 사라지고, 이미 보낸 메시지에는 빈 그림으로 보여요. 잠깐만 안 보이게 하려면 숨기기를 쓰세요.', '삭제', true))) { x.disabled = false; return; }
+            await api.adminDeleteSticker(c.id); toast('이모티콘을 지웠어요');
+          }
+          await reload();
+        } catch (ex) { x.disabled = false; showErr(ex); }
+      });
+    },
+  });
 }
 
 // ---------- 관리자: 광고 관리 ----------
@@ -2617,14 +3041,19 @@ function onMemberUpdate(row) {
 }
 
 function onStatus(status) {
+  S.rtUp = status === 'SUBSCRIBED';
   if (status === 'SUBSCRIBED') {
-    if (S.wasSubscribed) catchUp();
+    if (S.wasSubscribed) catchUp({ force: true });
     S.wasSubscribed = true;
   }
 }
 
-async function catchUp() {
+// v1.27: 짧은 시간에 여러 번 불려도 한 번만 (화면 복귀·인터넷 연결·실시간 재연결이 겹칠 때)
+let lastCatch = 0;
+async function catchUp({ force = false, periodic = false } = {}) {
   if (!S.entered || !$('#main')) return;
+  if (!force && Date.now() - lastCatch < 8000) return;
+  lastCatch = Date.now();
   refreshRoomsSoon();
   loadRequests();
   if (S.room) {
@@ -2637,8 +3066,10 @@ async function catchUp() {
       const fresh = await api.getMessagesAfter(R.id, from);
       if (S.room === R) {
         if (fresh.length) R.syncedId = Math.max(from, ...fresh.map((m) => Number(m.id) || 0));
-        addMessages(fresh); refreshMembers(); markReadSoon();
-        const first = R.msgs.find((m) => isNum(m.id)); if (first) loadReactions(R, first.id);
+        addMessages(fresh);
+        // v1.27: 정기 확인 때는 꼭 필요한 것만 (참여자 정보는 입장·퇴장이 있을 때, 공감은 새 메시지가 있을 때)
+        if (!periodic || fresh.some((m) => m.kind === 'system')) refreshMembers(); else refreshReads();
+        if (!periodic || fresh.length) { markReadSoon(); const first = R.msgs.find((m) => isNum(m.id)); if (first) loadReactions(R, first.id); }
       }
     } catch (e) { console.warn(e); }
   }
@@ -2675,12 +3106,16 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden || !S.entered) return;
   if (!$('#main')) return;
   touchLastSeen();
-  catchUp();
+  catchUp({ force: true });
   if (S.room) markReadSoon();
 });
 window.addEventListener('online', () => { setOffline(false); catchUp(); });
-// 놓친 실시간 알림이 있어도 맞춰지도록 화면이 켜져 있을 때 90초마다 한 번 확인
-setInterval(() => { if (S.entered && !document.hidden && $('#main')) catchUp(); }, 90000);
+// 놓친 실시간 알림이 있어도 맞춰지도록 화면이 켜져 있을 때 확인
+//   v1.27: 실시간 연결이 살아 있으면 5분마다, 끊겨 있으면 90초마다 (서버 요청·데이터 절약)
+setInterval(() => {
+  if (!S.entered || document.hidden || !$('#main')) return;
+  if (Date.now() - lastCatch >= (S.rtUp ? 300000 : 90000)) catchUp({ periodic: true });
+}, 30000);
 window.addEventListener('offline', () => setOffline(true));
 
 // ---------------------------------------------------------------------
@@ -2763,8 +3198,13 @@ function showAddFriend() {
           cacheProfile(u);
           setTimeout(() => out.scrollIntoView({ block: 'nearest', behavior: 'smooth' }), 50);
           const isMe = u.id === S.uid; const isFriend = S.friends.some((f) => f.id === u.id);
+          // v1.27: 번호로 찾았거나 갓 만든 계정이면 주의 안내 (번호는 문자 인증을 하지 않아서 다른 사람이 등록했을 수도 있음)
+          const days = u.created_at ? Math.max(0, Math.floor((Date.now() - Date.parse(u.created_at)) / 864e5)) : null;
+          const isNew = days != null && days < 7;
+          const caution = !isMe && !isFriend && (ph || isNew)
+            ? `<div class="safe-note">${ic('shield', 16, 'flex:none')}<span>${ph ? '휴대폰 번호는 문자 인증을 하지 않아서 다른 사람이 등록했을 수도 있어요. ' : ''}아는 사람이 맞는지 이름·아이디를 꼭 확인하세요.${isNew ? ` <b>${days < 1 ? '오늘' : days + '일 전'} 가입한 계정</b>이에요.` : ''}</span></div>` : '';
           out.innerHTML = `<div class="found">${av(u, 76)}<div class="fn">${esc(u.display_name)}</div><div class="fid">@${esc(u.username)}</div>
-            ${u.status_message ? `<div class="fst">${esc(u.status_message)}</div>` : ''}
+            ${u.status_message ? `<div class="fst">${esc(u.status_message)}</div>` : ''}${caution}
             <div class="act">${isMe ? '<div class="itsme"><span class="chip me">나</span>내 아이디예요</div>'
     : isFriend ? `<div class="already">${ic('check', 18)}이미 친구예요</div>`
       : `<button class="btn" data-add style="height:52px">${ic('userplus', 20)}친구 추가</button>`}</div></div>`;
@@ -2790,18 +3230,29 @@ function showPhone() {
   openSheet({
     title: '휴대폰 번호',
     body: `<div class="sub-text">번호를 등록하면 친구가 휴대폰 번호로 나를 찾아 추가할 수 있어요.</div>
+      <div class="consent-box"><b>[선택] 휴대폰 번호 수집·이용 동의</b><br>목적: 번호로 친구 찾기 · 항목: 휴대폰 번호 · 보관: 직접 지우거나 탈퇴할 때까지<br>동의하지 않아도(번호를 등록하지 않아도) ${esc(APP)}을 이용할 수 있어요.</div>
       <div class="auth-fields">${fieldHtml('phone', '휴대폰 번호', { type: 'tel', ph: '010-1234-5678', auto: 'tel', max: 16 })}</div>
       <div class="card-line"><span class="label">번호로 나를 찾을 수 있게<span class="sub">끄면 휴대폰 번호로 검색해도 내가 나오지 않아요</span></span>
         <button class="switch ${findable ? 'on' : ''}" data-x="find" role="switch" aria-checked="${findable}" aria-label="번호로 나를 찾을 수 있게"></button></div>
-      <button class="btn" data-x="save" style="margin-top:18px">저장</button>
+      <div id="claimBox"></div>
+      <button class="btn" data-x="save" style="margin-top:18px">동의하고 저장</button>
       ${cur ? '<button class="btn text" data-x="remove" style="margin-top:4px">번호 삭제</button>' : ''}
       <div class="foot-note" style="margin-top:10px">번호는 다른 회원에게 보이지 않아요. 관리자만 확인할 수 있어요.</div>`,
     onMount(sheet, close) {
       const input = $('#f-phone', sheet);
       if (cur) input.value = fmtPhone(cur.phone);
-      input.oninput = () => setFieldErr(sheet, 'phone', '');
+      const claimBox = $('#claimBox', sheet);
+      input.oninput = () => { setFieldErr(sheet, 'phone', ''); claimBox.innerHTML = ''; };
       sheet.addEventListener('click', async (e) => {
         const x = e.target.closest('[data-x]'); if (!x) return;
+        if (x.dataset.x === 'claim') {   // v1.27: 내 번호를 다른 사람이 먼저 등록했을 때
+          const raw = input.value.trim();
+          close();
+          if (!(await ask('내 번호가 맞나요?', `${fmtPhone(normPhone(raw) || raw)} 번호를 관리자에게 확인 요청해요. 그 번호는 바로 번호 검색에서 숨겨지고, 관리자가 확인하면 1:1 문의로 알려 드려요. 다른 사람의 번호로 요청하면 이용이 제한될 수 있어요.`, '확인 요청'))) return;
+          try { await api.claimPhone(raw); toast('확인 요청을 보냈어요. 답변은 더보기 → 1:1 문의에서 볼 수 있어요', { ms: 5000 }); }
+          catch (ex) { showErr(ex); }
+          return;
+        }
         if (x.dataset.x === 'find') {
           findable = !findable;
           x.classList.toggle('on', findable); x.setAttribute('aria-checked', String(findable));
@@ -2822,7 +3273,10 @@ function showPhone() {
             const v = await api.setMyPhone(raw, findable);
             S.phone = { phone: v || normPhone(raw), findable };
             close(); renderMain(); toast('휴대폰 번호를 저장했어요');
-          } catch (ex) { x.disabled = false; setFieldErr(sheet, 'phone', ex.message); }
+          } catch (ex) {
+            x.disabled = false; setFieldErr(sheet, 'phone', ex.message);
+            if (/이미 다른 계정/.test(ex.message) && api.claimPhone) claimBox.innerHTML = `<button class="btn line sm claim-btn" data-x="claim">${ic('flag', 16)}내 번호예요 — 확인 요청하기</button>`;
+          }
         }
       });
     },
@@ -2856,7 +3310,7 @@ function kickedOut(roomId, title) {
   S.rooms = S.rooms.filter((x) => x.room_id !== roomId);
   updateBadges();
   if (S.room && S.room.id === roomId) {
-    closeRoom(); S.fromList = false; S.tab = 'chats'; location.replace('#/chats');
+    closeRoom(); S.fromList = false; S.tab = 'chats'; afterBack(() => location.replace('#/chats'));
   } else if (S.tab === 'chats') scheduleMain();
   toast(`‘${name}’ 채팅방에서 내보내졌어요`, { error: true, ms: 4500 });
 }
@@ -2872,7 +3326,7 @@ function friendAddedToast(id, name) {
 async function pickFriends({ invite = false, exclude = [], fromDm = false } = {}) {
   await loadFriends().catch(() => {});
   return new Promise((resolve) => {
-    const list = S.friends.filter((f) => f.mutual !== false && !exclude.includes(f.id));
+    const list = sortFriends(S.friends.filter((f) => f.mutual !== false && !exclude.includes(f.id)));   // v1.28: ㄱㄴㄷ 순
     const waiting = S.friends.filter((f) => f.mutual === false).length;
     const sel = [];
     let finished = false;
@@ -2880,6 +3334,7 @@ async function pickFriends({ invite = false, exclude = [], fromDm = false } = {}
       title: invite ? '대화상대 초대' : '새 채팅',
       body: `<div class="sub-text">${fromDm ? '고른 친구와 지금 대화 상대가 함께하는 새 단체방이 만들어져요. 지금 1:1 대화방은 그대로 남아요.' : invite ? '채팅방에 초대할 친구를 선택하세요' : '대화할 친구를 선택하세요. 여러 명을 고르면 단체방이 돼요.'}</div>
         <div class="sel-chips" id="selChips" hidden></div>
+        ${list.length >= 8 ? `<div class="f-search in-sheet">${ic('search', 18, 'flex:none;color:var(--ink3)')}<input id="pickQ" type="search" placeholder="이름·초성으로 찾기" autocomplete="off" aria-label="친구 검색"></div>` : ''}
         ${list.length ? `<div class="pick-list bleed">${list.map((f) => `<button class="pick" data-pick="${esc(f.id)}" role="checkbox" aria-checked="false">${av(f, 44)}<span class="nm">${esc(f.display_name)}</span><span class="ck">${ic('check', 16)}</span></button>`).join('')}</div>`
     : `<div class="empty-line">${!S.friends.length ? '먼저 친구를 추가해 주세요.' : waiting && S.friends.length === waiting ? '서로 친구인 사람이 아직 없어요.<br>상대방도 나를 친구로 추가해야 대화할 수 있어요.' : '초대할 수 있는 친구가 없어요.'}</div>`}
         ${list.length && waiting ? `<div class="help" style="margin-top:8px">서로 친구인 사람만 보여요 · 대화 대기 ${waiting}명</div>` : ''}
@@ -2909,6 +3364,8 @@ async function pickFriends({ invite = false, exclude = [], fromDm = false } = {}
           refresh();
         });
         if (gt) gt.oninput = refresh;
+        const pq = $('#pickQ', sheet);
+        if (pq) pq.oninput = () => { $$('[data-pick]', sheet).forEach((b) => { b.hidden = !matchFriend(profileOf(b.dataset.pick) || {}, pq.value); }); };
         ok.onclick = () => { finished = true; close(); resolve({ ids: [...sel], title: gt ? gt.value.trim() : '' }); };
         onSheetGone(sheet, () => { if (!finished) resolve(null); });
       },
@@ -2988,7 +3445,7 @@ function showRoomMenu() {
             updateBadges();
             S.fromList = false;
             S.tab = 'chats';
-            location.replace('#/chats');
+            afterBack(() => location.replace('#/chats'));
             toast(res && res.room_deleted ? '채팅방에서 나왔어요. 마지막 참여자라 대화와 사진·파일을 모두 삭제했어요' : '채팅방에서 나왔어요', { ms: res && res.room_deleted ? 3600 : undefined });
           } catch (ex) { showErr(ex); }
         }
@@ -3011,8 +3468,23 @@ function showImage(btn) {
       <div class="vt"><b>${esc(p ? p.display_name : '사진')}</b><span>${esc(when + keepTxt)}</span></div><div style="width:44px"></div></div>
     <div class="vimg"><img src="${esc(img.src)}" alt="사진"></div>
     <div class="vfoot"><a class="save" href="${esc(img.src)}" download="kkiritalk-photo.jpg" target="_blank" rel="noopener">${ic('download', 20)}저장</a></div>`;
-  v.addEventListener('click', (e) => { if (e.target.closest('[data-v=close]') || e.target.classList.contains('vimg')) v.remove(); });
+  let vid = 0;
+  const vclose = (fromPop) => { v.remove(); if (fromPop !== true) ovDone(vid); };
+  v.addEventListener('click', (e) => { if (e.target.closest('[data-v=close]') || e.target.classList.contains('vimg')) vclose(); });
+  // v1.28: '저장' — 다른 주소의 사진은 download 가 무시되어 새 창으로만 열리던 문제 → 받아서 파일로 저장
+  const save = $('.save', v);
+  save.addEventListener('click', async (e) => {
+    e.preventDefault();
+    try {
+      const blob = await (await fetch(img.src)).blob();
+      const u = URL.createObjectURL(blob); const a = document.createElement('a');
+      a.href = u; a.download = `kkiritalk-photo-${Date.now()}.${/png/.test(blob.type) ? 'png' : /gif/.test(blob.type) ? 'gif' : 'jpg'}`;
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(u), 10000);
+      toast('사진을 저장했어요');
+    } catch { window.open(img.src, '_blank', 'noopener'); }
+  });
   app.appendChild(v);
+  vid = ovPush(vclose, v);
 }
 
 function showChangePassword() {
@@ -3034,7 +3506,7 @@ function showChangePassword() {
         ['cur', 'n1', 'n2'].forEach((k) => setFieldErr(sheet, k, errs[k] || ''));
         if (Object.keys(errs).length) return;
         const btn = $('#pwOk', sheet); btn.disabled = true;
-        try { await api.changePassword(v('cur'), v('n1')); close(); toast('비밀번호를 바꿨어요'); }
+        try { await api.changePassword(v('cur'), v('n1'), await getCaptchaToken()); close(); toast('비밀번호를 바꿨어요'); }
         catch (e) { btn.disabled = false; setFieldErr(sheet, /현재/.test(e.message) ? 'cur' : 'n1', e.message); }
       };
     },
@@ -3075,7 +3547,7 @@ const fmtDT = (iso) => { if (!iso) return '-'; const d = new Date(iso); return `
 const untilTxt = (u) => (u.suspended_until ? `${fmtDT(u.suspended_until)}까지 정지` : '영구 정지');
 
 async function openAdmin(sec) {
-  if (!S.me || !S.me.is_admin) { location.replace('#/more'); return; }
+  if (!S.me || !S.me.is_admin) { afterBack(() => location.replace('#/more')); return; }
   closeAllSheets();
   const A = S.admin = S.admin || {
     sec: 'home', badges: {}, dash: null, chart: 'active',
@@ -3180,7 +3652,7 @@ async function renderHomeSec() {
 }
 
 // ---------- v1.20.2: 데이터베이스(schema.sql) 버전 확인 ----------
-const DB_VERSION_NEEDED = '1.21';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
+const DB_VERSION_NEEDED = '1.23';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
 const verNum = (v) => String(v || '0').split('.').reduce((a, x, i) => a + (Number(x) || 0) / (1000 ** i), 0);
 const dbOutdated = () => verNum(S.dbVersion) < verNum(DB_VERSION_NEEDED);
 function dbUpdateCard() {
@@ -3617,6 +4089,7 @@ function renderOpsSec() {
         <button class="switch ${approval ? 'on' : ''}" data-act="admin-approval" role="switch" aria-checked="${approval}" aria-label="가입 승인제"></button></div>
       <button class="item" data-act="admin-notice"><span class="tile mint">${ic('mega', 19)}</span><span class="label">전체 공지 보내기<span class="sub">모든 회원의 공지사항 방에 글을 올려요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="admin-ads"><span class="tile lav">${ic('gift', 19)}</span><span class="label">광고 관리<span class="sub">광고 탭에 보일 이미지와 링크를 등록해요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      <button class="item" data-act="admin-stickers"><span class="tile lemon">${ic('smile', 19)}</span><span class="label">이모티콘 관리<span class="sub">그림 파일을 올리면 모든 회원의 이모티콘 창에 나와요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="admin-words"><span class="tile peach">${ic('ban', 19)}</span><span class="label">금칙어 관리<span class="sub">욕설 등 부적절한 말을 * 로 가려요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="admin-clean" style="padding-top:14px;padding-bottom:14px"><span class="tile sky">${ic('file', 19)}</span><span class="label">남은 사진·파일 정리<span class="sub">없어진 대화방에 남아 있는 사진·파일을 저장 공간에서 지워요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
     </div>
@@ -4036,6 +4509,8 @@ app.addEventListener('click', async (e) => {
     case 'open-room': goRoom(el.dataset.id); break;
     case 'room-back': backFromRoom(); break;
     case 'room-menu': showRoomMenu(); break;
+    case 'friend-q-clear': { S.friendQuery = ''; const qi = $('#friendQ'); if (qi) { qi.value = ''; qi.dispatchEvent(new Event('input', { bubbles: true })); qi.focus(); } break; }
+    case 'safety-ok': if (S.room) { dismissSafety(S.room.id); updateSafetyBar(); } break;
     case 'to-bottom': scrollBottom(); break;
     case 'send': sendComposer(); break;
     case 'stickers': toggleStickers(); break;
@@ -4098,7 +4573,7 @@ app.addEventListener('click', async (e) => {
     case 'install': showInstall(); break;
     case 'open-admin': S.adminFromMore = true; go('#/admin'); break;
     case 'admin-back':   // v1.18: 관리자 안에서 메뉴를 옮겨 다녀도 한 번에 더보기로
-      S.adminFromMore = false; location.replace('#/more');
+      S.adminFromMore = false; afterBack(() => location.replace('#/more'));
       break;
     case 'admin-filter':
       if (S.admin) { S.admin.members.filter = el.dataset.f; $$('.filters [data-act=admin-filter]').forEach((b) => b.classList.toggle('on', b === el)); loadMembers(true); }
@@ -4148,6 +4623,7 @@ app.addEventListener('click', async (e) => {
       break;
     }
     case 'admin-ads': showAdsAdmin(); break;
+    case 'admin-stickers': showStickersAdmin(); break;   // v1.28
     case 'admin-reports': showReportsAdmin('open'); break;
     case 'admin-words': showWordsAdmin(); break;
     case 'blocks': showBlocks(); break;
@@ -4177,7 +4653,7 @@ app.addEventListener('click', async (e) => {
         } else {
           setNotifOff(false);
           if (Notification.permission === 'denied') toast('알림이 차단되어 있어요. 휴대폰(브라우저) 설정에서 이 앱의 알림을 허용해 주세요', { error: true, ms: 5000 });
-          else if (push.supported()) toast((await enablePush()) ? '알림을 켰어요' : '알림 권한이 허용되지 않았어요', { error: !S.pushOn });
+          else if (push.supported()) { toast((await enablePush()) ? '알림을 켰어요' : '알림 권한이 허용되지 않았어요', { error: !S.pushOn }); if (S.pushOn) maybeSoundTip(); }
           else if (Notification.permission === 'granted') toast('알림을 켰어요');
           else {
             const p = await Notification.requestPermission();
