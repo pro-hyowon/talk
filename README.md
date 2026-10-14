@@ -101,6 +101,13 @@ SUPABASE_ANON_KEY: 'sb_publishable_xxxxxxxx',
 
 ## 이전 버전에서 업그레이드할 때
 
+**v1.25.1 (Cloudflare 로 옮기기 준비)** — 앱·SQL 변경 없음.
+1. 새 파일 4개 `wrangler.jsonc`, `.assetsignore`, `_headers`, `_redirects` 와 `README.md` 를 GitHub 저장소 **맨 바깥(index.html 이 있는 곳)** 에 올립니다. `.assetsignore` 처럼 점(.)으로 시작하는 파일도 빠지지 않게 확인하세요.
+2. Cloudflare → Compute → Workers & Pages → Create application → GitHub 저장소 `talk` 연결 → Project name **kkiritalk**(wrangler.jsonc 의 "name" 과 같아야 해요), Build command 비움, Deploy command `npx wrangler deploy` 그대로 → Deploy.
+3. 배포가 끝나면 `https://kkiritalk.(내계정).workers.dev` 에서 로그인·대화를 확인하고, `…/README.md` 를 열었을 때 **404(없음)** 가 나오면 숨길 파일이 잘 빠진 거예요.
+4. Worker → Settings → **Domains & Routes → Add → Custom domain** 에 산 주소를 넣으면 연결돼요.
+- Vercel 에도 그대로 올라가지만 Vercel 은 이 파일들을 쓰지 않아서 문제없어요.
+
 **v1.25 (휴대폰 번호는 '권장')** — SQL 은 다시 실행하지 않아도 돼요(v1.21 을 이미 실행했다면). v1.24 를 건너뛰고 바로 올려도 돼요.
 1. `js/config.js` 를 제외한 나머지 파일을 GitHub 저장소에 올립니다(덮어쓰기). 바뀐 파일: `js/app.js`, `css/style.css`, `sw.js`, `terms.html`, `privacy.html`, `README.md`
 2. 앱을 완전히 껐다 켭니다.
@@ -477,7 +484,8 @@ v1.6에서 접속자가 많아도 느려지지 않도록 다음을 바꿨어요.
 | `tools/push-setup.html` | 알림용 키·설정값 생성 도구 (내 컴퓨터에서만 동작) |
 | `terms.html`, `privacy.html`, `delete-account.html`, `licenses.html` | 이용약관 · 개인정보처리방침 · 계정 삭제 안내 · 라이선스 (스토어 등록에 필요) |
 | `css/legal.css`, `js/legal.js` | 약관 페이지 디자인 · 운영자 정보 채우기 (`js/config.js` 값 사용) |
-| `vercel.json` | 플레이 스토어 앱 연결 파일(`assetlinks.json`) 주소 설정 |
+| `vercel.json` | Vercel용 설정 (플레이 스토어 앱 연결 파일 `assetlinks.json` 주소) |
+| `wrangler.jsonc`, `.assetsignore`, `_headers`, `_redirects` | Cloudflare용 설정 (배포 방법 · 인터넷에 올리지 않을 파일 · `assetlinks.json` 주소) |
 
 ## 수정·업데이트할 때
 

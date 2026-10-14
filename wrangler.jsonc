@@ -1,0 +1,11 @@
+// 끼리톡 — Cloudflare Workers(정적 파일) 배포 설정
+// Cloudflare 화면의 Project name 과 아래 "name" 이 같아야 해요.
+{
+  "name": "kkiritalk",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./",
+    "html_handling": "none",
+    "not_found_handling": "none"
+  }
+}
