@@ -16,7 +16,7 @@ function friendly(error) {
     [/captcha/i, '로봇이 아닌지 확인하지 못했어요. 잠시 후 다시 시도해 주세요'],   // v1.28
     [/너무 빨리 보내고/, '메시지를 너무 빨리 보내고 있어요. 잠시 후 다시 보내 주세요'],
     [/banned/i, '이용이 정지된 계정이에요. 관리자에게 문의해 주세요'],
-    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|claim_phone|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|admin_remove_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad|block_user|unblock_user|my_blocks|report_content|agree_terms|my_media_files|delete_my_account|refresh_my_status|create_inquiry|my_inquiries|inquiry_thread|reply_inquiry|close_inquiry|app_info|expired_media|admin_expired_media|admin_usage|admin_set_usage_settings|admin_purge_messages|admin_add_sticker|admin_set_sticker|admin_delete_sticker|admin_move_sticker|admin_log_action)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|claim_phone|edit_message|my_suspension|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|admin_remove_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad|block_user|unblock_user|my_blocks|report_content|agree_terms|my_media_files|delete_my_account|refresh_my_status|create_inquiry|my_inquiries|inquiry_thread|reply_inquiry|close_inquiry|app_info|expired_media|admin_expired_media|admin_usage|admin_set_usage_settings|admin_purge_messages|admin_add_sticker|admin_set_sticker|admin_delete_sticker|admin_move_sticker|admin_log_action)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found|'reply_to' column|relation "public\.ads"|table 'public\.ads'|public\.ads|custom_stickers/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/already registered|already exists/i, '이미 사용 중인 아이디예요'],
     [/Database error saving new user/i, '가입할 수 없는 아이디예요. 영문 소문자·숫자·밑줄(_) 3~20자로 입력해 주세요'],
@@ -228,6 +228,11 @@ export function createApi() {
       return must(await sb.from('messages').select('*').eq('room_id', roomId)
         .gt('id', afterId || 0).order('id', { ascending: true }).limit(200));
     },
+    // v1.29: 화면을 안 보던 사이 수정·삭제된 메시지 (보이는 범위 안에서만)
+    async getChangedSince(roomId, fromId, since) {
+      return must(await sb.from('messages').select('*').eq('room_id', roomId).gte('id', fromId || 0)
+        .or(`edited_at.gt."${since}",deleted_at.gt."${since}"`).order('id', { ascending: true }).limit(100));
+    },
     async sendText(roomId, text, replyTo) {
       const row = { room_id: roomId, kind: 'text', content: text };
       if (replyTo) row.reply_to = replyTo;   // v1.11: 답장
@@ -248,6 +253,10 @@ export function createApi() {
     },
     async react(messageId, emoji) { return must(await sb.rpc('react_message', { p_id: messageId, p_emoji: emoji || null })); },
     // 내 메시지 삭제 (사진이면 파일도 지움)
+    async editMessage(id, content) {   // v1.29: 내가 보낸 글 수정 → { content, edited_at }
+      const rows = must(await sb.rpc('edit_message', { p_id: id, p_content: content }));
+      return rows && rows[0];
+    },
     async deleteMessage(m) {
       must(await sb.rpc('delete_message', { p_id: m.id }));
       if (m.kind === 'image' && m.content && m.content !== '-') {
@@ -410,7 +419,7 @@ export function createApi() {
     // 기본: 내 전용 비공개 채널(user:<내 ID>)로 내가 속한 방의 새 메시지만 받음 (Broadcast).
     //   → 접속자가 많아도 메시지 1건당 그 방 참여자에게만 전달돼 빠름.
     // 데이터베이스가 아직 v1.6 이 아니면(채널 권한 없음) 예전 방식(Postgres Changes)으로 자동 전환.
-    subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport, onInquiry, onInquiryAdmin, onUnfriended }) {
+    subscribe({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport, onInquiry, onInquiryAdmin, onUnfriended, onEdited }) {
       let closed = false; let ch = null; let joined = false;
       const legacy = () => {
         rtMode = 'legacy';
@@ -436,6 +445,7 @@ export function createApi() {
           .on('broadcast', { event: 'inquiry' }, ({ payload }) => payload && onInquiry && onInquiry(payload))   // v1.18: 내 문의에 답변
           .on('broadcast', { event: 'inquiry_admin' }, ({ payload }) => payload && onInquiryAdmin && onInquiryAdmin(payload))   // v1.18: 관리자에게 새 문의
           .on('broadcast', { event: 'unfriended' }, ({ payload }) => payload && onUnfriended && onUnfriended(payload))   // v1.20: 관리자가 친구 관계를 끊음
+          .on('broadcast', { event: 'edited' }, ({ payload }) => payload && onEdited && onEdited(payload))   // v1.29: 상대가 글을 수정함
           .subscribe((status) => {
             if (status === 'SUBSCRIBED') joined = true;
             // v1.27: 연결 오류가 나도 예전 방식으로 바꾸지 않음 (라이브러리가 알아서 다시 연결 — 서버 부담·데이터 절약)

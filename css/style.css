@@ -1085,3 +1085,8 @@ a.btn { text-decoration: none; }
 .cst-grid .empty-line { grid-column: 1 / -1; }
 .susp-reason { font-size: 14px; color: var(--ink2); background: #fff; border-radius: 12px; padding: 8px 12px; }
 .susp-reason[hidden] { display: none; }
+/* v1.29: 메시지 수정 */
+.meta-col .edited { font-size: 10.5px; color: var(--ink4); line-height: 1.2; }
+.reply-bar.edit-bar .rb-ic { color: #8A5E00; }
+.composer.editing .send-btn { background: var(--mint); }
+.composer.editing .photo-btn, .composer.editing .emo-btn { display: none; }

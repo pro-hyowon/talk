@@ -1,5 +1,5 @@
 -- =====================================================================
---  끼리톡(Kkiri Talk) v1.23 — Supabase 데이터베이스 설정 스크립트
+--  끼리톡(Kkiri Talk) v1.24 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -88,6 +88,8 @@ alter table public.messages drop constraint if exists messages_kind_check;
 alter table public.messages add constraint messages_kind_check check (kind in ('text', 'image', 'sticker', 'file', 'contact', 'system', 'deleted')) not valid;
 -- v1.8: 삭제한 메시지 (kind = 'deleted' 로 바뀌고 내용은 지워짐)
 alter table public.messages add column if not exists deleted_at timestamptz;
+-- v1.24: 수정한 메시지 (마지막으로 수정한 시각 — 화면에 '수정됨' 표시)
+alter table public.messages add column if not exists edited_at timestamptz;
 alter table public.messages drop constraint if exists messages_sticker_check;
 alter table public.messages add constraint messages_sticker_check check (kind <> 'sticker' or content ~ '^[a-z0-9_]{1,30}$') not valid;
 
@@ -1416,6 +1418,57 @@ begin
 end;
 $$;
 
+-- v1.24: 내가 보낸 글 수정 (보낸 지 24시간 안, 한 메시지에 10번까지, 글 메시지만)
+--   수정 전 내용은 신고 처리(수정으로 증거를 없애는 것 막기)를 위해 메시지가 남아 있는 동안만 따로 보관
+create table if not exists private.message_edits (
+  id          bigint generated always as identity primary key,
+  message_id  bigint not null references public.messages(id) on delete cascade,
+  old_content text not null,
+  edited_at   timestamptz not null default now()
+);
+create index if not exists message_edits_msg_idx on private.message_edits(message_id);
+revoke all on private.message_edits from public, anon, authenticated;
+
+drop function if exists public.edit_message(bigint, text);
+create function public.edit_message(p_id bigint, p_content text)
+returns table (content text, edited_at timestamptz)
+language plpgsql security definer set search_path = public as $$
+declare
+  v_m    messages%rowtype;
+  v_new  text := btrim(coalesce(p_content, ''));
+  v_last bigint;
+  v_at   timestamptz := now();
+begin
+  select * into v_m from messages m where m.id = p_id;
+  if not found or not public.can_see_message(v_m.room_id, p_id) then raise exception '메시지를 찾을 수 없어요'; end if;
+  if v_m.sender_id is distinct from auth.uid() then raise exception '내가 보낸 메시지만 수정할 수 있어요'; end if;
+  if v_m.kind <> 'text' then raise exception '글 메시지만 수정할 수 있어요'; end if;
+  if v_m.created_at < now() - interval '24 hours' then raise exception '보낸 지 24시간이 지난 메시지는 수정할 수 없어요'; end if;
+  if not public.can_post(v_m.room_id) then raise exception '이 대화방에는 글을 쓸 수 없어요'; end if;
+  if v_new = '' then raise exception '내용을 입력해 주세요'; end if;
+  if char_length(v_new) > 2000 then raise exception '2000자까지 쓸 수 있어요'; end if;
+  v_new := public.mask_banned(v_new);
+  if v_new = v_m.content then return query select v_m.content, v_m.edited_at; return; end if;
+  if (select count(*) from private.message_edits e where e.message_id = p_id) >= 10 then
+    raise exception '한 메시지는 10번까지 수정할 수 있어요';
+  end if;
+  insert into private.message_edits (message_id, old_content) values (p_id, v_m.content);
+  update messages m set content = v_new, edited_at = v_at where m.id = p_id;
+  -- 방의 마지막 메시지였다면 목록 미리보기도 바꿈
+  select max(x.id) into v_last from messages x where x.room_id = v_m.room_id and x.kind <> 'system';
+  if v_last = p_id then update rooms r set last_message = left(v_new, 100) where r.id = v_m.room_id; end if;
+  if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null then
+    begin
+      perform realtime.send(jsonb_build_object('id', p_id, 'room_id', v_m.room_id, 'content', v_new, 'edited_at', v_at, 'last', v_last = p_id),
+                            'edited', 'user:' || rm.user_id::text, true)
+         from room_members rm where rm.room_id = v_m.room_id and rm.user_id is distinct from auth.uid();
+    exception when others then null;
+    end;
+  end if;
+  return query select v_new, v_at;
+end;
+$$;
+
 -- 최근 접속 시각 기록 (앱을 열 때 호출)
 drop function if exists public.touch_last_seen();
 create function public.touch_last_seen()
@@ -1965,6 +2018,10 @@ begin
                       and g.id = (select max(x.id) from messages x where x.room_id = r.id and x.kind <> 'system'));
     update messages set kind = 'deleted', content = '-', deleted_at = now()
      where sender_id = p_user and kind not in ('system', 'deleted');
+    -- v1.24: 수정 전 내용도 지움 (처리 중인 신고가 있는 글은 신고 처리 때까지 남김)
+    delete from private.message_edits e using messages g
+     where g.id = e.message_id and g.sender_id = p_user
+       and not exists (select 1 from private.reports r where r.message_id = g.id and r.status = 'open');
   end if;
   delete from private.friend_request_log where from_id = p_user or to_id = p_user;
   delete from private.lookup_quota where user_id = p_user;
@@ -2203,6 +2260,10 @@ begin
   if not found or v_m.kind = 'deleted' then return; end if;
   update messages set kind = 'deleted', content = '-', deleted_at = now() where id = p_id;
   delete from message_reactions where message_id = p_id;
+  -- v1.24: 수정 전 내용도 지움 (처리 중인 신고가 있으면 신고 처리 때까지 남김)
+  if not exists (select 1 from private.reports r where r.message_id = p_id and r.status = 'open') then
+    delete from private.message_edits where message_id = p_id;
+  end if;
   -- 방의 마지막 메시지였다면 목록 미리보기도 바꿈
   select max(id) into v_last from messages where room_id = v_m.room_id and kind <> 'system';
   if v_last = p_id then
@@ -2252,6 +2313,11 @@ begin
     if v_target is null or v_target = v_me or not exists (select 1 from profiles where id = v_target) then
       raise exception '회원을 찾을 수 없어요';
     end if;
+  end if;
+  -- v1.24: 수정된 글이면 수정 전 내용도 함께 남김
+  if p_message is not null and exists (select 1 from private.message_edits where message_id = p_message) then
+    v_snap := coalesce(v_snap, '') || E'\n\n[수정 전 내용]\n' ||
+      (select string_agg(old_content, E'\n---\n' order by id) from private.message_edits where message_id = p_message);
   end if;
   insert into private.reports (reporter_id, target_id, room_id, message_id, reason, detail, snapshot)
   values (v_me, v_target, v_room, p_message, p_reason, left(btrim(coalesce(p_detail, '')), 300), left(coalesce(v_snap, ''), 2000));
@@ -2362,6 +2428,10 @@ begin
   update private.reports
      set status = 'done', action = p_action, handled_at = now(), handled_by = v_me
    where id = p_id or (v_r.message_id is not null and message_id = v_r.message_id and status = 'open');
+  -- v1.24: 지워진 메시지의 수정 전 내용은 신고 처리가 끝나면 지움 (신고 기록에는 이미 들어 있음)
+  if v_r.message_id is not null and exists (select 1 from messages where id = v_r.message_id and kind = 'deleted') then
+    delete from private.message_edits where message_id = v_r.message_id;
+  end if;
 end;
 $$;
 
@@ -2419,6 +2489,10 @@ begin
                       and g.id = (select max(x.id) from messages x where x.room_id = r.id and x.kind <> 'system'));
     update messages set kind = 'deleted', content = '-', deleted_at = now()
      where sender_id = v_me and kind not in ('system', 'deleted');
+    -- v1.24: 수정 전 내용도 지움 (처리 중인 신고가 있는 글은 신고 처리 때까지 남김)
+    delete from private.message_edits e using messages g
+     where g.id = e.message_id and g.sender_id = v_me
+       and not exists (select 1 from private.reports r where r.message_id = g.id and r.status = 'open');
   end if;
   delete from private.friend_request_log where from_id = v_me or to_id = v_me;
   delete from private.lookup_quota where user_id = v_me;
@@ -2971,7 +3045,7 @@ returns jsonb language sql stable security definer set search_path = public, pri
                             'media_keep_from', (select media_keep_from from private.app_settings where id = 1),
                             'msg_keep_days', public.msg_keep_days(),
                             'msg_keep_from', (select msg_keep_from from private.app_settings where id = 1),
-                            'db_version', '1.23');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
+                            'db_version', '1.24');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
 $$;
 
 -- 회원 앱: 내 방에서 보관 기간이 지난 사진·파일을 몇 개씩 받아 저장 공간에서 지움
@@ -3241,7 +3315,7 @@ declare
     'admin_suspend(uuid, integer, text)', 'admin_set_note(uuid, text)', 'admin_dashboard()', 'admin_badges()',
     'admin_member_page(text, text, text, integer, integer)', 'admin_member_detail(uuid)', 'admin_list_inquiries(text, integer, integer)',
     'app_info()', 'expired_media(integer)', 'admin_expired_media(integer)', 'admin_usage()', 'admin_set_usage_settings(integer, text, integer)', 'admin_purge_messages()', 'admin_log_action(text, text)',
-    'my_suspension()', 'admin_add_sticker(text, text)', 'admin_set_sticker(bigint, boolean, text)', 'admin_delete_sticker(bigint)', 'admin_move_sticker(bigint, integer)'];
+    'my_suspension()', 'edit_message(bigint, text)', 'admin_add_sticker(text, text)', 'admin_set_sticker(bigint, boolean, text)', 'admin_delete_sticker(bigint)', 'admin_move_sticker(bigint, integer)'];
   helper_fns text[] := array[
     'is_active()', 'is_active_user(uuid)', 'is_admin()', 'is_room_member(uuid)', 'is_room_member_text(text)',
     'shares_room_with(uuid)', 'is_notice_room(uuid)', 'admin_guard()',

@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.28';
+const VERSION = '1.29';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -946,7 +946,7 @@ function askTerms() {
   });
 }
 
-const rtHandlers = () => ({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport, onInquiry, onInquiryAdmin, onUnfriended });
+const rtHandlers = () => ({ onMessage, onMemberUpdate, onStatus, onFriend, onKicked, onDeleted, onReaction, onConnected, onReport, onInquiry, onInquiryAdmin, onUnfriended, onEdited });
 // v1.27: 앱을 1분 넘게 안 보고 있고 알림(푸시)이 켜져 있으면 실시간 연결을 잠시 끊음
 //   → 휴대폰 데이터·배터리와 서버 동시 연결 수 절약 (그동안 새 메시지는 휴대폰 알림으로 옴). 다시 보면 바로 연결하고 놓친 것을 받아 옴
 let rtPauseT = null;
@@ -1575,7 +1575,7 @@ function msgHtml(m, prev, next) {
     : m.kind === 'contact' ? contactBubble(m)
       : `<div class="bubble">${m.reply_to && !notice ? quoteHtml(m) : ''}${notice ? noticeText(m.content) : linkify(m.content)}</div>`;
   const showMeta = !m.pending && !m.failed;
-  const metaCol = showMeta ? `<div class="meta-col"><span class="unread" data-unread="${esc(m.id)}"></span><span class="tm">${fmtTime(m.created_at)}</span></div>` : '';
+  const metaCol = showMeta ? `<div class="meta-col"><span class="unread" data-unread="${esc(m.id)}"></span>${m.edited_at && m.kind === 'text' ? '<span class="edited">수정됨</span>' : ''}<span class="tm">${fmtTime(m.created_at)}</span></div>` : '';
   const cls = `msg ${mine ? 'mine' : ''} ${first ? 'first' : ''} ${m.pending ? 'pending' : ''} ${m.failed ? 'failed' : ''}`;
 
   if (mine) {
@@ -1878,6 +1878,7 @@ function wireComposer() {
     const touch = matchMedia('(pointer: coarse)').matches;
     if (e.key === 'Enter' && !e.shiftKey && !touch && !e.isComposing) { e.preventDefault(); sendComposer(); }
     if (e.key === 'Escape' && S.room && S.room.replyTo) { e.preventDefault(); cancelReply(); }
+    if (e.key === 'Escape' && S.room && S.room.editing) { e.preventDefault(); cancelEdit(); }
   });
   // v1.18.1: 대화창 높이가 바뀌면(키보드가 올라오거나 입력창·답장 줄이 커지면) 맨 아래에 있던 경우 맨 아래를 따라감
   let lastH = box.clientHeight;
@@ -1990,6 +1991,7 @@ function showMsgMenu(m) {
   if (m.kind === 'text' && !hiddenMsg) items.push(['copy', ic('copy', 22), '복사']);
   if (m.kind === 'contact' && contactOf(m) && !hiddenMsg) items.push(['copy', ic('copy', 22), '이름·번호 복사']);
   if (m.kind === 'file' && isNum(m.id) && !hiddenMsg && !mediaExpired(m)) items.push(['save', ic('download', 22), '저장']);
+  if (canEdit(m)) items.push(['edit', ic('pencil', 22), '수정']);   // v1.29
   if (mineMsg) items.push(['delete', ic('ban', 22), local ? '보내기 취소' : '삭제']);
   const canReport = !mineMsg && !local && !isNoticeRoom() && !!m.sender_id && !!api.report;
   if (canReport) items.push(['report', ic('flag', 22), '신고']);
@@ -2008,6 +2010,7 @@ function showMsgMenu(m) {
         const x = e.target.closest('[data-x]'); if (!x) return;
         close();
         if (x.dataset.x === 'reply') startReply(m);
+        if (x.dataset.x === 'edit') startEdit(m);
         if (x.dataset.x === 'copy') {
           const c = m.kind === 'contact' ? contactOf(m) : null;
           const text = c ? `${c.name} ${c.phones.map(fmtTel).join(', ')}` : m.content;
@@ -2043,11 +2046,25 @@ function markDeleted(roomId, id) {
     for (const x of [m, ref]) if (x && x.kind !== 'deleted') { x.kind = 'deleted'; x.content = '-'; changed = true; }
     if (R.reacts && R.reacts.delete(Number(id))) changed = true;
     if (R.replyTo === id) cancelReply();
+    if (R.editing && R.editing.id === id) cancelEdit();
     if (changed) renderMsgs();
   }
   refreshRoomsSoon();   // 목록 미리보기 갱신
 }
 function onDeleted(p) { markDeleted(p.room_id, p.id); }
+// v1.29: 상대가 글을 수정함 → 화면의 글과 목록 미리보기를 바꿈
+function onEdited(p) {
+  if (!p || p.id == null) return;
+  const R = S.room;
+  if (R && R.id === p.room_id) {
+    let changed = false;
+    for (const x of [R.msgs.find((y) => y.id === p.id), R.refs && R.refs.get(Number(p.id))]) {
+      if (x && x.kind === 'text') { x.content = p.content; x.edited_at = p.edited_at; changed = true; }
+    }
+    if (changed) renderMsgs();
+  }
+  if (p.last) { const r = S.rooms.find((x) => x.room_id === p.room_id); if (r) { r.last_message = String(p.content || '').slice(0, 100); scheduleMain(); } }
+}
 
 // ---------- 이모티콘 ----------
 // v1.28: 관리자가 올린 추가 이모티콘 (메시지에는 'c_번호' 로 저장)
@@ -2116,6 +2133,7 @@ function unpickSticker() {
   if (ta && b) b.disabled = !ta.value.trim();
 }
 function sendComposer() {
+  if (S.room && S.room.editing) { saveEdit(); return; }   // v1.29: 수정 중이면 저장
   if (S.room && S.room.pick) { const id = S.room.pick; unpickSticker(); sendSticker(id); }
   sendText();
 }
@@ -2951,6 +2969,7 @@ function jumpTo(id) {
 function startReply(m) {
   const R = S.room;
   if (!R || !m || !isNum(m.id) || m.kind === 'deleted' || m.kind === 'system' || isNoticeRoom() || !$('#msgInput')) return;
+  if (R.editing) cancelEdit();   // v1.29: 수정 중이었으면 그만두고 답장
   const wasBottom = R.atBottom;
   R.replyTo = m.id;
   renderReplyBar();
@@ -2969,6 +2988,62 @@ function renderReplyBar() {
     <button class="ibtn sm" data-act="cancel-reply" aria-label="답장 취소">${ic('x', 18)}</button>`;
 }
 function cancelReply() { if (S.room) S.room.replyTo = null; renderReplyBar(); }
+
+// ---------- v1.29: 내가 보낸 글 수정 (보낸 지 24시간 안, 글 메시지만) ----------
+const EDIT_WINDOW = 24 * 3600 * 1000;
+function canEdit(m) {
+  return !!(api.editMessage && m && S.room && m.sender_id === S.uid && m.kind === 'text' && isNum(m.id) && !m.pending && !m.failed
+    && !isNoticeRoom() && $('#msgInput') && Date.now() - Date.parse(m.created_at) < EDIT_WINDOW);
+}
+function startEdit(m) {
+  const R = S.room; if (!canEdit(m)) return;
+  if (R.replyTo) cancelReply();
+  if (R.pick) unpickSticker();
+  toggleStickers(false);   // 수정 중에는 이모티콘·사진 버튼을 숨김 (글만 고칠 수 있게)
+  R.editing = m;
+  const ta = $('#msgInput');
+  ta.value = m.content; ta.dispatchEvent(new Event('input'));
+  renderEditBar();
+  ta.focus(); try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch { /* 없음 */ }
+  $('#sendBtn').disabled = false;
+  $('#sendBtn').setAttribute('aria-label', '수정 저장');
+}
+function renderEditBar() {
+  const comp = $('#composer'); if (!comp) return;
+  const R = S.room;
+  let bar = $('#editBar');
+  if (!R || !R.editing) { if (bar) bar.remove(); const sb = $('#sendBtn'); if (sb) sb.setAttribute('aria-label', '보내기'); comp.classList.remove('editing'); return; }
+  if (!bar) { comp.insertAdjacentHTML('afterbegin', '<div class="reply-bar edit-bar" id="editBar"></div>'); bar = $('#editBar'); }
+  comp.classList.add('editing');
+  bar.innerHTML = `<span class="rb-ic">${ic('pencil', 18)}</span><div class="rb-t"><b>메시지 수정</b><span>${esc(snippetOf(R.editing))}</span></div>
+    <button class="ibtn sm" data-act="cancel-edit" aria-label="수정 취소">${ic('x', 18)}</button>`;
+}
+function cancelEdit() {
+  const R = S.room; if (!R || !R.editing) return;
+  R.editing = null;
+  const ta = $('#msgInput'); if (ta) { ta.value = ''; ta.dispatchEvent(new Event('input')); }
+  renderEditBar();
+}
+async function saveEdit() {
+  const R = S.room; const m = R && R.editing; if (!m) return;
+  const ta = $('#msgInput'); const text = ta ? ta.value.trim() : '';
+  if (!text) { toast('내용을 입력해 주세요. 지우려면 메시지를 길게 눌러 삭제를 고르세요', { error: true }); return; }
+  if (text === m.content) { cancelEdit(); return; }
+  if (Date.now() - Date.parse(m.created_at) >= EDIT_WINDOW) { cancelEdit(); toast('보낸 지 24시간이 지난 메시지는 수정할 수 없어요', { error: true }); return; }
+  const btn = $('#sendBtn'); if (btn) btn.disabled = true;
+  try {
+    const r = await api.editMessage(m.id, text);
+    m.content = (r && r.content) || text; m.edited_at = (r && r.edited_at) || new Date().toISOString();
+    const ref = R.refs && R.refs.get(Number(m.id)); if (ref) { ref.content = m.content; ref.edited_at = m.edited_at; }
+    R.editing = null;
+    if (ta) { ta.value = ''; ta.dispatchEvent(new Event('input')); }
+    renderEditBar();
+    if (S.room === R) renderMsgs();
+    const last = [...R.msgs].reverse().find((x) => isNum(x.id) && x.kind !== 'system');
+    if (last && last.id === m.id) { const rr = S.rooms.find((x) => x.room_id === R.id); if (rr) { rr.last_message = m.content.slice(0, 100); scheduleMain(); } }
+    toast('메시지를 수정했어요');
+  } catch (e) { if (btn) btn.disabled = false; showErr(e); }
+}
 
 // 옆으로 밀어서 답장 (상대 글은 오른쪽으로, 내 글은 왼쪽으로)
 function wireSwipeReply(box, cancelLp, msgOf) {
@@ -3072,7 +3147,33 @@ async function catchUp({ force = false, periodic = false } = {}) {
         if (!periodic || fresh.length) { markReadSoon(); const first = R.msgs.find((m) => isNum(m.id)); if (first) loadReactions(R, first.id); }
       }
     } catch (e) { console.warn(e); }
+    syncChanges(R);
   }
+}
+// v1.29: 실시간 연결이 쉬는 동안(화면 꺼짐·인터넷 끊김) 놓친 '수정·삭제' 를 채움
+//        기준 시각은 서버가 붙인 시각만 사용 (휴대폰 시계가 틀려도 빠지지 않게)
+async function syncChanges(R) {
+  if (!api.getChangedSince || !R || R.chgBusy) return;
+  const real = R.msgs.filter((m) => isNum(m.id));
+  if (!real.length) return;
+  const later = (a, b) => { const d = Date.parse(a) - Date.parse(b); return d > 0 || (d === 0 && a > b); };
+  const stamp = (m) => [m.created_at, m.edited_at, m.deleted_at].filter(Boolean).reduce((a, b) => (later(b, a) ? b : a));
+  let since = R.chgAt;
+  if (!since) since = real.map(stamp).reduce((a, b) => (later(b, a) ? b : a));
+  R.chgBusy = true;
+  try {
+    const rows = await api.getChangedSince(R.id, real[0].id, since);
+    for (const x of rows) {
+      const t = stamp(x); if (later(t, since)) since = t;
+      if (S.room !== R) continue;
+      if (x.kind === 'deleted') markDeleted(R.id, x.id);
+      else if (x.edited_at) {
+        const cur = R.msgs.find((y) => y.id === x.id);
+        if (cur && (cur.content !== x.content || cur.edited_at !== x.edited_at)) onEdited({ id: x.id, room_id: R.id, content: x.content, edited_at: x.edited_at, last: false });
+      }
+    }
+    R.chgAt = since;
+  } catch (e) { console.warn(e); } finally { R.chgBusy = false; }
 }
 
 function maybeNotify(m) {
@@ -3652,7 +3753,7 @@ async function renderHomeSec() {
 }
 
 // ---------- v1.20.2: 데이터베이스(schema.sql) 버전 확인 ----------
-const DB_VERSION_NEEDED = '1.23';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
+const DB_VERSION_NEEDED = '1.24';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
 const verNum = (v) => String(v || '0').split('.').reduce((a, x, i) => a + (Number(x) || 0) / (1000 ** i), 0);
 const dbOutdated = () => verNum(S.dbVersion) < verNum(DB_VERSION_NEEDED);
 function dbUpdateCard() {
@@ -4554,6 +4655,7 @@ app.addEventListener('click', async (e) => {
     case 'react': { const m = S.room && S.room.msgs.find((x) => String(x.id) === el.dataset.id); if (m) toggleReact(m, el.dataset.e); break; }
     case 'jump-reply': jumpTo(el.dataset.id); break;
     case 'cancel-reply': cancelReply(); break;
+    case 'cancel-edit': cancelEdit(); break;   // v1.29
     case 'open-file': { const m = S.room && S.room.msgs.find((x) => String(x.id) === el.dataset.id); if (m) openFile(m); break; }
     case 'save-contact': { const m = S.room && S.room.msgs.find((x) => String(x.id) === el.dataset.id); if (m) saveContact(m); break; }
     case 'view-img': showImage(el); break;
