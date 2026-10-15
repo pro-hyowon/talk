@@ -1,0 +1,8 @@
+[{
+      "relation": ["delegate_permission/common.handle_all_urls"],
+      "target": {
+        "namespace": "android_app",
+        "package_name": "com.kkiritalk.app",
+        "sha256_cert_fingerprints": ["32:91:CA:7A:DB:DB:80:AE:20:B1:F2:62:A2:E0:DD:32:E7:2A:48:7D:7A:FD:4C:B9:1D:7F:99:7B:25:B3:7D:31"]
+      }
+    }]
