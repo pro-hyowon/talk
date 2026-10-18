@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.29';
+const VERSION = '1.30';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -1078,8 +1078,11 @@ async function loadPhone() {
   if (!api.getMyPhone) { S.phone = null; return; }
   try { S.phone = (await api.getMyPhone()) || null; } catch (e) { console.warn('phone', e); S.phone = null; }
 }
+// v1.30: 공지사항 방은 항상 맨 위, 나머지는 최근 대화 순
+const roomTime = (r) => Date.parse(r && r.last_message_at) || 0;
+const roomOrder = (a, b) => (b.is_notice ? 1 : 0) - (a.is_notice ? 1 : 0) || roomTime(b) - roomTime(a);
 async function loadRooms() {
-  S.rooms = await api.listRooms();
+  S.rooms = (await api.listRooms()).sort(roomOrder);
   S.roomsLoaded = true;
   S.muted = new Map(S.rooms.map((r) => [r.room_id, !!r.muted]));
   // 보고 있던 단체방에서 내보내졌으면 닫기 (실시간 알림을 못 받은 경우 대비)
@@ -1267,9 +1270,10 @@ function renderMain() {
   }
 }
 
+const PIN_IC = '<svg class="pin-ic" width="14" height="14" viewBox="0 0 24 24" role="img" aria-label="맨 위 고정"><path d="M15 3l6 6-3 1-3.5 3.5L14 18l-2 2-3.5-3.5L4 21l-1-1 4.5-4.5L4 12l2-2 4.5-.5L14 6z" fill="currentColor"/></svg>';
 function chatRowHtml(r) {
   return `<button class="row chat" data-act="open-room" data-id="${esc(r.room_id)}">${roomAv(r)}
-    <div class="meta"><div class="title-line">${r.is_group && !r.is_notice ? '<span class="tag-group">단체</span>' : ''}<span class="name">${esc(roomName(r, r.members || []))}</span>${r.is_group && !r.is_notice ? `<span class="cnt">${r.member_count}</span>` : ''}${isMuted(r.room_id) ? `<span class="mute-ic" aria-label="알림 꺼짐">${ic('belloff', 15)}</span>` : ''}</div>
+    <div class="meta"><div class="title-line">${r.is_group && !r.is_notice ? '<span class="tag-group">단체</span>' : ''}<span class="name">${esc(roomName(r, r.members || []))}</span>${r.is_notice ? PIN_IC : ''}${r.is_group && !r.is_notice ? `<span class="cnt">${r.member_count}</span>` : ''}${isMuted(r.room_id) ? `<span class="mute-ic" aria-label="알림 꺼짐">${ic('belloff', 15)}</span>` : ''}</div>
     <div class="desc">${esc(previewText(r.last_message))}</div></div>
     <div class="side"><span class="time">${esc(fmtListTime(r.last_message_at))}</span>${r.unread ? `<span class="badge ${isMuted(r.room_id) ? 'muted' : ''}">${badgeTxt(r.unread)}</span>` : ''}</div></button>`;
 }
@@ -1843,7 +1847,7 @@ function applyToList(m) {
   r.last_message_at = m.created_at;
   const viewing = S.room && S.room.id === m.room_id && !document.hidden;
   if (m.sender_id !== S.uid && !viewing) r.unread = (r.unread || 0) + 1;
-  S.rooms.sort((a, b) => Date.parse(b.last_message_at) - Date.parse(a.last_message_at));
+  S.rooms.sort(roomOrder);
   updateBadges();
   scheduleMain();
   return true;

@@ -1090,3 +1090,6 @@ a.btn { text-decoration: none; }
 .reply-bar.edit-bar .rb-ic { color: #8A5E00; }
 .composer.editing .send-btn { background: var(--mint); }
 .composer.editing .photo-btn, .composer.editing .emo-btn { display: none; }
+
+/* v1.30: 공지사항 방 맨 위 고정 표시 */
+.row.chat .pin-ic { flex: none; color: var(--mint-text); vertical-align: -2px; }
