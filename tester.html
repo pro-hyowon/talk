@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>테스트 참여 · 끼리톡</title>
+  <meta name="description" content="끼리톡 플레이 스토어 테스트에 참여하는 방법을 안내합니다.">
+  <meta name="theme-color" content="#F6FBF9">
+  <link rel="icon" type="image/png" sizes="32x32" href="./icons/favicon-32.png">
+  <link rel="stylesheet" href="./css/legal.css">
+  <script>
+    // 카카오톡·라인 안에서 열면 구글 로그인이 안 되어 있어서 테스트 참여가 안 돼요 → 크롬(기본 브라우저)으로 다시 열기
+    (function () {
+      var ua = navigator.userAgent || '';
+      var android = /Android/i.test(ua);
+      if (!android) return;
+      var here = location.href.split('#')[0];
+      if (/KAKAOTALK/i.test(ua)) { location.href = 'kakaotalk://web/openExternal?url=' + encodeURIComponent(here); return; }
+      if (/\bLine\//i.test(ua) && !/openExternalBrowser=1/.test(here)) { location.href = here + (here.indexOf('?') < 0 ? '?' : '&') + 'openExternalBrowser=1'; }
+    })();
+  </script>
+  <style>
+    main { padding-top: 22px; }
+    h1 { font-size: 24px; }
+    .lead { font-size: 15.5px; color: var(--ink2); margin: 0 0 6px; }
+    .alert { border-radius: 16px; padding: 14px 16px; margin: 12px 0; font-size: 14.5px; line-height: 1.6; border: 1px solid var(--line); background: var(--card); }
+    .alert.warn { border-color: #F2C3CD; background: #FFF4F6; color: #8A1F35; }
+    .alert.warn b { color: #8A1F35; }
+    .alert[hidden] { display: none; }
+    .step { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 18px 18px 16px; margin: 12px 0; }
+    .step .no { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 50%; background: var(--mint); color: #0C3B30; font-weight: 800; font-size: 15px; margin-right: 8px; flex: none; }
+    .step h2 { display: flex; align-items: center; font-size: 18px; margin: 0 0 6px; }
+    .step p { font-size: 14.5px; margin: 4px 0 12px; }
+    .go { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; min-height: 56px; border-radius: 16px; background: var(--mint); color: #0C3B30 !important; font-size: 17px; font-weight: 800; text-decoration: none; border: 0; cursor: pointer; }
+    .go:active { filter: brightness(.94); }
+    .go.line { background: var(--card); border: 1.5px solid var(--mint); color: var(--mint-text) !important; }
+    .step.done { border-color: var(--mint); }
+    .step.done .no { background: var(--mint-text); color: #fff; }
+    .step .ok { display: none; margin-left: auto; padding-left: 8px; white-space: nowrap; font-size: 13px; font-weight: 800; color: var(--mint-text); }
+    .step.done .ok { display: inline; }
+    .see { font-size: 13.5px; color: var(--ink3); margin: 10px 0 0; }
+    .see b { color: var(--ink2); }
+    .help summary { cursor: pointer; font-weight: 800; font-size: 15px; color: var(--ink); }
+    .help li { font-size: 14.5px; margin: 8px 0; }
+    .copy { margin-top: 10px; }
+    .small { font-size: 13px; color: var(--ink3); }
+    footer { text-align: center; margin-top: 26px; font-size: 13px; color: var(--ink3); }
+  </style>
+</head>
+<body>
+<main>
+  <header><span class="logo"><svg width="26" height="26" viewBox="0 0 64 64" aria-hidden="true"><path d="M32 9c14.4 0 25 9 25 20.5S46.4 50 32 50c-2.7 0-5.2-.3-7.6-.9L13 55l2.8-9.6C10.4 41.6 7 36 7 29.5 7 18 17.6 9 32 9z" fill="#fff"/><circle cx="24.5" cy="28" r="3" fill="#0C3B30"/><circle cx="39.5" cy="28" r="3" fill="#0C3B30"/></svg></span><span class="app">끼리톡</span></header>
+  <h1>끼리톡 테스트 참여 🙏</h1>
+  <p class="lead">아래 <b>초록 버튼 3개</b>를 위에서부터 차례로 누르면 끝나요. 3분이면 돼요.</p>
+
+  <div class="alert warn" id="iosNote" hidden><b>아이폰은 참여할 수 없어요.</b> 안드로이드 폰에서 이 페이지를 열어 주세요. 아이폰은 지금처럼 끼리톡을 쓰시면 돼요.</div>
+  <div class="alert warn" id="inAppNote" hidden>
+    <b>지금 앱 안의 브라우저로 열려 있어요.</b> 이대로는 참여가 안 될 수 있어요. 오른쪽 위 <b>⋮</b> 또는 <b>공유</b> → <b>"다른 브라우저로 열기"</b>(크롬)를 눌러 주세요.
+    <div class="copy"><button class="go line" type="button" id="copyLink">이 페이지 주소 복사하기</button></div>
+  </div>
+
+  <div class="step" data-step="1">
+    <h2><span class="no">1</span>그룹 가입하기<span class="ok">✓ 완료</span></h2>
+    <p>버튼을 누르면 구글 화면이 열려요. <b>[그룹 가입]</b>을 누르고, 한 번 더 묻는 창이 뜨면 <b>[그룹 가입]</b>을 한 번 더 누르세요.</p>
+    <a class="go" data-go="1" href="https://groups.google.com/g/kkiritalk-testers" target="_blank" rel="noopener">① 그룹 가입하러 가기</a>
+    <p class="see">끝나면 이 페이지로 돌아와 ②를 누르세요. 로그인하라고 나오면 <b>플레이 스토어에서 쓰는 구글 계정</b>으로 로그인하세요.</p>
+  </div>
+
+  <div class="step" data-step="2">
+    <h2><span class="no">2</span>테스터 되기<span class="ok">✓ 완료</span></h2>
+    <p>열린 화면에서 파란 <b>[테스터 되기]</b> 버튼을 누르세요. "테스터가 되었습니다"가 나오면 성공이에요.</p>
+    <a class="go" data-go="2" href="https://play.google.com/apps/testing/com.kkiritalk.app" target="_blank" rel="noopener">② 테스터 되러 가기</a>
+    <p class="see"><b>"앱을 찾을 수 없음"</b>이 나오면 ①이 아직 반영 전이에요. <b>5분 뒤</b> 다시 눌러 주세요.</p>
+  </div>
+
+  <div class="step" data-step="3">
+    <h2><span class="no">3</span>앱 설치하기<span class="ok">✓ 완료</span></h2>
+    <p>플레이 스토어가 열리면 <b>[설치]</b>를 누르세요. 설치한 앱을 열고 <b>지금 쓰는 아이디·비밀번호</b>로 로그인한 뒤 <b>알림 허용</b>을 눌러 주세요.</p>
+    <a class="go" data-go="3" href="https://play.google.com/store/apps/details?id=com.kkiritalk.app" target="_blank" rel="noopener">③ 플레이 스토어에서 설치</a>
+    <p class="see">새 앱은 <b>2주 동안 지우지 말고</b> 가끔 열어 주세요. 예전 홈 화면 아이콘은 지워도 대화는 그대로예요.</p>
+  </div>
+
+  <section class="help">
+    <details>
+      <summary>잘 안 되나요? (눌러서 보기)</summary>
+      <ul>
+        <li><b>①에서 막혀요</b> → 아래 <b>"이메일로 신청하기"</b>를 눌러 메일을 그냥 보내 주세요. 운영자가 대신 넣어 드려요. 넣었다고 연락드리면 ②부터 하시면 돼요.</li>
+        <li><b>②에서 "앱을 찾을 수 없음"</b> → 5분 뒤 다시 눌러 보세요. 그래도 안 되면 플레이 스토어 오른쪽 위 <b>프로필 사진</b>을 눌러 ①에서 가입한 계정으로 바꿔 주세요.</li>
+        <li><b>③에 [설치] 대신 다른 글자가 보여요</b> → ②를 먼저 끝내야 설치 버튼이 나와요.</li>
+      </ul>
+      <a class="go line" id="mailBtn" href="#">✉️ 이메일로 신청하기</a>
+      <p class="small" style="margin-top:8px">휴대폰의 <b>Gmail 앱</b>으로 그대로 보내 주세요. 보내는 사람 주소(플레이 스토어 계정)로 등록해 드려요.</p>
+    </details>
+  </section>
+
+  <footer>문의: kkiritalk@gmail.com · <a href="./">끼리톡 열기</a></footer>
+</main>
+<script>
+  (function () {
+    var ua = navigator.userAgent || '';
+    var ios = /iPhone|iPad|iPod/i.test(ua) || (/Macintosh/i.test(ua) && 'ontouchend' in document);
+    var inApp = /KAKAOTALK|NAVER\(inapp|Instagram|FBAN|FBAV|DaumApps|Line\/|everytimeApp|BAND\//i.test(ua);
+    if (ios) document.getElementById('iosNote').hidden = false;
+    else if (inApp) document.getElementById('inAppNote').hidden = false;
+
+    var KEY = 'kkiri-tester-steps';
+    var done = {};
+    try { done = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { done = {}; }
+    function paint() {
+      Array.prototype.forEach.call(document.querySelectorAll('.step'), function (s) { s.classList.toggle('done', !!done[s.getAttribute('data-step')]); });
+    }
+    paint();
+    Array.prototype.forEach.call(document.querySelectorAll('[data-go]'), function (a) {
+      a.addEventListener('click', function () {
+        done[a.getAttribute('data-go')] = 1;
+        try { localStorage.setItem(KEY, JSON.stringify(done)); } catch (e) { /* 저장 안 됨 */ }
+        paint();
+      });
+    });
+
+    var subject = '끼리톡 테스터 신청';
+    var body = '끼리톡 아이디: (여기에 적어 주세요)\n\n이 메일을 보낸 구글 계정으로 테스터 등록 부탁드려요.';
+    document.getElementById('mailBtn').href = 'mailto:kkiritalk@gmail.com?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
+
+    document.getElementById('copyLink').addEventListener('click', function () {
+      var url = location.href.split('?')[0].split('#')[0];
+      var btn = this;
+      function ok() { btn.textContent = '복사했어요! 크롬 주소창에 붙여넣어 주세요'; }
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(ok, function () { prompt('이 주소를 복사해 주세요', url); });
+      else prompt('이 주소를 복사해 주세요', url);
+    });
+  })();
+</script>
+</body>
+</html>

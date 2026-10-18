@@ -102,6 +102,13 @@ SUPABASE_ANON_KEY: 'sb_publishable_xxxxxxxx',
 
 ## 이전 버전에서 업그레이드할 때
 
+**v1.29.2 (테스트 참여 안내 페이지)** — SQL·앱 변경 없음. 파일 2개만 추가돼요.
+- `tester.html`: 테스터 참여 안내 페이지예요. 회원에게는 **https://kkiritalk.com/tester.html** 하나만 보내면 돼요.
+  - 큰 버튼 3개를 순서대로 누르면 그룹 가입, 테스터 되기, 설치까지 끝나요.
+  - 카카오톡에서 열면 크롬으로 자동으로 넘어가요. 아이폰이나 앱 안 브라우저로 열면 안내가 떠요.
+  - 그룹 가입이 어려운 사람은 "이메일로 신청하기"를 누르면 돼요. 받은 메일 주소를 groups.google.com → 끼리톡 테스터 → 회원 추가(회원 직접 추가)로 넣어 주세요.
+- `assetlinks.json`: Play 앱 서명 지문을 포함했어요(이미 올렸다면 같은 내용이에요).
+
 **v1.29 (보낸 글 수정)** — **schema.sql 을 다시 실행해야 해요.**
 1. Supabase SQL Editor에서 새 `supabase/schema.sql` 전체를 붙여넣고 **Run** → **Success** 확인.
 2. `js/config.js` 를 제외한 나머지 파일을 GitHub 저장소에 올립니다(덮어쓰기).
