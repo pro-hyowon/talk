@@ -1,5 +1,5 @@
 // 끼리톡 서비스 워커 — 앱 화면 캐시(오프라인에서도 열림) + 푸시 알림 수신·클릭 처리
-const CACHE = 'kkiritalk-v1.32.2';
+const CACHE = 'kkiritalk-v1.33';
 const SHELL = [
   './',
   './index.html',
@@ -65,15 +65,17 @@ self.addEventListener('push', (e) => {
   try { d = e.data ? e.data.json() : {}; } catch { d = { body: e.data ? e.data.text() : '' }; }
   e.waitUntil((async () => {
     // 앱 화면을 보고 있으면 앱 안의 알림으로 충분 (아이폰은 규정상 항상 표시)
+    // v1.33: '알림 테스트'는 앱을 보고 있어도 띄움 (알림이 오는지 확인하는 용도)
+    const isTest = d.tag === 'kkiri-test';
     const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-    if (!isAppleWebKit && wins.some((w) => w.visibilityState === 'visible')) return;
+    if (!isTest && !isAppleWebKit && wins.some((w) => w.visibilityState === 'visible')) return;
     await self.registration.showNotification(d.title || '끼리톡', {
       body: d.body || '새 메시지가 도착했습니다.',
       tag: d.tag || 'minitalk',
       renotify: true,
       icon: './icons/icon-192.png',
       badge: './icons/badge-72.png',
-      data: { url: d.url || './' },
+      data: { url: isTest ? './' : (d.url || './') },
     });
   })());
 });

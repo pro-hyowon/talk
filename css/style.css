@@ -1114,3 +1114,11 @@ a.btn { text-decoration: none; }
 .av-viewer .vimg { padding: 0 12px; }
 .av-viewer .vimg img { width: min(100%, 520px); max-height: 100%; aspect-ratio: 1; border-radius: 6px; object-fit: contain; }
 .av-viewer .vfoot { height: 56px; }
+
+/* v1.33: 관리자 회원 정보 — 알림 기기 · 테스트 알림 */
+#admPush .push-info { display: flex; flex-direction: column; gap: 4px; font-size: 14px; }
+#admPush .push-info > span { color: var(--ink3); font-size: 13px; line-height: 1.5; }
+#admPush .push-info .hist { margin-top: 4px; }
+#admPush .warn { color: var(--berry); }
+#admPush .push-res p { margin: 8px 0 0; font-size: 13.5px; line-height: 1.55; color: var(--ink2); word-break: keep-all; }
+#admPush .push-res p.warn { color: var(--berry); }

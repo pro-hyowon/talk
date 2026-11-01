@@ -1,5 +1,5 @@
 -- =====================================================================
---  끼리톡(Kkiri Talk) v1.24 — Supabase 데이터베이스 설정 스크립트
+--  끼리톡(Kkiri Talk) v1.25 — Supabase 데이터베이스 설정 스크립트
 --  Supabase 대시보드 > SQL Editor 에 이 파일 전체를 붙여넣고 [Run] 하세요.
 --  여러 번 실행해도 안전합니다. 이전 버전을 이미 설치했다면 이 파일을
 --  다시 실행하면 기존 회원·대화는 그대로 두고 새 기능만 추가됩니다.
@@ -2750,6 +2750,124 @@ begin
 end;
 $$;
 
+-- ---------- v1.25: 알림 테스트 · 관리자 알림 진단 ----------
+--   알림이 안 온다는 회원이 있을 때: (1) 서버에 그 회원의 알림 기기가 등록돼 있는지,
+--   (2) 서버가 실제로 보냈는지(발송 결과)를 확인할 수 있게 함. 휴대폰에 떴는지는 회원이 확인.
+create table if not exists private.push_tests (
+  id         bigserial primary key,
+  user_id    uuid not null,          -- 받는 회원
+  by_admin   uuid,                   -- 관리자가 보낸 경우 그 관리자 (본인이 보낸 경우 null)
+  request_id bigint,                 -- 서버 발송 요청 번호 (결과 확인용)
+  devices    integer not null default 0,
+  created_at timestamptz not null default now()
+);
+create index if not exists push_tests_user_idx on private.push_tests(user_id, created_at desc);
+revoke all on private.push_tests from public, anon, authenticated;
+
+-- 테스트 알림 보내기: p_user 를 비우면 나에게, 관리자는 다른 회원에게도
+create or replace function public.send_test_push(p_user uuid default null)
+returns jsonb language plpgsql security definer set search_path = public, extensions as $$
+declare
+  v_me     uuid := auth.uid();
+  v_target uuid := coalesce(p_user, auth.uid());
+  v_admin  boolean := public.is_admin();
+  v_url    text;
+  v_secret text;
+  v_subs   jsonb;
+  v_n      integer := 0;
+  v_req    bigint;
+  v_id     bigint;
+begin
+  if v_me is null or not public.is_active() then raise exception '로그인이 필요해요'; end if;
+  if v_target <> v_me and not v_admin then raise exception '다른 회원에게는 보낼 수 없어요'; end if;
+  if not exists (select 1 from profiles where id = v_target) then raise exception '회원을 찾을 수 없어요'; end if;
+  perform pg_advisory_xact_lock(hashtext('push_test:' || v_me::text));   -- 동시에 여러 번 눌러도 횟수 제한이 지켜지게
+  delete from private.push_tests where created_at < now() - interval '1 day';   -- 오래된 테스트 기록 정리
+  if (select count(*) from private.push_tests
+       where created_at > now() - interval '1 minute'
+         and ((by_admin is null and user_id = v_me) or by_admin = v_me)) >= 3 then
+    raise exception '테스트 알림은 1분에 3번까지 보낼 수 있어요. 잠시 후 다시 해 주세요';
+  end if;
+  if to_regclass('public.push_subscriptions') is null or to_regclass('private.push_config') is null then
+    return jsonb_build_object('status', 'not_setup', 'devices', 0);
+  end if;
+  execute 'select function_url, secret from private.push_config where id = 1' into v_url, v_secret;
+  if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return jsonb_build_object('status', 'not_setup', 'devices', 0); end if;
+  execute 'select count(*)::int, jsonb_agg(jsonb_build_object(''endpoint'', endpoint, ''p256dh'', p256dh, ''auth'', auth))
+             from push_subscriptions where user_id = $1' into v_n, v_subs using v_target;
+  if coalesce(v_n, 0) = 0 then
+    insert into private.push_tests (user_id, by_admin, devices) values (v_target, case when v_target <> v_me then v_me end, 0);
+    return jsonb_build_object('status', 'no_device', 'devices', 0);
+  end if;
+  begin
+  v_req := net.http_post(
+    url := v_url,
+    body := jsonb_build_object('subs', v_subs, 'title', '끼리톡 알림 테스트',
+      'body', case when v_target = v_me then '이 알림이 보이면 알림이 잘 오고 있어요 👍'
+                   else '운영자가 보낸 테스트 알림이에요. 이 알림이 보이면 알림이 잘 오고 있어요 👍' end,
+      'room_id', 'kkiri-test'),   -- 앱이 '테스트 알림'으로 알아보고, 앱을 보고 있어도 띄움
+    headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
+    timeout_milliseconds := 8000
+  );
+  exception when others then
+    -- 발송 요청 자체가 안 되면 원문 오류 대신 'error' 로 알려 줌 (화면에서 운영자 확인 안내)
+    return jsonb_build_object('status', 'error', 'devices', v_n, 'error', left(sqlerrm, 200));
+  end;
+  insert into private.push_tests (user_id, by_admin, request_id, devices)
+  values (v_target, case when v_target <> v_me then v_me end, v_req, v_n) returning id into v_id;
+  return jsonb_build_object('status', 'sent', 'devices', v_n, 'test_id', v_id);
+end;
+$$;
+
+-- 테스트 알림의 서버 발송 결과 (보낸 본인 또는 그 관리자만)
+--   state: pending(아직) / done(서버 응답 받음) / unknown(결과를 볼 수 없음)
+create or replace function public.test_push_result(p_id bigint)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_t    private.push_tests%rowtype;
+  v_code integer;
+  v_body text;
+  v_err  text;
+  v_out  jsonb;
+begin
+  select * into v_t from private.push_tests where id = p_id;
+  if not found then raise exception '테스트 기록을 찾을 수 없어요'; end if;
+  if not coalesce((v_t.by_admin is null and v_t.user_id = auth.uid())
+                  or (v_t.by_admin is not null and v_t.by_admin = auth.uid() and public.is_admin()), false) then
+    raise exception '볼 수 없는 기록이에요';
+  end if;
+  if v_t.request_id is null or to_regclass('net._http_response') is null then
+    return jsonb_build_object('state', 'unknown', 'devices', v_t.devices);
+  end if;
+  begin
+    execute 'select status_code, content, error_msg from net._http_response where id = $1' into v_code, v_body, v_err using v_t.request_id;
+  exception when others then
+    return jsonb_build_object('state', 'unknown', 'devices', v_t.devices);   -- 결과 표를 읽을 수 없으면 '모름'
+  end;
+  if v_code is null and v_err is null then return jsonb_build_object('state', 'pending', 'devices', v_t.devices); end if;
+  begin v_out := v_body::jsonb; exception when others then v_out := null; end;
+  return jsonb_build_object('state', 'done', 'devices', v_t.devices, 'http', v_code, 'error', left(v_err, 200),
+    'sent', coalesce((v_out->>'sent')::int, 0), 'failed', coalesce((v_out->>'failed')::int, 0), 'removed', coalesce((v_out->>'removed')::int, 0));
+end;
+$$;
+
+-- 관리자: 회원의 알림 받는 기기 (수, 마지막 등록, 기기 종류 — 브라우저 정보)
+create or replace function public.admin_push_info(p_user uuid)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare
+  v_out jsonb;
+begin
+  perform public.admin_guard();
+  if to_regclass('public.push_subscriptions') is null then
+    return jsonb_build_object('setup', false, 'devices', 0, 'list', '[]'::jsonb);
+  end if;
+  execute 'select jsonb_build_object(''setup'', true, ''devices'', count(*), ''last'', max(created_at),
+             ''list'', coalesce(jsonb_agg(jsonb_build_object(''agent'', left(coalesce(user_agent, ''''), 300), ''at'', created_at) order by created_at desc), ''[]''::jsonb))
+             from push_subscriptions where user_id = $1' into v_out using p_user;
+  return v_out;
+end;
+$$;
+
 -- ---------- 1:1 문의 ----------
 create or replace function public.create_inquiry(p_category text, p_title text, p_body text)
 returns bigint language plpgsql security definer set search_path = public as $$
@@ -3045,7 +3163,7 @@ returns jsonb language sql stable security definer set search_path = public, pri
                             'media_keep_from', (select media_keep_from from private.app_settings where id = 1),
                             'msg_keep_days', public.msg_keep_days(),
                             'msg_keep_from', (select msg_keep_from from private.app_settings where id = 1),
-                            'db_version', '1.24');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
+                            'db_version', '1.25');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
 $$;
 
 -- 회원 앱: 내 방에서 보관 기간이 지난 사진·파일을 몇 개씩 받아 저장 공간에서 지움
@@ -3315,7 +3433,8 @@ declare
     'admin_suspend(uuid, integer, text)', 'admin_set_note(uuid, text)', 'admin_dashboard()', 'admin_badges()',
     'admin_member_page(text, text, text, integer, integer)', 'admin_member_detail(uuid)', 'admin_list_inquiries(text, integer, integer)',
     'app_info()', 'expired_media(integer)', 'admin_expired_media(integer)', 'admin_usage()', 'admin_set_usage_settings(integer, text, integer)', 'admin_purge_messages()', 'admin_log_action(text, text)',
-    'my_suspension()', 'edit_message(bigint, text)', 'admin_add_sticker(text, text)', 'admin_set_sticker(bigint, boolean, text)', 'admin_delete_sticker(bigint)', 'admin_move_sticker(bigint, integer)'];
+    'my_suspension()', 'edit_message(bigint, text)', 'admin_add_sticker(text, text)', 'admin_set_sticker(bigint, boolean, text)', 'admin_delete_sticker(bigint)', 'admin_move_sticker(bigint, integer)',
+    'send_test_push(uuid)', 'test_push_result(bigint)', 'admin_push_info(uuid)'];
   helper_fns text[] := array[
     'is_active()', 'is_active_user(uuid)', 'is_admin()', 'is_room_member(uuid)', 'is_room_member_text(text)',
     'shares_room_with(uuid)', 'is_notice_room(uuid)', 'admin_guard()',

@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.32.2';
+const VERSION = '1.33';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -459,22 +459,21 @@ function envKind() {
   return isStandalone() ? 'home' : 'browser';
 }
 const ENV_NAME = { store: '플레이 스토어 앱', inapp: '다른 앱 안의 브라우저', 'ios-app': '아이폰 홈 화면 앱', 'ios-tab': '아이폰 사파리', home: '홈 화면 앱', browser: '인터넷 브라우저' };
-function browserName() {
-  const ua = navigator.userAgent || '';
+function browserName(ua = navigator.userAgent || '') {
   const pick = [[/SamsungBrowser\/([\d.]+)/, '삼성 인터넷'], [/Whale\/([\d.]+)/, '네이버 웨일'], [/EdgA?\/([\d.]+)/, '엣지'], [/(?:Firefox|FxiOS)\/([\d.]+)/, '파이어폭스'], [/CriOS\/([\d.]+)/, '크롬'], [/Chrome\/([\d.]+)/, '크롬'], [/Version\/([\d.]+).*Safari/, '사파리']];
   for (const [re, n] of pick) { const m = ua.match(re); if (m) return `${n} ${m[1].split('.')[0]}`; }
   return '알 수 없음';
 }
 const isSamsungNet = () => /SamsungBrowser/i.test(navigator.userAgent || '');
-function deviceName() {
-  const ua = navigator.userAgent || '';
-  const a = ua.match(/Android (\d+)/); if (a) return `${phoneKind() === 'samsung' ? '갤럭시' : '안드로이드'} (안드로이드 ${a[1]})`;
-  const i = ua.match(/OS (\d+)[_.](\d+)/); if (phoneKind() === 'ios') return `아이폰 (iOS ${i ? `${i[1]}.${i[2]}` : '?'})`;
-  return '컴퓨터';
+function deviceName(ua = navigator.userAgent || '') {
+  if (ua === (navigator.userAgent || '') && phoneKind() === 'ios' && !/iPhone|iPad|iPod/i.test(ua)) return '아이패드';
+  const a = ua.match(/Android (\d+)/); if (a) return `${/SM-|Samsung/i.test(ua) ? '갤럭시' : '안드로이드'} (안드로이드 ${a[1]})`;
+  const i = ua.match(/OS (\d+)[_.](\d+)/); if (/iPhone|iPad|iPod/i.test(ua)) return `아이폰 (iOS ${i ? `${i[1]}.${i[2]}` : '?'})`;
+  return /Macintosh|Windows|Linux|CrOS/i.test(ua) ? '컴퓨터' : '알 수 없는 기기';
 }
 function notifDiag(reason, err) {
   const perm = 'Notification' in window ? ({ granted: '허용', denied: '차단', default: '아직 안 물어봄' }[Notification.permission] || Notification.permission) : '알림 기능 없음';
-  const stage = { perm: '알림 권한', push: '휴대폰 알림 서비스 연결', save: '서버에 저장' }[err && err.stage] || '';
+  const stage = { perm: '알림 권한', push: '휴대폰 알림 서비스 연결', save: '서버에 저장', phone: '휴대폰에 표시(테스트 알림)', server: '서버 발송' }[err && err.stage] || '';
   return ['[알림 진단 정보 — 자동으로 적었어요]', `앱 버전: ${VERSION}`, `사용 환경: ${ENV_NAME[envKind()]}`, `기기: ${deviceName()}`, `브라우저: ${browserName()}`,
     `알림 권한: ${perm}`, `알림 서비스: ${push.supported() ? '지원' : '지원 안 함'}`, `원인 분류: ${reason}`,
     stage ? `멈춘 단계: ${stage}` : '', err ? `오류: ${String((err.errName ? err.errName + ' — ' : '') + err.message).slice(0, 300)}` : '',
@@ -489,6 +488,19 @@ function unblockSteps(env) {
     : `<li>주소창 왼쪽의 <b>아이콘</b>(자물쇠·조절 모양)을 누름 → <b>권한</b>(또는 '알림')을 <b>허용</b>으로 바꿈</li><li>안 보이면: 크롬 오른쪽 위 <b>⋮</b> → <b>설정</b> → <b>사이트 설정</b> → <b>알림</b> → <b>kkiritalk.com</b> → <b>허용</b></li>`;
   return `<ol>${home}<li>${esc(APP)}로 돌아와 아래 <b>다시 켜기</b>를 누름</li></ol><p class="nh-note">휴대폰 <b>설정 → 애플리케이션 → 크롬</b> → 알림이 꺼져 있어도 알림이 오지 않아요.</p>`;
 }
+// v1.33: 서버는 보냈는데 휴대폰에 안 뜰 때 — 갤럭시 절전(잠자는 앱)·앱 알림·방해 금지
+function phoneBlockSteps(env, sure = true) {
+  const lead = sure ? '서버는 알림을 보냈는데 휴대폰이 보여 주지 않았어요.' : '서버 발송 결과를 확인하지 못했어요. 먼저 아래 설정을 확인해 주세요.';
+  if (phoneKind() === 'pc') return `<p>${lead}</p><ol><li><b>윈도우</b>: 설정 → 시스템 → 알림 → 알림 켜기, 목록에서 <b>${esc(isSamsungNet() ? '브라우저' : 'Chrome(또는 사용하는 브라우저)')}</b> 켜기, <b>방해 금지</b> 끄기</li><li><b>맥</b>: 시스템 설정 → 알림 → 사용하는 브라우저 → 알림 허용, <b>집중 모드</b> 끄기</li><li>브라우저 주소창 왼쪽 아이콘 → <b>알림 허용</b></li><li>바꾼 뒤 아래 <b>다시 테스트</b>를 눌러 확인</li></ol>`;
+  const appName = env === 'store' ? APP : isSamsungNet() ? '삼성 인터넷' : env === 'ios-app' ? APP : 'Chrome(크롬)';
+  if (env === 'ios-app' || phoneKind() === 'ios') return `<p>${sure ? '서버는 알림을 보냈는데 아이폰에 뜨지 않았어요.' : lead}</p><ol><li><b>설정</b> → <b>알림</b> → <b>${esc(APP)}</b> → <b>알림 허용</b> 켜기, '잠금 화면·알림 센터·배너' 모두 켜기</li><li><b>집중 모드</b>(방해 금지·수면)가 켜져 있으면 끄거나 ${esc(APP)}를 허용 앱에 추가</li></ol>`;
+  return `<p>${lead} 아래를 차례로 확인해 주세요.</p><ol>
+    ${phoneKind() === 'samsung' ? `<li>휴대폰 <b>설정</b> → <b>배터리</b> → <b>백그라운드 사용 제한</b> → <b>잠자는 앱</b>·<b>딥 슬리핑 앱</b> 목록에서 <b>${esc(appName)}</b>${env === 'store' ? ' 와 <b>Chrome</b>' : ''}을 빼기</li><li>같은 화면의 <b>사용하지 않는 앱을 절전 상태로 전환</b> 끄기</li>`
+      : `<li>휴대폰 <b>설정</b> → <b>애플리케이션</b> → <b>${esc(appName)}</b> → <b>배터리</b> → <b>제한 없음</b>(또는 '최적화 안 함')으로 바꾸기</li>`}
+    <li>휴대폰 <b>설정</b> → <b>애플리케이션</b> → <b>${esc(appName)}</b> → <b>알림</b>에서 알림 허용, 그 아래 항목들도 모두 켜기</li>
+    <li><b>방해 금지 모드</b>가 켜져 있으면 끄기</li>
+    <li>바꾼 뒤 아래 <b>다시 테스트</b>를 눌러 확인</li></ol>`;
+}
 function notifHelpBody(reason, env) {
   switch (reason) {
     case 'inapp': return { t: '다른 앱 안에서 열려 있어요', h: `<p>카카오톡·네이버 같은 다른 앱 안의 화면에서는 알림을 켤 수 없어요.</p><ol><li>오른쪽 위 <b>⋮</b> 또는 <b>공유</b> → <b>다른 브라우저로 열기</b>(크롬)를 누름</li><li>열린 크롬에서 로그인하고 더보기 → 알림을 켬</li></ol>${phoneKind() === 'ios' ? '' : `<p class="nh-note">플레이 스토어에서 <b>${esc(APP)}</b> 앱을 설치하면 더 편해요.</p>`}`, retry: false };
@@ -496,6 +508,9 @@ function notifHelpBody(reason, env) {
     case 'unsupported': return { t: '이 브라우저에서는 알림을 쓸 수 없어요', h: `<p><b>크롬</b>이나 <b>삼성 인터넷</b>으로 kkiritalk.com 을 열어 주세요.${phoneKind() === 'ios' ? '' : ` 플레이 스토어에서 <b>${esc(APP)}</b> 앱을 설치해도 돼요.`}</p>`, retry: false };
     case 'denied': return { t: '알림이 막혀 있어요', h: `<p>예전에 알림을 <b>차단</b>해서 지금은 켤 수 없어요. 아래 순서로 풀어 주세요.</p>${unblockSteps(env)}`, retry: true };
     case 'dismissed': return { t: '알림 허용을 누르지 않았어요', h: '<p>알림을 켜려면 휴대폰이 묻는 창에서 <b>허용</b>을 눌러야 해요. 아래 <b>다시 켜기</b>를 누르고 <b>허용</b>을 눌러 주세요.</p><p class="nh-note">묻는 창이 안 보이면 주소창의 <b>종(🔔) 모양</b>이나 <b>자물쇠</b> 아이콘을 눌러 알림을 허용해 주세요.</p>', retry: true };
+    case 'phone': return { t: '휴대폰이 알림을 막고 있어요', h: phoneBlockSteps(env), retry: false };
+    case 'unsure': return { t: '알림이 오지 않았어요', h: phoneBlockSteps(env, false), retry: false };
+    case 'server': return { t: '서버 알림 설정을 확인해야 해요', h: '<p>서버에서 알림을 보내지 못했어요. 회원님 휴대폰 문제가 아니에요. 아래 <b>운영자에게 알리기</b>를 눌러 주세요.</p>', retry: false };
     case 'save': return { t: '서버에 저장하지 못했어요', h: '<p>인터넷 연결이 잠깐 끊겼을 수 있어요. 와이파이나 데이터를 확인하고 <b>다시 켜기</b>를 눌러 주세요.</p>', retry: true };
     default: return { t: '휴대폰 알림 서비스에 연결하지 못했어요', h: `<p>알림 권한은 허용됐는데, 휴대폰의 알림 서비스가 응답하지 않았어요. 아래를 차례로 해 보세요.</p><ol><li>인터넷(와이파이·데이터)을 확인하고 <b>다시 켜기</b></li><li>플레이 스토어에서 <b>${env === 'store' || !isSamsungNet() ? '크롬(Chrome)' : '삼성 인터넷'}</b>과 <b>Google Play 서비스</b>를 최신으로 업데이트</li><li><b>절전 모드</b>나 <b>데이터 절약</b>을 잠깐 끄고 다시 켜기</li><li>휴대폰을 껐다 켠 뒤 다시 켜기</li></ol><p class="nh-note">구글 서비스가 없는 휴대폰(일부 화웨이 등)은 앱을 닫았을 때 오는 알림을 받을 수 없어요.</p>`, retry: true };
   }
@@ -503,17 +518,20 @@ function notifHelpBody(reason, env) {
 function showNotifHelp(reason, err) {
   const env = envKind();
   const { t, h, retry, install } = notifHelpBody(reason, env);
+  const retest = reason === 'phone' || reason === 'unsure';
   const diag = notifDiag(reason, err);
   console.warn('notif-help', reason, err);
   openSheet({
-    title: '알림 켜기',
+    title: reason === 'phone' || reason === 'server' || reason === 'unsure' ? '알림 테스트' : '알림 켜기',
     body: `<div class="notif-help"><h3>${esc(t)}</h3>${h}</div>
-      <div class="btn-col" style="gap:8px">${retry ? '<button class="btn" data-retry>다시 켜기</button>' : ''}${install ? '<button class="btn" data-install>홈 화면 추가 방법 보기</button>' : ''}
+      <div class="btn-col" style="gap:8px">${retest ? '<button class="btn" data-retest>다시 테스트</button>' : ''}${retry ? '<button class="btn" data-retry>다시 켜기</button>' : ''}${install ? '<button class="btn" data-install>홈 화면 추가 방법 보기</button>' : ''}
         <button class="btn line" data-report>그래도 안 되면 운영자에게 알리기</button></div>
       <p class="sheet-desc nh-foot">운영자에게 알리면 쓰는 휴대폰·브라우저 종류와 오류 내용이 1:1 문의로 전달돼요. 답변은 더보기 → 1:1 문의에서 볼 수 있어요.</p>`,
     onMount(sheet, close) {
       const r = $('[data-retry]', sheet);
       if (r) r.onclick = () => { close(); turnOnNotif(); };   // 누른 그 순간에 권한 창을 띄워야 하므로 바로 호출
+      const rt = $('[data-retest]', sheet);
+      if (rt) rt.onclick = () => { close(); setTimeout(runNotifTest, 250); };
       const i = $('[data-install]', sheet);
       if (i) i.onclick = () => { close(); setTimeout(showInstall, 250); };
       const rp = $('[data-report]', sheet);
@@ -552,7 +570,8 @@ async function turnOnNotif() {
   let ok = false; let perm = Notification.permission;
   try {
     if (perm !== 'granted') {
-      perm = await Notification.requestPermission();   // 첫 번째 기다림이어야 아이폰에서도 권한 창이 열림
+      // 첫 번째 기다림이어야 아이폰에서도 권한 창이 열림. v1.33: 크롬이 주소창의 작은 종 모양으로만 묻는 경우 답이 안 올 수 있어 60초까지만 기다림
+      perm = await Promise.race([Promise.resolve(Notification.requestPermission()), new Promise((res) => setTimeout(() => res('timeout'), 60000))]);
       if (perm !== 'granted') { notifDone(); showNotifHelp(perm === 'denied' ? 'denied' : 'dismissed'); return; }
     }
     if (push.supported()) {
@@ -571,6 +590,91 @@ async function turnOnNotif() {
   why.stage = 'perm';
   showNotifHelp(Notification.permission === 'denied' ? 'denied' : ok ? 'push' : 'dismissed', why);
 }
+// ---------------------------------------------------------------------
+// v1.33: 알림 테스트 — 내 휴대폰으로 테스트 알림을 보내 보고, 안 오면 원인(서버/등록/휴대폰)을 알려 줌
+// ---------------------------------------------------------------------
+async function pollTestResult(id, ms = 10000) {
+  const end = Date.now() + ms; let last = null;
+  while (Date.now() < end) {
+    await new Promise((r) => setTimeout(r, 1200));
+    try { last = await api.testPushResult(id); } catch (e) { console.warn('test result', e); break; }
+    if (last && last.state !== 'pending') break;
+  }
+  return last;
+}
+const testOkHttp = (r) => r && r.state === 'done' && r.http >= 200 && r.http < 300;
+function testResultText(r, devices) {
+  if (!r || r.state === 'pending') return `서버에 보냈어요 (기기 ${devices}대) · 결과를 기다리는 중이에요`;
+  if (r.state === 'unknown') return `서버에 보냈어요 (기기 ${devices}대)`;
+  if (!testOkHttp(r)) return `서버에서 보내지 못했어요 (오류 ${r.http || '-'}${r.error ? ` · ${r.error}` : ''})`;
+  return `서버에서 ${r.sent}대에 보냈어요${r.failed ? ` · 실패 ${r.failed}대` : ''}${r.removed ? ` · 만료된 기기 ${r.removed}대 정리` : ''}`;
+}
+async function runNotifTest() {
+  const env = envKind();
+  if (!('Notification' in window)) { showNotifHelp(env === 'inapp' ? 'inapp' : env === 'ios-tab' ? 'ios-tab' : 'unsupported'); return; }
+  if (!api.sendTestPush || $('#ntBody')) return;   // 두 번 눌러도 한 번만
+  if (!notifOn()) {
+    if (Notification.permission === 'denied') { showNotifHelp('denied'); return; }
+    if (await ask('먼저 알림을 켜 주세요', '알림이 꺼져 있어서 테스트할 수 없어요. 지금 알림을 켤까요?', '알림 켜기')) turnOnNotif();
+    return;
+  }
+  let sheet = null; let closeIt = () => {};
+  openSheet({ title: '알림 테스트', body: '<div class="notif-help" id="ntBody"><div class="spinner" style="margin:18px auto"></div><p style="text-align:center">테스트 알림을 보내는 중이에요…</p></div>',
+    onMount(sh, close) { sheet = sh; closeIt = close; } });
+  const alive = () => !!(sheet && sheet.isConnected);
+  const set = (h) => { const el = alive() && $('#ntBody', sheet); if (el) el.innerHTML = h; };
+  // 이 휴대폰의 등록을 서버에 한 번 더 저장 (빠졌거나 바뀐 경우 대비)
+  try { if (push.supported()) await enablePush({ silent: true }); } catch (e) { if (alive()) { closeIt(); showNotifHelp(e.stage === 'save' ? 'save' : 'push', e); } return; }
+  if (!alive()) return;   // 그사이 창을 닫았으면 보내지 않음
+  let r;
+  try { r = await api.sendTestPush(); } catch (e) { if (alive()) closeIt(); showErr(e); return; }
+  if (!alive()) return;
+  if (r.status === 'not_setup' || r.status === 'error') { closeIt(); showNotifHelp('server', Object.assign(new Error(`서버 알림 설정 문제 (${r.status}${r.error ? ` · ${r.error}` : ''})`), { stage: 'server' })); return; }
+  if (r.status === 'no_device') { closeIt(); showNotifHelp('save', Object.assign(new Error('서버에 이 회원의 알림 기기가 없어요 (no_device)'), { stage: 'save' })); return; }
+  set(`<h3>테스트 알림을 보냈어요</h3><p>몇 초 안에 휴대폰 위쪽에 <b>'끼리톡 알림 테스트'</b> 알림이 떠요. 떴는지 알려 주세요.</p>
+    <p class="nh-note" id="ntSrv">${esc(testResultText(null, r.devices))}</p>
+    <div class="two" style="margin-top:14px"><button class="btn gray" data-nt="no">안 왔어요</button><button class="btn" data-nt="yes">왔어요 👍</button></div>`);
+  let res = null; let repaired = false;
+  const pollP = pollTestResult(r.test_id).then((x) => { res = x; return x; });
+  sheet.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-nt]'); if (!btn || btn.disabled) return;
+    if (btn.dataset.nt === 'yes') { closeIt(); toast('알림이 잘 오고 있어요 👍'); return; }
+    if (btn.dataset.nt === 'again') { closeIt(); setTimeout(runNotifTest, 250); return; }
+    // '안 왔어요' — 서버 결과를 받은 뒤에 원인을 판단 (결과 전에 휴대폰 탓으로 돌리지 않음)
+    if (!res || res.state === 'pending') {
+      $$('[data-nt]', sheet).forEach((x) => { x.disabled = true; });
+      const ln = $('#ntSrv', sheet); if (ln) ln.textContent = '서버 결과를 확인하는 중이에요…';
+      await pollP;
+    }
+    if (!alive()) return;
+    closeIt();
+    const done = res && res.state === 'done';
+    const info = testResultText(res, r.devices);
+    if (repaired) return;   // '닫기'
+    if (done && !testOkHttp(res)) { showNotifHelp('server', Object.assign(new Error(`테스트 알림 서버 오류 · ${info}`), { stage: 'server' })); return; }
+    if (done && res.sent === 0) { showNotifHelp('push', Object.assign(new Error(`서버가 보내지 못함 · ${info}`), { stage: 'push' })); return; }
+    showNotifHelp(done ? 'phone' : 'unsure', Object.assign(new Error(`테스트 알림이 휴대폰에 뜨지 않음 · ${info}`), { stage: 'phone' }));
+  });
+  await pollP;
+  if (!alive()) return;
+  // 서버 응답은 정상인데 1대도 못 보냄 + 만료 정리됨 → 이 휴대폰 등록이 만료된 것: 새로 등록하고 다시 테스트하게 함
+  if (res && res.state === 'done' && testOkHttp(res) && res.sent === 0 && res.removed > 0 && push.supported()) {
+    try {
+      const old = await push.current(); if (old) { try { await old.unsubscribe(); } catch { /* 무시 */ } }
+      await enablePush({ silent: true });
+      repaired = true;
+    } catch (e) { console.warn('re-register', e); }
+    if (!alive()) return;
+    if (repaired) {
+      set(`<h3>알림 등록을 새로 했어요</h3><p>이 휴대폰의 알림 등록이 만료돼 있어서 <b>새로 등록</b>했어요. 아래 <b>다시 테스트</b>를 눌러 알림이 오는지 확인해 주세요.</p>
+        <div class="two" style="margin-top:14px"><button class="btn gray" data-nt="no">닫기</button><button class="btn" data-nt="again">다시 테스트</button></div>`);
+      return;
+    }
+  }
+  const line = $('#ntSrv', sheet);
+  if (line) line.textContent = testResultText(res, r.devices);
+}
+
 async function turnOffNotif() {
   if (notifWorking) return;
   notifWorking = true;
@@ -1472,6 +1576,7 @@ function renderMore(head, body) {
       <div class="item tap" data-act="notif-row"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림<span class="sub">${nb ? esc(nb.text) : notifSub(on)}</span></span>
         <button class="switch ${on ? 'on' : ''}${nb ? ' busy' : ''}" data-act="notif" role="switch" aria-checked="${on}" aria-busy="${nb ? 'true' : 'false'}" aria-label="새 메시지 알림"></button></div>
       <button class="item" data-act="notif-sound"><span class="tile lemon">${ic('bell', 19)}</span><span class="label">알림 소리<span class="sub">${esc(soundLabel(soundPref()))}${vibratePref() && 'vibrate' in navigator ? ' · 진동' : ''} · 휴대폰 알림음 바꾸기</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      ${api.sendTestPush && !dbOutdated() ? `<button class="item" data-act="notif-test"><span class="tile mint">${ic('send', 19)}</span><span class="label">알림 테스트<span class="sub">내 휴대폰으로 알림이 오는지 확인해요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>` : ''}
       ${isStandalone() ? '' : `<button class="item" data-act="install"><span class="tile mint">${ic('install', 19)}</span><span class="label">홈 화면에 설치</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>`}
     </div>
     <div class="card">
@@ -3943,7 +4048,7 @@ async function renderHomeSec() {
 }
 
 // ---------- v1.20.2: 데이터베이스(schema.sql) 버전 확인 ----------
-const DB_VERSION_NEEDED = '1.24';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
+const DB_VERSION_NEEDED = '1.25';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
 const verNum = (v) => String(v || '0').split('.').reduce((a, x, i) => a + (Number(x) || 0) / (1000 ** i), 0);
 const dbOutdated = () => verNum(S.dbVersion) < verNum(DB_VERSION_NEEDED);
 function dbUpdateCard() {
@@ -4142,6 +4247,10 @@ async function showAdminUser(id) {
         ${cell('휴대폰 번호', u.phone ? esc(fmtPhone(u.phone)) : '등록 안 함', true)}
         ${cell('약관 동의', u.terms_agreed_at ? fmtDT(u.terms_agreed_at) : '아직 안 함', true)}
       </div>
+      ${api.adminPushInfo && !dbOutdated() ? `<div class="adm-block" id="admPush"><div class="blk-h">알림 (앱을 닫아도 오는 알림)</div>
+        <div class="push-info">불러오는 중…</div>
+        <button class="btn line sm" data-x="testpush" style="align-self:flex-start">${ic('send', 16)}테스트 알림 보내기</button>
+        <div class="push-res"></div></div>` : ''}
       <div class="adm-block"><div class="blk-h">관리자 메모${u.note_updated_at ? `<span>${fmtDT(u.note_updated_at)} 저장</span>` : ''}</div>
         <textarea class="input memo" id="memo" maxlength="2000" rows="3" placeholder="이 회원에 대해 기억할 내용 (회원에게는 보이지 않아요)">${esc(u.note || '')}</textarea>
         <button class="btn line sm" data-x="memo" style="align-self:flex-end">메모 저장</button></div>
@@ -4152,6 +4261,7 @@ async function showAdminUser(id) {
       ${self ? '<div class="help" style="margin-top:12px;text-align:center">내 계정의 권한은 다른 관리자만 바꿀 수 있어요.</div>' : ''}
       <div class="stack">${btns.join('')}</div>`,
     onMount(sheet, close) {
+      if ($('#admPush', sheet)) loadAdminPush(sheet, u);   // v1.33
       sheet.addEventListener('click', async (e) => {
         const x = e.target.closest('[data-x]'); if (!x || x.disabled) return;
         const act = x.dataset.x;
@@ -4162,6 +4272,7 @@ async function showAdminUser(id) {
             await api.adminSetNote(u.id, $('#memo', sheet).value);
             x.disabled = false; toast('메모를 저장했어요'); return;
           }
+          if (act === 'testpush') { await adminTestPush(u, x, sheet); return; }   // v1.33
           if (act === 'connect') { close(); showConnectFriends(u); return; }
           if (act === 'unfriend') { close(); showRemoveFriends(u); return; }
           if (act === 'approve') {
@@ -4197,6 +4308,36 @@ async function showAdminUser(id) {
       });
     },
   });
+}
+// v1.33: 관리자 — 회원의 알림 기기 보기 · 테스트 알림 보내기
+function fillAdminPush(sheet, pi) {
+  const box = $('#admPush .push-info', sheet); if (!box) return;
+  if (!pi) { box.textContent = '불러오지 못했어요'; return; }
+  if (!pi.setup) { box.innerHTML = '<b>서버 알림 설정 전이에요</b>'; return; }
+  if (!Number(pi.devices)) { box.innerHTML = '<b class="warn">알림 받는 기기 없음</b><span>이 회원은 서버에 알림이 등록돼 있지 않아요. 회원이 평소 쓰는 앱에서 더보기 → 알림을 껐다 켜거나, 더보기 → 알림 테스트를 누르면 다시 등록돼요.</span>'; return; }
+  box.innerHTML = `<b>알림 받는 기기 ${Number(pi.devices)}대</b><span>마지막 등록 ${esc(fmtDT(pi.last))}</span>
+    <ul class="hist">${(pi.list || []).map((d) => `<li>${esc(deviceName(d.agent || ''))} · ${esc(browserName(d.agent || ''))}<span>${esc(fmtDT(d.at))} 등록</span></li>`).join('')}</ul>`;
+}
+async function loadAdminPush(sheet, u) {
+  try { fillAdminPush(sheet, await api.adminPushInfo(u.id)); } catch (e) { console.warn(e); fillAdminPush(sheet, null); }
+}
+async function adminTestPush(u, btn, sheet) {
+  const out = $('#admPush .push-res', sheet);
+  const say = (h) => { if (out) out.innerHTML = h; };
+  btn.disabled = true;
+  try {
+    const r = await api.sendTestPush(u.id);
+    if (r.status === 'not_setup') { say('<p class="warn">서버 알림 설정이 아직 안 돼 있어요.</p>'); return; }
+    if (r.status === 'error') { say(`<p class="warn">서버에서 알림을 보내지 못했어요${r.error ? ` (${esc(r.error)})` : ''}. Supabase → Edge Functions → send-push → Logs 를 확인해 주세요.</p>`); return; }
+    if (r.status === 'no_device') { say(`<p class="warn">${esc(u.display_name)}님은 알림 받는 기기가 없어서 보낼 수 없어요. 회원에게 평소 쓰는 앱에서 <b>더보기 → 알림</b>을 껐다 켜 달라고 해 주세요.</p>`); return; }
+    say(`<p>${esc(testResultText(null, r.devices))}</p>`);
+    const res = await pollTestResult(r.test_id);
+    const ok = !res || res.state !== 'done' || (testOkHttp(res) && res.sent > 0);
+    say(`<p class="${ok ? '' : 'warn'}">${esc(testResultText(res, r.devices))}</p><p>${ok
+      ? `${esc(u.display_name)}님에게 <b>'끼리톡 알림 테스트'</b>가 왔는지 물어보세요. 서버는 보냈는데 안 왔다면 그 휴대폰의 <b>절전(잠자는 앱)·알림 설정</b> 문제예요. 회원에게 더보기 → 알림 테스트를 눌러 보게 하면 휴대폰에 맞는 설정 방법이 나와요.`
+      : '서버에서 보내지 못했어요. 기기 등록이 만료됐을 수 있어요. 회원이 앱을 한 번 열면 다시 등록돼요.'}</p>`);
+    loadAdminPush(sheet, u);
+  } catch (e) { showErr(e); } finally { btn.disabled = false; }
 }
 // 회원 상태가 바뀐 뒤: 목록·배지·현황 새로
 function adminAfterChange() {
@@ -4796,6 +4937,7 @@ app.addEventListener('click', async (e) => {
     case 'tab': go('#/' + el.dataset.tab); break;
     case 'profile': if (el.dataset.id) showProfile(el.dataset.id); break;
     case 'my-photo': showAvatarBig(S.me); break;
+    case 'notif-test': runNotifTest(); break;   // v1.33
     case 'add-friend': showAddFriend(); break;
     case 'new-chat': newChat(); break;
     case 'open-room': goRoom(el.dataset.id); break;
