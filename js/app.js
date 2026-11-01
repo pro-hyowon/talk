@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.32.1';
+const VERSION = '1.32.2';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -1269,6 +1269,19 @@ function updateBadges() {
 function setBadge(n) {
   document.title = n ? `(${n}) ${APP}` : APP;
   try { if (n) navigator.setAppBadge?.(n); else navigator.clearAppBadge?.(); } catch { /* 지원 안 함 */ }
+  // v1.32.2: 다 읽었으면 휴대폰 알림창에 남은 끼리톡 알림도 지움 → 갤럭시 앱 아이콘의 숫자도 함께 사라짐
+  if (!n && S.roomsLoaded && !document.hidden) clearShownNotifs();
+}
+// v1.32.2: 휴대폰 알림창의 끼리톡 알림 지우기 (roomId 를 주면 그 방 알림만)
+//   갤럭시 등은 알림창에 남은 알림 수를 앱 아이콘 숫자로 보여 줘서, 앱을 직접 열어 읽어도 숫자가 남아 있었음
+async function clearShownNotifs(roomId) {
+  try {
+    if (!('serviceWorker' in navigator)) return;
+    const reg = await limitTime(navigator.serviceWorker.ready, 3000, 'sw');
+    if (!reg || !reg.getNotifications) return;
+    const list = await reg.getNotifications(roomId ? { tag: roomId } : undefined);
+    list.forEach((x) => { try { x.close(); } catch { /* 무시 */ } });
+  } catch { /* 지원 안 함 */ }
 }
 
 // ---------------------------------------------------------------------
@@ -1932,6 +1945,7 @@ function markReadSoon() {
     if (!S.room || document.hidden) return;
     const id = S.room.id;
     try { await api.markRead(id); } catch (e) { console.warn(e); }
+    clearShownNotifs(id);   // v1.32.2: 이 방에서 온 알림은 알림창에서 지움
     const r = S.rooms.find((x) => x.room_id === id);
     if (r && r.unread) { r.unread = 0; updateBadges(); scheduleMain(); }
   }, 600);
