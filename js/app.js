@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.32';
+const VERSION = '1.32.1';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -395,12 +395,13 @@ function setNotifOff(off) {
 }
 // 앱이 열려 있지만 화면이 꺼져 있을 때 기기 알림을 띄워도 되는지
 const localNotifOk = () => !notifOffPref() && 'Notification' in window && Notification.permission === 'granted' && !!navigator.serviceWorker;
-async function enablePush({ silent = false } = {}) {
+async function enablePush({ silent = false, granted = false } = {}) {
   if (!push.supported()) return false;
   if (silent && notifOffPref()) return false;
-  if (Notification.permission !== 'granted') {
-    if (silent) return false;
-    if ((await Notification.requestPermission()) !== 'granted') return false;
+  if (!granted && Notification.permission !== 'granted') {
+    // v1.32: 권한 값이 늦게 바뀌는 휴대폰 — 이미 알림 구독이 있으면 허용된 것으로 보고 이어서 진행 (차단은 제외)
+    if (silent) { if (Notification.permission === 'denied') return false; try { if (!(await push.current())) return false; } catch { return false; } }
+    else if ((await Notification.requestPermission()) !== 'granted') return false;
   }
   // v1.31: 어느 단계에서 멈췄는지 알 수 있게(stage) + 끝없이 기다리지 않게(시간 초과)
   let sub;
@@ -437,8 +438,10 @@ async function detachPush() {
 }
 function notifOn() {
   if (notifOffPref()) return false;
-  if (!('Notification' in window) || Notification.permission !== 'granted') return false;
-  return push.supported() ? S.pushOn : true;
+  if (!('Notification' in window)) return false;
+  // v1.32: 일부 휴대폰·스토어 앱은 허용한 뒤에도 권한 값이 바로 바뀌지 않음 → 알림 구독이 끝났으면 켜짐으로 봄 (차단만 아니면)
+  if (push.supported()) return !!S.pushOn && Notification.permission !== 'denied';
+  return Notification.permission === 'granted';
 }
 
 // ---------------------------------------------------------------------
@@ -528,6 +531,7 @@ function showNotifHelp(reason, err) {
 }
 // 알림 줄의 스위치를 '켜는 중' 으로 바로 바꿔 보여 줌 (권한 창·알림 서비스 연결이 몇 초 걸려도 눌린 걸 알 수 있게)
 function notifBusy(on, text) {
+  S.notifBusy = text ? { on, text } : null;   // v1.32: 도중에 화면을 다시 그려도 '켜는 중' 유지
   const sw = $('.switch[data-act=notif]');
   if (!sw) return;
   sw.classList.toggle('busy', !!text); sw.classList.toggle('on', on); sw.setAttribute('aria-checked', String(on));
@@ -536,6 +540,7 @@ function notifBusy(on, text) {
   if (sub && text) sub.textContent = text;
 }
 let notifWorking = false;
+function notifDone() { notifWorking = false; S.notifBusy = null; renderMain(); }
 async function turnOnNotif() {
   if (notifWorking) return;
   const env = envKind();
@@ -544,26 +549,27 @@ async function turnOnNotif() {
   if (Notification.permission === 'denied') { renderMain(); showNotifHelp('denied'); return; }
   notifWorking = true;
   notifBusy(true, '알림을 켜는 중이에요…');
-  let ok = false;
+  let ok = false; let perm = Notification.permission;
   try {
-    if (Notification.permission !== 'granted') {
-      const p = await Notification.requestPermission();   // 첫 번째 기다림이어야 아이폰에서도 권한 창이 열림
-      if (p !== 'granted') { notifWorking = false; renderMain(); showNotifHelp(p === 'denied' ? 'denied' : 'dismissed'); return; }
+    if (perm !== 'granted') {
+      perm = await Notification.requestPermission();   // 첫 번째 기다림이어야 아이폰에서도 권한 창이 열림
+      if (perm !== 'granted') { notifDone(); showNotifHelp(perm === 'denied' ? 'denied' : 'dismissed'); return; }
     }
     if (push.supported()) {
       notifBusy(true, '휴대폰 알림 서비스에 연결하는 중이에요…');
-      ok = await enablePush();
+      ok = await enablePush({ granted: true });
     } else ok = true;
   } catch (ex) {
-    notifWorking = false; renderMain();
-    if (env === 'inapp') showNotifHelp('inapp', ex);
-    else showNotifHelp(ex.stage === 'save' ? 'save' : 'push', ex);
+    notifDone();
+    showNotifHelp(env === 'inapp' ? 'inapp' : ex.stage === 'save' ? 'save' : 'push', ex);
     return;
   }
-  notifWorking = false;
-  renderMain();
-  if (ok) { toast('알림을 켰어요'); maybeSoundTip(); }
-  else showNotifHelp(Notification.permission === 'denied' ? 'denied' : 'dismissed');
+  notifDone();
+  if (ok && notifOn()) { toast('알림을 켰어요'); maybeSoundTip(); return; }
+  // 켜졌어야 하는데 꺼져 보이면 — 원인을 남기고 안내 (운영자에게 알리기로 진단 정보 전달)
+  const why = new Error(`켜기를 마쳤지만 꺼진 상태로 보여요 (요청 결과 ${perm}, 현재 권한 ${Notification.permission}, 구독 ${S.pushOn ? '됨' : '안 됨'})`);
+  why.stage = 'perm';
+  showNotifHelp(Notification.permission === 'denied' ? 'denied' : ok ? 'push' : 'dismissed', why);
 }
 async function turnOffNotif() {
   if (notifWorking) return;
@@ -571,8 +577,7 @@ async function turnOffNotif() {
   notifBusy(false, '알림을 끄는 중이에요…');
   setNotifOff(true);   // 이 기기에서 꺼 둔 것을 기억 → 앱을 다시 열어도 저절로 켜지지 않음
   try { if (push.supported()) await limitTime(disablePush(), 10000, '시간이 오래 걸려요'); } catch (ex) { console.warn('push off', ex); S.pushOn = false; }
-  notifWorking = false;
-  renderMain();
+  notifDone();
   toast('알림을 껐어요. 언제든 다시 켤 수 있어요');
 }
 
@@ -970,7 +975,7 @@ function showSoundSettings() {
 // v1.18.2: 아직 알림 권한을 묻지 않은 기기면 들어오자마자 한 번 안내 → "알림 받기" 한 번이면 켜짐
 //   (브라우저는 사용자가 버튼을 눌러야 권한 창을 띄울 수 있어서 안내 창을 거침. "나중에"를 누르면 3일 뒤 다시 물어봄)
 function maybeAskNotif(tries = 0) {
-  const want = () => S.entered && 'Notification' in window && Notification.permission === 'default' && !notifOffPref();
+  const want = () => S.entered && 'Notification' in window && Notification.permission === 'default' && !notifOffPref() && !S.pushOn;
   if (!want()) return;
   let last = 0;
   try { last = Number(localStorage.getItem(NOTIF_ASK_KEY)) || 0; } catch { if (S.notifAsked) return; }
@@ -1435,7 +1440,8 @@ function notifSub(on) {
 function renderMore(head, body) {
   head.innerHTML = '<h1>더보기</h1>';
   const me = S.me;
-  const on = notifOn();
+  const nb = S.notifBusy;
+  const on = nb ? nb.on : notifOn();
   body.innerHTML = `<div class="more-body">
     <div class="card prof-card">${hasPhoto(me) ? `<button class="pav-zoom" data-act="my-photo" aria-label="내 프로필 사진 크게 보기">${av(me, 64)}</button>` : av(me, 64)}
       <div class="meta"><div class="name">${esc(me.display_name)}</div><div class="desc">${esc(me.status_message || '상태메시지가 없어요')}</div></div>
@@ -1450,8 +1456,8 @@ function renderMore(head, body) {
         <button class="ibtn" data-act="copy-id" aria-label="아이디 복사" style="border-radius:12px;color:var(--ink3)">${ic('copy', 18)}</button></div>
       <button class="item" data-act="phone"><span class="tile sky">${ic('phone', 19)}</span><span class="label">휴대폰 번호</span><span class="val" id="phoneVal">${S.phone === undefined ? '' : S.phone ? esc(maskPhone(S.phone.phone)) : '등록하기'}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="change-password"><span class="tile lav">${ic('lock', 19)}</span><span class="label">비밀번호 변경</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      <div class="item tap" data-act="notif-row"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림<span class="sub">${notifSub(on)}</span></span>
-        <button class="switch ${on ? 'on' : ''}" data-act="notif" role="switch" aria-checked="${on}" aria-label="새 메시지 알림"></button></div>
+      <div class="item tap" data-act="notif-row"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림<span class="sub">${nb ? esc(nb.text) : notifSub(on)}</span></span>
+        <button class="switch ${on ? 'on' : ''}${nb ? ' busy' : ''}" data-act="notif" role="switch" aria-checked="${on}" aria-busy="${nb ? 'true' : 'false'}" aria-label="새 메시지 알림"></button></div>
       <button class="item" data-act="notif-sound"><span class="tile lemon">${ic('bell', 19)}</span><span class="label">알림 소리<span class="sub">${esc(soundLabel(soundPref()))}${vibratePref() && 'vibrate' in navigator ? ' · 진동' : ''} · 휴대폰 알림음 바꾸기</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       ${isStandalone() ? '' : `<button class="item" data-act="install"><span class="tile mint">${ic('install', 19)}</span><span class="label">홈 화면에 설치</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>`}
     </div>
