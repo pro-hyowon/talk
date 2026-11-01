@@ -1107,3 +1107,10 @@ a.btn { text-decoration: none; }
 .notif-help b { color: var(--ink); }
 .notif-help .nh-note { font-size: 13px; color: var(--ink3); background: var(--line2); border-radius: 12px; padding: 9px 12px; }
 .nh-foot { margin: 12px 0 0; font-size: 12.5px; text-align: center; }
+
+/* v1.32: 프로필 사진을 누르면 크게 보기 */
+.pav-zoom { padding: 0; border: 0; background: none; border-radius: 50%; cursor: zoom-in; flex: none; -webkit-tap-highlight-color: transparent; }
+.pav-zoom:active { transform: scale(.96); }
+.av-viewer .vimg { padding: 0 12px; }
+.av-viewer .vimg img { width: min(100%, 520px); max-height: 100%; aspect-ratio: 1; border-radius: 6px; object-fit: contain; }
+.av-viewer .vfoot { height: 56px; }

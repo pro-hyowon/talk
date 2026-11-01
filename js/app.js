@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.31';
+const VERSION = '1.32';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -1437,7 +1437,7 @@ function renderMore(head, body) {
   const me = S.me;
   const on = notifOn();
   body.innerHTML = `<div class="more-body">
-    <div class="card prof-card">${av(me, 64)}
+    <div class="card prof-card">${hasPhoto(me) ? `<button class="pav-zoom" data-act="my-photo" aria-label="내 프로필 사진 크게 보기">${av(me, 64)}</button>` : av(me, 64)}
       <div class="meta"><div class="name">${esc(me.display_name)}</div><div class="desc">${esc(me.status_message || '상태메시지가 없어요')}</div></div>
       <button class="edit-btn" data-act="edit-profile">${ic('pencil', 16)}편집</button></div>
     <div class="card">
@@ -3384,7 +3384,7 @@ async function showProfile(id) {
   const canChat = isFriend && fr.mutual !== false;
   openSheet({
     title: '프로필', closeOnly: true,
-    body: `<div class="profile-card">${av(p, 116)}<div class="pname">${esc(p.display_name)}</div>
+    body: `<div class="profile-card">${hasPhoto(p) ? `<button class="pav-zoom" data-x="photo" aria-label="프로필 사진 크게 보기">${av(p, 116)}</button>` : av(p, 116)}<div class="pname">${esc(p.display_name)}</div>
       ${p.username ? `<div class="pid">@${esc(p.username)}</div>` : ''}
       ${p.status_message ? `<div class="pstatus">${esc(p.status_message)}</div>` : ''}</div>
       ${isMe ? `<button class="btn" data-x="edit" style="margin-top:24px">${ic('pencil', 18)}프로필 편집</button>`
@@ -3400,6 +3400,7 @@ async function showProfile(id) {
         const act = x.dataset.x;
         try {
           if (act === 'edit') { close(); showEditProfile(); }
+          if (act === 'photo') showAvatarBig(p);   // v1.32: 프로필 사진 크게 보기 (닫으면 프로필로 돌아옴)
           if (act === 'chat') { x.disabled = true; const rid = await api.openDM(id); close(); goRoom(rid); }
           if (act === 'befriend') { await api.addFriend(id); await loadFriends(); loadSuggestions(); close(); friendAddedToast(id, p.display_name); }
           if (act === 'block') { close(); await blockUser(id, p.display_name); }
@@ -3705,6 +3706,23 @@ function showRoomMenu() {
       });
     },
   });
+}
+
+// v1.32: 프로필 사진 크게 보기 — 사진 보기와 같은 검은 화면, 휴대폰 '뒤로'·화면 빈 곳·X 로 닫힘 (남의 사진이라 저장 버튼은 없음)
+function hasPhoto(p) { return !!(p && p.avatar_url && okAvatar(p.avatar_url)); }
+function showAvatarBig(p) {
+  if (!hasPhoto(p)) return;
+  const v = document.createElement('div');
+  v.className = 'viewer av-viewer';
+  v.innerHTML = `<div class="vbar"><button class="ibtn" data-v="close" aria-label="닫기">${ic('x', 24)}</button>
+      <div class="vt"><b>${esc(p.display_name || '')}</b><span>프로필 사진</span></div><div style="width:44px"></div></div>
+    <div class="vimg"><img src="${esc(p.avatar_url)}" alt="${esc(p.display_name || '')} 프로필 사진"></div><div class="vfoot"></div>`;
+  let vid = 0;
+  const vclose = (fromPop) => { v.remove(); if (fromPop !== true) ovDone(vid); };
+  v.addEventListener('click', (e) => { if (e.target.closest('[data-v=close]') || e.target.classList.contains('vimg')) vclose(); });
+  $('img', v).addEventListener('error', () => { vclose(); toast('사진을 불러오지 못했어요', { error: true }); });
+  app.appendChild(v);
+  vid = ovPush(vclose, v);
 }
 
 function showImage(btn) {
@@ -4757,6 +4775,7 @@ app.addEventListener('click', async (e) => {
   switch (act) {
     case 'tab': go('#/' + el.dataset.tab); break;
     case 'profile': if (el.dataset.id) showProfile(el.dataset.id); break;
+    case 'my-photo': showAvatarBig(S.me); break;
     case 'add-friend': showAddFriend(); break;
     case 'new-chat': newChat(); break;
     case 'open-room': goRoom(el.dataset.id); break;
