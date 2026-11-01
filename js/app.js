@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.30';
+const VERSION = '1.31';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -402,12 +402,25 @@ async function enablePush({ silent = false } = {}) {
     if (silent) return false;
     if ((await Notification.requestPermission()) !== 'granted') return false;
   }
-  let sub = await push.current();
-  if (sub && !sameServerKey(sub)) { try { await sub.unsubscribe(); } catch { /* 무시 */ } sub = null; }
-  if (!sub) sub = await push.subscribe();
-  await api.savePush(sub);
+  // v1.31: 어느 단계에서 멈췄는지 알 수 있게(stage) + 끝없이 기다리지 않게(시간 초과)
+  let sub;
+  try {
+    sub = await push.current();
+    if (sub && !sameServerKey(sub)) { try { await sub.unsubscribe(); } catch { /* 무시 */ } sub = null; }
+    if (!sub) sub = await limitTime(push.subscribe(), 20000, '휴대폰의 알림 서비스가 응답하지 않아요');
+  } catch (e) { throw stageErr(e, 'push'); }
+  try { await limitTime(api.savePush(sub), 15000, '서버에 연결하지 못했어요'); } catch (e) { throw stageErr(e, 'save'); }
   S.pushOn = true;
   return true;
+}
+function limitTime(p, ms, msg) {
+  let t;
+  return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(msg)), ms); })]).finally(() => clearTimeout(t));
+}
+function stageErr(e, stage) {
+  const err = new Error((e && (e.message || e.name)) || String(e || '알 수 없는 오류'));
+  err.stage = stage; err.errName = (e && e.name) || '';
+  return err;
 }
 async function disablePush() {
   const sub = await push.current();
@@ -426,6 +439,141 @@ function notifOn() {
   if (notifOffPref()) return false;
   if (!('Notification' in window) || Notification.permission !== 'granted') return false;
   return push.supported() ? S.pushOn : true;
+}
+
+// ---------------------------------------------------------------------
+// v1.31: 알림이 안 켜질 때 — 어디서 쓰는지 알아내 원인별로 푸는 방법을 안내하고, 운영자에게 진단 정보를 보낼 수 있게
+// ---------------------------------------------------------------------
+const STORE_APP_KEY = 'kkiri-store-app';
+try { if (document.referrer.startsWith('android-app://com.kkiritalk.app')) sessionStorage.setItem(STORE_APP_KEY, '1'); } catch { /* 저장 안 됨 */ }
+const inStoreApp = () => { try { if (sessionStorage.getItem(STORE_APP_KEY) === '1') return true; } catch { /* 없음 */ } return document.referrer.startsWith('android-app://'); };
+// 플레이 스토어 앱(store) · 다른 앱 안의 브라우저(inapp) · 아이폰 홈 화면 앱(ios-app) / 사파리(ios-tab) · 홈 화면 앱(home) · 브라우저(browser)
+function envKind() {
+  const ua = navigator.userAgent || '';
+  if (inStoreApp()) return 'store';
+  if (/KAKAOTALK|NAVER\(inapp|Instagram|FBAN|FBAV|DaumApps|Line\/|everytimeApp|BAND\/|; wv\)/i.test(ua)) return 'inapp';
+  if (phoneKind() === 'ios') return isStandalone() ? 'ios-app' : 'ios-tab';
+  return isStandalone() ? 'home' : 'browser';
+}
+const ENV_NAME = { store: '플레이 스토어 앱', inapp: '다른 앱 안의 브라우저', 'ios-app': '아이폰 홈 화면 앱', 'ios-tab': '아이폰 사파리', home: '홈 화면 앱', browser: '인터넷 브라우저' };
+function browserName() {
+  const ua = navigator.userAgent || '';
+  const pick = [[/SamsungBrowser\/([\d.]+)/, '삼성 인터넷'], [/Whale\/([\d.]+)/, '네이버 웨일'], [/EdgA?\/([\d.]+)/, '엣지'], [/(?:Firefox|FxiOS)\/([\d.]+)/, '파이어폭스'], [/CriOS\/([\d.]+)/, '크롬'], [/Chrome\/([\d.]+)/, '크롬'], [/Version\/([\d.]+).*Safari/, '사파리']];
+  for (const [re, n] of pick) { const m = ua.match(re); if (m) return `${n} ${m[1].split('.')[0]}`; }
+  return '알 수 없음';
+}
+const isSamsungNet = () => /SamsungBrowser/i.test(navigator.userAgent || '');
+function deviceName() {
+  const ua = navigator.userAgent || '';
+  const a = ua.match(/Android (\d+)/); if (a) return `${phoneKind() === 'samsung' ? '갤럭시' : '안드로이드'} (안드로이드 ${a[1]})`;
+  const i = ua.match(/OS (\d+)[_.](\d+)/); if (phoneKind() === 'ios') return `아이폰 (iOS ${i ? `${i[1]}.${i[2]}` : '?'})`;
+  return '컴퓨터';
+}
+function notifDiag(reason, err) {
+  const perm = 'Notification' in window ? ({ granted: '허용', denied: '차단', default: '아직 안 물어봄' }[Notification.permission] || Notification.permission) : '알림 기능 없음';
+  const stage = { perm: '알림 권한', push: '휴대폰 알림 서비스 연결', save: '서버에 저장' }[err && err.stage] || '';
+  return ['[알림 진단 정보 — 자동으로 적었어요]', `앱 버전: ${VERSION}`, `사용 환경: ${ENV_NAME[envKind()]}`, `기기: ${deviceName()}`, `브라우저: ${browserName()}`,
+    `알림 권한: ${perm}`, `알림 서비스: ${push.supported() ? '지원' : '지원 안 함'}`, `원인 분류: ${reason}`,
+    stage ? `멈춘 단계: ${stage}` : '', err ? `오류: ${String((err.errName ? err.errName + ' — ' : '') + err.message).slice(0, 300)}` : '',
+    `브라우저 정보: ${(navigator.userAgent || '').slice(0, 400)}`].filter(Boolean).join('\n');
+}
+// 알림을 막아 둔 경우 — 쓰는 곳마다 푸는 곳이 달라요
+function unblockSteps(env) {
+  if (env === 'store') return `<ol><li>휴대폰 <b>설정</b> → <b>애플리케이션</b>(또는 '앱') → <b>${esc(APP)}</b></li><li><b>알림</b> → <b>알림 허용</b>을 켬</li><li>${esc(APP)}로 돌아와 아래 <b>다시 켜기</b>를 누름</li></ol>`;
+  if (env === 'ios-app') return `<ol><li>아이폰 <b>설정</b> → <b>알림</b> → <b>${esc(APP)}</b></li><li><b>알림 허용</b>을 켬</li><li>${esc(APP)}로 돌아와 아래 <b>다시 켜기</b>를 누름</li></ol>`;
+  if (isSamsungNet()) return `<ol><li>삼성 인터넷 아래쪽 <b>≡(메뉴)</b> → <b>설정</b> → <b>사이트 및 다운로드</b> → <b>알림</b></li><li><b>kkiritalk.com</b>을 찾아 <b>허용</b>으로 바꿈</li><li>${esc(APP)}로 돌아와 아래 <b>다시 켜기</b>를 누름</li></ol>`;
+  const home = env === 'home' ? `<li>홈 화면의 <b>${esc(APP)} 아이콘을 길게</b> 누르고 <b>ⓘ(앱 정보)</b> → <b>알림</b> → <b>알림 허용</b>을 켬</li><li>그래도 안 되면: <b>크롬</b> 앱 → 오른쪽 위 <b>⋮</b> → <b>설정</b> → <b>사이트 설정</b> → <b>알림</b> → <b>kkiritalk.com</b> → <b>허용</b></li>`
+    : `<li>주소창 왼쪽의 <b>아이콘</b>(자물쇠·조절 모양)을 누름 → <b>권한</b>(또는 '알림')을 <b>허용</b>으로 바꿈</li><li>안 보이면: 크롬 오른쪽 위 <b>⋮</b> → <b>설정</b> → <b>사이트 설정</b> → <b>알림</b> → <b>kkiritalk.com</b> → <b>허용</b></li>`;
+  return `<ol>${home}<li>${esc(APP)}로 돌아와 아래 <b>다시 켜기</b>를 누름</li></ol><p class="nh-note">휴대폰 <b>설정 → 애플리케이션 → 크롬</b> → 알림이 꺼져 있어도 알림이 오지 않아요.</p>`;
+}
+function notifHelpBody(reason, env) {
+  switch (reason) {
+    case 'inapp': return { t: '다른 앱 안에서 열려 있어요', h: `<p>카카오톡·네이버 같은 다른 앱 안의 화면에서는 알림을 켤 수 없어요.</p><ol><li>오른쪽 위 <b>⋮</b> 또는 <b>공유</b> → <b>다른 브라우저로 열기</b>(크롬)를 누름</li><li>열린 크롬에서 로그인하고 더보기 → 알림을 켬</li></ol>${phoneKind() === 'ios' ? '' : `<p class="nh-note">플레이 스토어에서 <b>${esc(APP)}</b> 앱을 설치하면 더 편해요.</p>`}`, retry: false };
+    case 'ios-tab': return { t: '아이폰은 홈 화면에 추가해야 해요', h: '<p>아이폰은 사파리 화면에서는 알림을 받을 수 없어요. <b>홈 화면에 추가한 끼리톡</b>에서만 알림이 와요. (iOS 16.4 이상)</p><ol><li>사파리 아래쪽 <b>공유(□↑)</b> → <b>홈 화면에 추가</b></li><li>홈 화면에 생긴 끼리톡 아이콘으로 열고 로그인</li><li>더보기 → 알림을 켬</li></ol>', retry: false, install: true };
+    case 'unsupported': return { t: '이 브라우저에서는 알림을 쓸 수 없어요', h: `<p><b>크롬</b>이나 <b>삼성 인터넷</b>으로 kkiritalk.com 을 열어 주세요.${phoneKind() === 'ios' ? '' : ` 플레이 스토어에서 <b>${esc(APP)}</b> 앱을 설치해도 돼요.`}</p>`, retry: false };
+    case 'denied': return { t: '알림이 막혀 있어요', h: `<p>예전에 알림을 <b>차단</b>해서 지금은 켤 수 없어요. 아래 순서로 풀어 주세요.</p>${unblockSteps(env)}`, retry: true };
+    case 'dismissed': return { t: '알림 허용을 누르지 않았어요', h: '<p>알림을 켜려면 휴대폰이 묻는 창에서 <b>허용</b>을 눌러야 해요. 아래 <b>다시 켜기</b>를 누르고 <b>허용</b>을 눌러 주세요.</p><p class="nh-note">묻는 창이 안 보이면 주소창의 <b>종(🔔) 모양</b>이나 <b>자물쇠</b> 아이콘을 눌러 알림을 허용해 주세요.</p>', retry: true };
+    case 'save': return { t: '서버에 저장하지 못했어요', h: '<p>인터넷 연결이 잠깐 끊겼을 수 있어요. 와이파이나 데이터를 확인하고 <b>다시 켜기</b>를 눌러 주세요.</p>', retry: true };
+    default: return { t: '휴대폰 알림 서비스에 연결하지 못했어요', h: `<p>알림 권한은 허용됐는데, 휴대폰의 알림 서비스가 응답하지 않았어요. 아래를 차례로 해 보세요.</p><ol><li>인터넷(와이파이·데이터)을 확인하고 <b>다시 켜기</b></li><li>플레이 스토어에서 <b>${env === 'store' || !isSamsungNet() ? '크롬(Chrome)' : '삼성 인터넷'}</b>과 <b>Google Play 서비스</b>를 최신으로 업데이트</li><li><b>절전 모드</b>나 <b>데이터 절약</b>을 잠깐 끄고 다시 켜기</li><li>휴대폰을 껐다 켠 뒤 다시 켜기</li></ol><p class="nh-note">구글 서비스가 없는 휴대폰(일부 화웨이 등)은 앱을 닫았을 때 오는 알림을 받을 수 없어요.</p>`, retry: true };
+  }
+}
+function showNotifHelp(reason, err) {
+  const env = envKind();
+  const { t, h, retry, install } = notifHelpBody(reason, env);
+  const diag = notifDiag(reason, err);
+  console.warn('notif-help', reason, err);
+  openSheet({
+    title: '알림 켜기',
+    body: `<div class="notif-help"><h3>${esc(t)}</h3>${h}</div>
+      <div class="btn-col" style="gap:8px">${retry ? '<button class="btn" data-retry>다시 켜기</button>' : ''}${install ? '<button class="btn" data-install>홈 화면 추가 방법 보기</button>' : ''}
+        <button class="btn line" data-report>그래도 안 되면 운영자에게 알리기</button></div>
+      <p class="sheet-desc nh-foot">운영자에게 알리면 쓰는 휴대폰·브라우저 종류와 오류 내용이 1:1 문의로 전달돼요. 답변은 더보기 → 1:1 문의에서 볼 수 있어요.</p>`,
+    onMount(sheet, close) {
+      const r = $('[data-retry]', sheet);
+      if (r) r.onclick = () => { close(); turnOnNotif(); };   // 누른 그 순간에 권한 창을 띄워야 하므로 바로 호출
+      const i = $('[data-install]', sheet);
+      if (i) i.onclick = () => { close(); setTimeout(showInstall, 250); };
+      const rp = $('[data-report]', sheet);
+      rp.onclick = async () => {
+        rp.disabled = true; rp.textContent = '보내는 중…';
+        try {
+          await api.createInquiry({ category: 'bug', title: '알림이 켜지지 않아요', body: `알림을 켜려고 했는데 켜지지 않아요.\n\n${diag}` });
+          rp.textContent = '운영자에게 보냈어요 ✓';
+          toast('운영자에게 알렸어요. 답변은 더보기 → 1:1 문의에서 볼 수 있어요', { ms: 4500 });
+          loadMyInquiries().then(() => { const b = $('#inqBadge'); if (b) b.innerHTML = inqBadgeHtml(); }).catch(() => {});
+        } catch (ex) { rp.disabled = false; rp.textContent = '그래도 안 되면 운영자에게 알리기'; showErr(ex); }
+      };
+    },
+  });
+}
+// 알림 줄의 스위치를 '켜는 중' 으로 바로 바꿔 보여 줌 (권한 창·알림 서비스 연결이 몇 초 걸려도 눌린 걸 알 수 있게)
+function notifBusy(on, text) {
+  const sw = $('.switch[data-act=notif]');
+  if (!sw) return;
+  sw.classList.toggle('busy', !!text); sw.classList.toggle('on', on); sw.setAttribute('aria-checked', String(on));
+  sw.setAttribute('aria-busy', text ? 'true' : 'false');
+  const sub = sw.parentElement && $('.sub', sw.parentElement);
+  if (sub && text) sub.textContent = text;
+}
+let notifWorking = false;
+async function turnOnNotif() {
+  if (notifWorking) return;
+  const env = envKind();
+  if (!('Notification' in window)) { showNotifHelp(env === 'inapp' ? 'inapp' : env === 'ios-tab' ? 'ios-tab' : 'unsupported'); return; }
+  setNotifOff(false);
+  if (Notification.permission === 'denied') { renderMain(); showNotifHelp('denied'); return; }
+  notifWorking = true;
+  notifBusy(true, '알림을 켜는 중이에요…');
+  let ok = false;
+  try {
+    if (Notification.permission !== 'granted') {
+      const p = await Notification.requestPermission();   // 첫 번째 기다림이어야 아이폰에서도 권한 창이 열림
+      if (p !== 'granted') { notifWorking = false; renderMain(); showNotifHelp(p === 'denied' ? 'denied' : 'dismissed'); return; }
+    }
+    if (push.supported()) {
+      notifBusy(true, '휴대폰 알림 서비스에 연결하는 중이에요…');
+      ok = await enablePush();
+    } else ok = true;
+  } catch (ex) {
+    notifWorking = false; renderMain();
+    if (env === 'inapp') showNotifHelp('inapp', ex);
+    else showNotifHelp(ex.stage === 'save' ? 'save' : 'push', ex);
+    return;
+  }
+  notifWorking = false;
+  renderMain();
+  if (ok) { toast('알림을 켰어요'); maybeSoundTip(); }
+  else showNotifHelp(Notification.permission === 'denied' ? 'denied' : 'dismissed');
+}
+async function turnOffNotif() {
+  if (notifWorking) return;
+  notifWorking = true;
+  notifBusy(false, '알림을 끄는 중이에요…');
+  setNotifOff(true);   // 이 기기에서 꺼 둔 것을 기억 → 앱을 다시 열어도 저절로 켜지지 않음
+  try { if (push.supported()) await limitTime(disablePush(), 10000, '시간이 오래 걸려요'); } catch (ex) { console.warn('push off', ex); S.pushOn = false; }
+  notifWorking = false;
+  renderMain();
+  toast('알림을 껐어요. 언제든 다시 켤 수 있어요');
 }
 
 // ---------------------------------------------------------------------
@@ -775,7 +923,7 @@ function phoneKind() {
   return 'pc';
 }
 const PHONE_GUIDE = {
-  samsung: ['갤럭시', `<ol><li>휴대폰 <b>설정</b> → <b>애플리케이션</b> → <b>${esc(APP)}</b></li><li><b>알림</b> → <b>알림 카테고리</b>(또는 '일반 알림')를 누름</li><li><b>소리</b>를 눌러 휴대폰 기본 알림음이나 원하는 소리를 고름 (진동도 여기서)</li></ol><p>빠른 방법: 홈 화면의 ${esc(APP)} 아이콘을 길게 누르고 <b>ⓘ(앱 정보)</b> → <b>알림</b></p>`],
+  samsung: ['갤럭시', `<ol><li>${esc(APP)} 알림을 <b>한 번 이상 받은 뒤</b>에 할 수 있어요 (알림을 받아야 소리 항목이 생겨요)</li><li>휴대폰 <b>설정</b> → <b>알림</b> → <b>고급 설정</b> → <b>알림 카테고리 관리</b>(또는 '앱별 알림 카테고리 관리')를 <b>켬</b></li><li><b>설정</b> → <b>애플리케이션</b> → <b>${esc(APP)}</b> → <b>알림</b> → 맨 아래 <b>알림 카테고리</b>에서 항목(예: '일반')을 누름</li><li><b>소리</b>를 눌러 휴대폰 기본 알림음이나 원하는 소리를 고름 (진동도 여기서)</li></ol><p>빠른 방법: 홈 화면의 ${esc(APP)} 아이콘을 길게 누르고 <b>ⓘ(앱 정보)</b> → <b>알림</b></p>`],
   android: ['안드로이드', `<ol><li>휴대폰 <b>설정</b> → <b>앱</b> → <b>${esc(APP)}</b></li><li><b>알림</b> → 알림 종류(예: '일반')를 누름</li><li><b>소리</b>에서 휴대폰 기본 알림음이나 원하는 소리를 고름</li></ol><p>홈 화면에 설치하지 않고 크롬에서 쓰는 중이면: 설정 → 앱 → <b>Chrome</b> → 알림 → 사이트 목록에서 ${esc(APP)} 주소 → 소리</p>`],
   ios: ['아이폰', `<p>아이폰은 홈 화면에 추가한 앱의 알림 소리를 따로 고를 수 없고, 아이폰 기본 알림음이 울려요.</p><ol><li><b>설정</b> → <b>알림</b> → <b>${esc(APP)}</b></li><li><b>사운드</b>를 켜거나 끌 수 있어요</li></ol>`],
   pc: ['컴퓨터', '<p>컴퓨터는 운영체제(윈도우·맥) 알림 설정에서 브라우저 알림 소리를 바꿀 수 있어요.</p>'],
@@ -849,7 +997,7 @@ function maybeAskNotif(tries = 0) {
             if (push.supported()) await enablePush({ silent: true });
             toast('알림을 켰어요');
             maybeSoundTip();
-          }).catch((e) => { console.warn('push', e); toast('알림을 켜지 못했어요. 더보기 → 알림에서 다시 시도해 주세요', { error: true }); })
+          }).catch((e) => { console.warn('push', e); showNotifHelp(e && e.stage === 'save' ? 'save' : 'push', e); })   // v1.31: 원인별 안내
             .finally(() => { if (S.tab === 'more' && !S.room) renderMain(); });
         };
       },
@@ -1280,8 +1428,8 @@ function chatRowHtml(r) {
 
 function notifSub(on) {
   if (on) return '새 메시지·친구 소식을 알려 드려요';
-  if (!('Notification' in window)) return '이 브라우저에서는 쓸 수 없어요';
-  if (Notification.permission === 'denied' && !notifOffPref()) return '휴대폰(브라우저) 설정에서 알림이 막혀 있어요';
+  if (!('Notification' in window)) return '이 화면에서는 쓸 수 없어요 · 눌러서 방법 보기';
+  if (Notification.permission === 'denied' && !notifOffPref()) return '휴대폰(브라우저) 설정에서 알림이 막혀 있어요 · 눌러서 푸는 방법 보기';
   return '꺼져 있어요. 켜면 새 메시지를 알려 드려요';
 }
 function renderMore(head, body) {
@@ -1302,7 +1450,7 @@ function renderMore(head, body) {
         <button class="ibtn" data-act="copy-id" aria-label="아이디 복사" style="border-radius:12px;color:var(--ink3)">${ic('copy', 18)}</button></div>
       <button class="item" data-act="phone"><span class="tile sky">${ic('phone', 19)}</span><span class="label">휴대폰 번호</span><span class="val" id="phoneVal">${S.phone === undefined ? '' : S.phone ? esc(maskPhone(S.phone.phone)) : '등록하기'}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="change-password"><span class="tile lav">${ic('lock', 19)}</span><span class="label">비밀번호 변경</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      <div class="item"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림<span class="sub">${notifSub(on)}</span></span>
+      <div class="item tap" data-act="notif-row"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림<span class="sub">${notifSub(on)}</span></span>
         <button class="switch ${on ? 'on' : ''}" data-act="notif" role="switch" aria-checked="${on}" aria-label="새 메시지 알림"></button></div>
       <button class="item" data-act="notif-sound"><span class="tile lemon">${ic('bell', 19)}</span><span class="label">알림 소리<span class="sub">${esc(soundLabel(soundPref()))}${vibratePref() && 'vibrate' in navigator ? ' · 진동' : ''} · 휴대폰 알림음 바꾸기</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       ${isStandalone() ? '' : `<button class="item" data-act="install"><span class="tile mint">${ic('install', 19)}</span><span class="label">홈 화면에 설치</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>`}
@@ -4748,28 +4896,13 @@ app.addEventListener('click', async (e) => {
       break;
     }
     case 'notif': {
-      if (!('Notification' in window)) { toast('이 브라우저는 알림을 지원하지 않아요. 아이폰은 홈 화면에 추가한 뒤 사용할 수 있어요', { error: true, ms: 4500 }); break; }
-      el.disabled = true;
-      try {
-        if (notifOn()) {
-          // 끄기: 이 기기에서 꺼 둔 것을 기억 → 앱을 다시 열어도 저절로 켜지지 않음
-          setNotifOff(true);
-          if (push.supported()) await disablePush();
-          toast('알림을 껐어요. 언제든 다시 켤 수 있어요');
-        } else {
-          setNotifOff(false);
-          if (Notification.permission === 'denied') toast('알림이 차단되어 있어요. 휴대폰(브라우저) 설정에서 이 앱의 알림을 허용해 주세요', { error: true, ms: 5000 });
-          else if (push.supported()) { toast((await enablePush()) ? '알림을 켰어요' : '알림 권한이 허용되지 않았어요', { error: !S.pushOn }); if (S.pushOn) maybeSoundTip(); }
-          else if (Notification.permission === 'granted') toast('알림을 켰어요');
-          else {
-            const p = await Notification.requestPermission();
-            toast(p === 'granted' ? '알림을 켰어요' : '알림 권한이 허용되지 않았어요', { error: p !== 'granted' });
-          }
-        }
-      } catch (ex) { showErr(ex); }
-      renderMain();
+      // v1.31: 누르자마자 '켜는 중' 표시, 안 켜지면 원인별 해결 방법 안내 (알림 줄 어디를 눌러도 됨)
+      if (notifOn()) await turnOffNotif(); else await turnOnNotif();
       break;
     }
+    case 'notif-row':   // v1.31: 스위치 말고 '알림' 글자를 눌러도 같은 동작
+      if (notifOn()) await turnOffNotif(); else await turnOnNotif();
+      break;
     case 'logout':
       if (await ask('로그아웃할까요?', '다시 로그인하면 대화를 이어서 볼 수 있어요. 이 기기로는 알림이 오지 않게 돼요.', '로그아웃')) { await detachPush(); await api.signOut(); leaveApp(); }
       break;

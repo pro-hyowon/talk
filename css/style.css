@@ -1093,3 +1093,17 @@ a.btn { text-decoration: none; }
 
 /* v1.30: 공지사항 방 맨 위 고정 표시 */
 .row.chat .pin-ic { flex: none; color: var(--mint-text); vertical-align: -2px; }
+
+/* v1.31: 알림 켜기 — 누르자마자 '켜는 중' 표시, 줄 전체를 눌러도 됨, 안 켜질 때 해결 방법 안내 */
+.item.tap { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.item.tap:active { background: var(--line2); }
+.switch.busy::before { content: ''; position: absolute; top: 9px; width: 9px; height: 9px; border-radius: 50%; border: 2px solid rgba(12,59,48,.25); border-top-color: #0C3B30; z-index: 1; animation: mtSpin .7s linear infinite; left: 9px; }
+.switch.busy.on::before { left: 29px; }
+.switch.busy { cursor: progress; }
+.notif-help h3 { margin: 2px 0 8px; font-size: 18px; }
+.notif-help p { margin: 0 0 10px; font-size: 14.5px; line-height: 1.6; color: var(--ink2); word-break: keep-all; }
+.notif-help ol { margin: 0 0 10px; padding-left: 20px; }
+.notif-help li { margin: 6px 0; font-size: 14.5px; line-height: 1.55; color: var(--ink2); word-break: keep-all; }
+.notif-help b { color: var(--ink); }
+.notif-help .nh-note { font-size: 13px; color: var(--ink3); background: var(--line2); border-radius: 12px; padding: 9px 12px; }
+.nh-foot { margin: 12px 0 0; font-size: 12.5px; text-align: center; }
