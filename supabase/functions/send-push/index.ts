@@ -6,6 +6,9 @@
 //
 //  필요한 비밀값(Edge Functions > Secrets):
 //    VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT, PUSH_WEBHOOK_SECRET
+//    FCM_SERVICE_ACCOUNT  (v1.35: 끼리톡 앱 2.0 알림용 — Firebase 서비스 계정 키 JSON 파일 내용 전체. 없으면 앱 알림만 건너뜀)
+//  v1.35: 끼리톡 앱 2.0 의 기기는 같은 표(push_subscriptions)에 endpoint = 'fcm:<토큰>' 으로 저장돼요.
+//         그런 기기는 구글 알림 서비스(FCM HTTP v1)로, 나머지는 지금처럼 웹 알림(Web Push)으로 보냅니다.
 //  ※ 함수 설정에서 "Verify JWT"(JWT 검증)는 꺼 주세요. 대신 PUSH_WEBHOOK_SECRET 으로 보호합니다.
 // =====================================================================
 
@@ -104,6 +107,88 @@ export async function sendWebPush(sub: Sub, payload: string, vapid: { publicKey:
   return res.status;
 }
 
+// ---------- v1.35: 끼리톡 앱 2.0 알림 (Firebase Cloud Messaging HTTP v1) ----------
+type ServiceAccount = { project_id: string; client_email: string; private_key: string; token_uri?: string };
+let fcmToken: { value: string; exp: number } | null = null;
+let fcmTokenP: Promise<string> | null = null;   // 동시에 여러 요청이 와도 구글 로그인은 한 번만
+
+function pemToPkcs8(pem: string): Uint8Array {
+  const body = pem.replace(/-----BEGIN [^-]+-----|-----END [^-]+-----|\s+/g, '');
+  const bin = atob(body);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// 서비스 계정 키로 구글 접근 토큰 받기 (약 1시간 유효 — 만료 5분 전까지 다시 씀)
+export function fcmAccessToken(sa: ServiceAccount, tokenUrl: string): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  if (fcmToken && fcmToken.exp - 300 > now) return Promise.resolve(fcmToken.value);
+  fcmTokenP ??= newAccessToken(sa, tokenUrl).finally(() => { fcmTokenP = null; });
+  return fcmTokenP;
+}
+async function newAccessToken(sa: ServiceAccount, tokenUrl: string): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  const header = b64url(enc.encode(JSON.stringify({ alg: 'RS256', typ: 'JWT' })));
+  const claims = b64url(enc.encode(JSON.stringify({
+    iss: sa.client_email, scope: 'https://www.googleapis.com/auth/firebase.messaging',
+    aud: tokenUrl, iat: now, exp: now + 3600,
+  })));
+  const key = await crypto.subtle.importKey('pkcs8', buf(pemToPkcs8(sa.private_key)), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+  const sig = new Uint8Array(await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, buf(enc.encode(`${header}.${claims}`))));
+  const res = await fetch(tokenUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer')}&assertion=${header}.${claims}.${b64url(sig)}`,
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok || !j.access_token) throw new Error('FCM 접근 토큰을 받지 못했어요 (' + res.status + ')');
+  fcmToken = { value: j.access_token, exp: now + (Number(j.expires_in) || 3600) };
+  return fcmToken.value;
+}
+
+// 앱이 만드는 알림 채널 ('끼톡!' 소리). 앱의 MainActivity.CHANNEL_ID 와 같아야 해요.
+export const FCM_CHANNEL = 'kkiri_messages_v2';
+
+// 한 기기로 보내기 → HTTP 상태와 구글 오류 코드 (UNREGISTERED = 앱이 지워졌거나 등록이 만료됨)
+export async function sendFcm(token: string, msg: { title: string; body: string; tag: string; url: string }, sa: ServiceAccount, access: string, base: string): Promise<{ status: number; code: string }> {
+  const res = await fetch(`${base}/v1/projects/${encodeURIComponent(sa.project_id)}/messages:send`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: {
+      token,
+      notification: { title: msg.title, body: msg.body },
+      data: { tag: msg.tag, url: msg.url },
+      android: {
+        priority: 'HIGH', ttl: '86400s',
+        notification: {
+          channel_id: FCM_CHANNEL, tag: msg.tag, sound: 'kkitok', icon: 'ic_stat_kkiri', color: '#4FD1AE',
+          notification_priority: 'PRIORITY_HIGH', default_vibrate_timings: true,   // 안드로이드 7 이하(채널 없음)에서도 위에 뜨고 진동
+        },
+      },
+    } }),
+  });
+  if (res.ok) { await res.body?.cancel(); return { status: res.status, code: '' }; }
+  let code = '';
+  try {
+    const j = await res.json();
+    const d = Array.isArray(j?.error?.details) ? j.error.details : [];
+    code = String(d.find((x: { errorCode?: string }) => x && x.errorCode)?.errorCode ?? j?.error?.status ?? '');
+  } catch { /* 본문 없음 */ }
+  return { status: res.status, code };
+}
+// 다시는 이 프로젝트로 보낼 수 없는 토큰 (앱 삭제·만료, 다른 Firebase 프로젝트의 토큰)
+const deadFcm = (r: { status: number; code: string }) => r.code === 'UNREGISTERED' || r.code === 'SENDER_ID_MISMATCH';
+
+function serviceAccount(): ServiceAccount | null {
+  const raw = Deno.env.get('FCM_SERVICE_ACCOUNT');
+  if (!raw) return null;
+  try {
+    const sa = JSON.parse(raw);
+    return sa && sa.project_id && sa.client_email && sa.private_key ? sa : null;
+  } catch { return null; }
+}
+
 // ---------- 요청 처리 ----------
 async function removeDead(endpoints: string[]) {
   const url = Deno.env.get('SUPABASE_URL');
@@ -132,24 +217,57 @@ export async function handler(req: Request): Promise<Response> {
   let data: { subs?: Sub[]; title?: string; body?: string; room_id?: string };
   try { data = await req.json(); } catch { return new Response('bad json', { status: 400 }); }
   const subs = Array.isArray(data.subs) ? data.subs.slice(0, 500) : [];
-  const payload = JSON.stringify({
+  const msg = {
     title: data.title ?? '끼리톡',
     body: data.body ?? '새 메시지가 도착했습니다.',
     tag: data.room_id ?? 'minitalk',
     url: data.room_id ? `./#/room/${data.room_id}` : './',
-  });
+  };
+  const payload = JSON.stringify(msg);
+  const isApp = (s: Sub) => typeof s?.endpoint === 'string' && s.endpoint.startsWith('fcm:');
+  const webSubs = subs.filter((s) => !isApp(s));
+  const appSubs = subs.filter(isApp);
 
-  const results = await Promise.allSettled(
-    subs.map((s) => sendWebPush(s, payload, { publicKey, signKey: cachedKey!, subject })),
-  );
   const dead: string[] = [];
-  let sent = 0;
+  let sent = 0, failed = 0;
+  const results = await Promise.allSettled(
+    webSubs.map((s) => sendWebPush(s, payload, { publicKey, signKey: cachedKey!, subject })),
+  );
   results.forEach((r, i) => {
     if (r.status === 'fulfilled' && r.value >= 200 && r.value < 300) sent++;
-    else if (r.status === 'fulfilled' && (r.value === 404 || r.value === 410)) dead.push(subs[i].endpoint);
+    else if (r.status === 'fulfilled' && (r.value === 404 || r.value === 410)) dead.push(webSubs[i].endpoint);
+    else failed++;
   });
+
+  // v1.35: 끼리톡 앱 2.0 기기
+  if (appSubs.length) {
+    const sa = serviceAccount();
+    let access = '';
+    if (sa) {
+      try { access = await fcmAccessToken(sa, Deno.env.get('FCM_TOKEN_URL') ?? sa.token_uri ?? 'https://oauth2.googleapis.com/token'); }
+      catch (e) { console.warn(String(e)); }
+    }
+    if (!sa) console.warn('FCM_SERVICE_ACCOUNT 비밀값이 없거나 형식이 맞지 않아 앱 기기 ' + appSubs.length + '대에 보내지 못했어요');
+    if (!sa || !access) failed += appSubs.length;
+    else {
+      const base = Deno.env.get('FCM_BASE_URL') ?? 'https://fcm.googleapis.com';
+      const fr = await Promise.allSettled(appSubs.map((s) => sendFcm(s.endpoint.slice(4), msg, sa, access, base)));
+      fr.forEach((r, i) => {
+        if (r.status === 'fulfilled' && r.value.status >= 200 && r.value.status < 300) sent++;
+        else if (r.status === 'fulfilled' && deadFcm(r.value)) dead.push(appSubs[i].endpoint);
+        else {
+          failed++;
+          if (r.status === 'fulfilled') {
+            if (r.value.status === 401) fcmToken = null;   // 접근 토큰이 일찍 끝남 → 다음엔 새로 받기
+            console.warn('FCM 발송 실패', r.value.status, r.value.code);
+          } else console.warn('FCM 발송 실패', String(r.reason));
+        }
+      });
+    }
+  }
+
   await removeDead(dead);
-  return Response.json({ sent, failed: subs.length - sent - dead.length, removed: dead.length });
+  return Response.json({ sent, failed, removed: dead.length });
 }
 
 Deno.serve(handler);

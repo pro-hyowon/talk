@@ -3163,7 +3163,7 @@ returns jsonb language sql stable security definer set search_path = public, pri
                             'media_keep_from', (select media_keep_from from private.app_settings where id = 1),
                             'msg_keep_days', public.msg_keep_days(),
                             'msg_keep_from', (select msg_keep_from from private.app_settings where id = 1),
-                            'db_version', '1.25');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
+                            'db_version', '1.26');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
 $$;
 
 -- 회원 앱: 내 방에서 보관 기간이 지난 사진·파일을 몇 개씩 받아 저장 공간에서 지움
@@ -3733,6 +3733,33 @@ $$;
 $f$;
     execute 'revoke execute on function public.save_push_subscription(text, text, text, text) from public, anon';
     execute 'grant execute on function public.save_push_subscription(text, text, text, text) to authenticated';
+    -- v1.26: 끼리톡 앱 2.0 의 기기 등록 (구글 알림 서비스 토큰 → endpoint 'fcm:<토큰>', 보내는 곳은 send-push 함수)
+    execute $f$
+create or replace function public.save_app_push_token(p_token text, p_user_agent text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_ep text;
+begin
+  if auth.uid() is null then raise exception '로그인이 필요해요'; end if;
+  if not public.is_active() then raise exception '사용할 수 없는 계정이에요'; end if;
+  if p_token is null or char_length(p_token) not between 20 and 4096 or p_token !~ '^[A-Za-z0-9_:-]+$' then raise exception '잘못된 알림 등록 정보예요'; end if;
+  v_ep := 'fcm:' || p_token;
+  -- 예전 플레이 스토어 앱(웹 방식)에서 켠 알림은 새 앱이 대신 받으므로 정리 (같은 알림이 두 번 오지 않게)
+  delete from push_subscriptions where user_id = auth.uid() and endpoint <> v_ep and user_agent like 'KkiriEnv/store %';
+  if (select count(*) from push_subscriptions where user_id = auth.uid() and endpoint <> v_ep) >= 10 then
+    delete from push_subscriptions where endpoint in (
+      select endpoint from push_subscriptions where user_id = auth.uid() and endpoint <> v_ep order by created_at limit 1);
+  end if;
+  insert into push_subscriptions (endpoint, user_id, p256dh, auth, user_agent)
+  values (v_ep, auth.uid(), '-', '-', left(p_user_agent, 200))
+  on conflict (endpoint) do update
+    set user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,
+        user_agent = excluded.user_agent, created_at = now();
+end;
+$$;
+$f$;
+    execute 'revoke execute on function public.save_app_push_token(text, text) from public, anon';
+    execute 'grant execute on function public.save_app_push_token(text, text) to authenticated';
   end if;
 end
 $do$;
