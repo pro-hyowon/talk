@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.33';
+const VERSION = '1.34';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -16,6 +16,11 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const isNum = (v) => typeof v === 'number';
+// v1.34: 끼리톡 앱 2.0(하이브리드 앱) 안에서 열렸는지 — 앱이 화면에 넣어 주는 window.Capacitor 로 알아봄
+//   브라우저·예전 스토어 앱(크롬을 빌려 쓰는 방식)에서는 항상 false 라서 지금 동작은 그대로
+const CAP = window.Capacitor;
+const IN_APP = !!(CAP && typeof CAP.isNativePlatform === 'function' && CAP.isNativePlatform());
+const capPlugin = (name) => (IN_APP && CAP.Plugins && CAP.Plugins[name]) || null;
 
 // 아이콘 모음을 한 번만 문서에 넣고 <use>로 불러 씀
 document.body.insertAdjacentHTML('afterbegin', `<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>${SPRITE}</defs></svg>`);
@@ -453,12 +458,13 @@ const inStoreApp = () => { try { if (sessionStorage.getItem(STORE_APP_KEY) === '
 // 플레이 스토어 앱(store) · 다른 앱 안의 브라우저(inapp) · 아이폰 홈 화면 앱(ios-app) / 사파리(ios-tab) · 홈 화면 앱(home) · 브라우저(browser)
 function envKind() {
   const ua = navigator.userAgent || '';
+  if (IN_APP) return 'native';   // v1.34: 끼리톡 앱 2.0
   if (inStoreApp()) return 'store';
   if (/KAKAOTALK|NAVER\(inapp|Instagram|FBAN|FBAV|DaumApps|Line\/|everytimeApp|BAND\/|; wv\)/i.test(ua)) return 'inapp';
   if (phoneKind() === 'ios') return isStandalone() ? 'ios-app' : 'ios-tab';
   return isStandalone() ? 'home' : 'browser';
 }
-const ENV_NAME = { store: '플레이 스토어 앱', inapp: '다른 앱 안의 브라우저', 'ios-app': '아이폰 홈 화면 앱', 'ios-tab': '아이폰 사파리', home: '홈 화면 앱', browser: '인터넷 브라우저' };
+const ENV_NAME = { native: '끼리톡 앱 2.0', store: '플레이 스토어 앱', inapp: '다른 앱 안의 브라우저', 'ios-app': '아이폰 홈 화면 앱', 'ios-tab': '아이폰 사파리', home: '홈 화면 앱', browser: '인터넷 브라우저' };
 function browserName(ua = navigator.userAgent || '') {
   const pick = [[/SamsungBrowser\/([\d.]+)/, '삼성 인터넷'], [/Whale\/([\d.]+)/, '네이버 웨일'], [/EdgA?\/([\d.]+)/, '엣지'], [/(?:Firefox|FxiOS)\/([\d.]+)/, '파이어폭스'], [/CriOS\/([\d.]+)/, '크롬'], [/Chrome\/([\d.]+)/, '크롬'], [/Version\/([\d.]+).*Safari/, '사파리']];
   for (const [re, n] of pick) { const m = ua.match(re); if (m) return `${n} ${m[1].split('.')[0]}`; }
@@ -559,8 +565,10 @@ function notifBusy(on, text) {
 }
 let notifWorking = false;
 function notifDone() { notifWorking = false; S.notifBusy = null; renderMain(); }
+const NATIVE_NOTIF_SOON = '앱 알림은 다음 업데이트에서 연결돼요';
 async function turnOnNotif() {
   if (notifWorking) return;
+  if (IN_APP) { toast(NATIVE_NOTIF_SOON); return; }   // v1.34: 앱 화면(웹뷰)에는 웹 알림 기능이 없음 → 앱 알림(FCM)으로 연결 예정
   const env = envKind();
   if (!('Notification' in window)) { showNotifHelp(env === 'inapp' ? 'inapp' : env === 'ios-tab' ? 'ios-tab' : 'unsupported'); return; }
   setNotifOff(false);
@@ -1047,12 +1055,13 @@ function showSoundSettings() {
       <div class="card snd-list">${SOUNDS.map(([k, l]) => `<button class="snd-row ${soundPref() === k ? 'on' : ''}" data-snd="${k}" role="radio" aria-checked="${soundPref() === k}"><span>${esc(l)}</span><span class="ck">${ic('check', 16)}</span></button>`).join('')}
         ${canVib ? `<div class="snd-row vib"><span>진동도 함께</span><button class="switch ${vibratePref() ? 'on' : ''}" data-vib role="switch" aria-checked="${vibratePref()}" aria-label="진동"></button></div>` : ''}</div>
       <div class="snd-sec">앱을 닫아 두었을 때 (휴대폰 알림)</div>
+      ${IN_APP ? `<p class="sheet-desc" style="margin-top:0">${esc(APP)} 앱은 알림 소리가 <b>'끼톡!'</b>으로 정해져 있어요. 다른 소리로 바꾸려면 휴대폰 <b>설정 → 애플리케이션 → ${esc(APP)} → 알림</b>에서 바꿀 수 있어요.</p>` : `
       <p class="sheet-desc" style="margin-top:0">휴대폰에 뜨는 알림의 소리는 <b>휴대폰 설정</b>에서 바꿀 수 있어요. 휴대폰 기본 알림음이나 다른 소리를 고를 수 있어요.</p>
       <div class="snd-guide"><b>${PHONE_GUIDE[kind][0]}</b>${PHONE_GUIDE[kind][1]}</div>
       ${kind === 'ios' ? '' : `<div class="snd-sec">휴대폰 알림음을 '끼톡!' 으로 바꾸기</div>
       <p class="sheet-desc" style="margin-top:0">소리 파일을 받아 두면 위 방법의 <b>소리</b> 화면에서 고를 수 있어요. (목록 맨 위의 <b>+</b> 또는 <b>내 소리 추가</b>를 누르고 '다운로드(Download)' 폴더의 kkitok 파일 선택)</p>
       <div class="snd-dl">${Object.entries(SOUND_FILES).map(([k, [u, fn]]) => `<a class="btn line sm" href="${u}" download="${fn}" data-dl="${k}">${ic('download', 16)}${esc(soundLabel(k).replace(' (기본)', ''))} 받기</a>`).join('')}</div>`}
-      <details class="snd-other"><summary>다른 휴대폰은?</summary>${Object.entries(PHONE_GUIDE).filter(([k]) => k !== kind && k !== 'pc').map(([, [n, h]]) => `<div class="snd-guide"><b>${n}</b>${h}</div>`).join('')}</details>
+      <details class="snd-other"><summary>다른 휴대폰은?</summary>${Object.entries(PHONE_GUIDE).filter(([k]) => k !== kind && k !== 'pc').map(([, [n, h]]) => `<div class="snd-guide"><b>${n}</b>${h}</div>`).join('')}</details>`}
       <button class="btn" data-close style="margin-top:14px">확인</button>`,
     onMount(sheet) {
       sheet.addEventListener('click', (e) => {
@@ -1549,6 +1558,7 @@ function chatRowHtml(r) {
 }
 
 function notifSub(on) {
+  if (IN_APP && !on) return NATIVE_NOTIF_SOON;   // v1.34
   if (on) return '새 메시지·친구 소식을 알려 드려요';
   if (!('Notification' in window)) return '이 화면에서는 쓸 수 없어요 · 눌러서 방법 보기';
   if (Notification.permission === 'denied' && !notifOffPref()) return '휴대폰(브라우저) 설정에서 알림이 막혀 있어요 · 눌러서 푸는 방법 보기';
@@ -1576,7 +1586,7 @@ function renderMore(head, body) {
       <div class="item tap" data-act="notif-row"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림<span class="sub">${nb ? esc(nb.text) : notifSub(on)}</span></span>
         <button class="switch ${on ? 'on' : ''}${nb ? ' busy' : ''}" data-act="notif" role="switch" aria-checked="${on}" aria-busy="${nb ? 'true' : 'false'}" aria-label="새 메시지 알림"></button></div>
       <button class="item" data-act="notif-sound"><span class="tile lemon">${ic('bell', 19)}</span><span class="label">알림 소리<span class="sub">${esc(soundLabel(soundPref()))}${vibratePref() && 'vibrate' in navigator ? ' · 진동' : ''} · 휴대폰 알림음 바꾸기</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
-      ${api.sendTestPush && !dbOutdated() ? `<button class="item" data-act="notif-test"><span class="tile mint">${ic('send', 19)}</span><span class="label">알림 테스트<span class="sub">내 휴대폰으로 알림이 오는지 확인해요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>` : ''}
+      ${api.sendTestPush && !dbOutdated() && !IN_APP ? `<button class="item" data-act="notif-test"><span class="tile mint">${ic('send', 19)}</span><span class="label">알림 테스트<span class="sub">내 휴대폰으로 알림이 오는지 확인해요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>` : ''}
       ${isStandalone() ? '' : `<button class="item" data-act="install"><span class="tile mint">${ic('install', 19)}</span><span class="label">홈 화면에 설치</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>`}
     </div>
     <div class="card">
@@ -1665,7 +1675,7 @@ function showEditProfile() {
   });
 }
 
-const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true || document.referrer.startsWith('android-app://');
+const isStandalone = () => IN_APP || matchMedia('(display-mode: standalone)').matches || navigator.standalone === true || document.referrer.startsWith('android-app://');
 function showInstall() {
   const standalone = isStandalone();
   const ios = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -2559,12 +2569,14 @@ async function openFile(m) {
   a.href = c.url; a.rel = 'noopener'; a.download = f.name;
   if (isIOS()) a.target = '_blank';
   document.body.appendChild(a); a.click(); a.remove();
-  toast(`‘${f.name}’ 파일을 내려받고 있어요`);
+  toast(IN_APP ? `‘${f.name}’ 파일을 인터넷 브라우저에서 열어요` : `‘${f.name}’ 파일을 내려받고 있어요`);   // v1.34: 앱에서는 브라우저가 받아 줌
 }
 
 // 연락처 카드 → 휴대폰 연락처에 저장 (.vcf 파일을 열면 연락처 앱이 저장해 줌)
+const NATIVE_SAVE_SOON = '앱에서 저장하는 기능은 다음 업데이트에서 들어가요';
 function saveContact(m) {
   const c = contactOf(m); if (!c) return;
+  if (IN_APP) { toast(NATIVE_SAVE_SOON); return; }   // v1.34
   const v = (s) => String(s).replace(/\\/g, '\\\\').replace(/[,;]/g, (x) => '\\' + x).replace(/\r?\n/g, ' ');
   const vcf = ['BEGIN:VCARD', 'VERSION:3.0', `FN:${v(c.name)}`, `N:${v(c.name)};;;;`,
     ...c.phones.map((p) => `TEL;TYPE=${normPhone(telDigits(p)) ? 'CELL' : 'VOICE'}:${fmtTel(p)}`), 'END:VCARD'].join('\r\n');
@@ -3871,6 +3883,7 @@ function showImage(btn) {
   const save = $('.save', v);
   save.addEventListener('click', async (e) => {
     e.preventDefault();
+    if (IN_APP) { toast(NATIVE_SAVE_SOON); return; }   // v1.34
     try {
       const blob = await (await fetch(img.src)).blob();
       const u = URL.createObjectURL(blob); const a = document.createElement('a');
@@ -5116,7 +5129,49 @@ if (window.visualViewport) {
   vv.addEventListener('resize', fitViewport);
   vv.addEventListener('scroll', fitViewport);
 }
-if ('serviceWorker' in navigator && !window.__MINITALK_API__) {
+// v1.34: 끼리톡 앱 2.0 — 휴대폰 '뒤로' 버튼, kkiritalk.com 링크(초대 링크·QR)로 앱이 열렸을 때
+function openAppLink(url) {
+  let u;
+  try { u = new URL(String(url || '')); } catch { return; }
+  if (u.protocol !== 'https:' || u.hostname.toLowerCase() !== 'kkiritalk.com') return;
+  const path = u.pathname.replace(/\/index\.html$/, '/');
+  if (path !== '/') { if (location.pathname !== u.pathname) location.href = u.href; return; }   // 약관 같은 다른 페이지
+  if (u.hash && u.hash !== location.hash) location.hash = u.hash;   // 초대 링크(#/add/…)·대화방 → route() 가 처리
+}
+function setupNativeApp() {
+  const App = capPlugin('App');
+  if (!App) return;
+  // '뒤로': 열린 창·대화방·관리자 화면이 있으면 한 단계 뒤로, 맨 처음 화면(탭 목록·로그인)이면 앱을 내려 둠
+  //   (웹뷰의 기록 유무로만 판단하면 인터넷 끊김 화면 등이 기록에 남아 처음 화면에서 새로 고침이 될 수 있음)
+  App.addListener('backButton', (ev) => {
+    const overlay = $('.sheet-back') || $('.viewer');
+    const admin = $('#admin'); const inAdmin = admin && !admin.hidden;
+    if (overlay || S.room || inAdmin) {
+      if (ev && ev.canGoBack) history.back();
+      else if (overlay) { closeAllSheets(); const vw = $('.viewer'); if (vw) vw.remove(); }
+      else go('#/chats');   // 링크로 바로 열린 대화방 등 — 기록이 없으면 채팅 목록으로
+      return;
+    }
+    if (App.minimizeApp) App.minimizeApp();
+  });
+  App.addListener('appUrlOpen', (ev) => openAppLink(ev && ev.url));   // 앱이 켜져 있을 때 링크를 누름
+  const KEY = 'kkiri-launch-url';
+  if (App.getLaunchUrl) {
+    App.getLaunchUrl().then((r) => {   // 앱이 꺼져 있다가 링크로 켜짐 (같은 실행에서 화면을 새로 고쳐도 한 번만)
+      const url = r && r.url;
+      if (!url) return;
+      try { if (sessionStorage.getItem(KEY) === url) return; sessionStorage.setItem(KEY, url); } catch { /* 저장 안 됨 */ }
+      openAppLink(url);
+    }).catch(() => {});
+  }
+}
+if (IN_APP) { try { setupNativeApp(); } catch (e) { console.warn('app setup', e); } }
+
+// v1.34: 끼리톡 앱 2.0 안에서는 서비스 워커를 쓰지 않음 (앱 화면에는 웹 알림이 없고, 인터넷이 끊기면 앱의 안내 화면이 뜸)
+if (IN_APP && 'serviceWorker' in navigator && navigator.serviceWorker.getRegistrations) {
+  navigator.serviceWorker.getRegistrations().then((rs) => rs.forEach((r) => r.unregister())).catch(() => {});
+}
+if ('serviceWorker' in navigator && !window.__MINITALK_API__ && !IN_APP) {
   navigator.serviceWorker.register('./sw.js').catch((e) => console.warn('SW 등록 실패', e));
   navigator.serviceWorker.addEventListener('message', (e) => {
     if (e.data && e.data.type === 'open' && e.data.hash) go(e.data.hash);
