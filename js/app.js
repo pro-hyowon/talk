@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.36';
+const VERSION = '1.37';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -1126,14 +1126,28 @@ function renderAuth(mode = 'login') {
   };
 }
 
+// v1.37: 켤 때 내 정보와 친구·채팅 목록을 기다리지 않고 한꺼번에 요청 (서버 왕복 한 번 줄임)
+//   내 정보를 확인한 뒤(정지·약관 등) 받아 둔 목록을 그대로 씀. 각 목록은 한 번만 쓰고, 그다음부터는 새로 받음
+function prefetchLists() {
+  const q = (fn) => { if (typeof fn !== 'function') return null; const p = Promise.resolve().then(fn); p.catch(() => {}); return p; };
+  S.pre = { friends: q(() => api.listFriends()), rooms: q(() => api.listRooms()), blocks: api.myBlocks ? q(() => api.myBlocks()) : null, info: api.appInfo ? q(() => api.appInfo()) : null, uid: S.uid };
+}
+function takePre(k) {
+  const pre = S.pre;
+  if (!pre || pre.uid !== S.uid || !pre[k]) return null;
+  const p = pre[k]; pre[k] = null;
+  return p;
+}
 async function enterApp(id) {
   if (S.entered && S.uid === id) return;
   S.uid = id; S.entered = true;
   app.innerHTML = splashHtml();
   setOffline(!navigator.onLine);
+  prefetchLists();
   try {
     S.me = await api.getMyProfile();
   } catch (e) {
+    S.pre = null;
     S.entered = false; S.uid = null;
     // v1.27: 인터넷이 안 될 때는 로그인 화면 대신 '연결되면 다시 시도' 화면 (로그인은 그대로 유지)
     if (!navigator.onLine || /인터넷 연결|Failed to fetch|NetworkError|Load failed/i.test(e.message || '')) { renderOfflineStart(id); return; }
@@ -1142,14 +1156,17 @@ async function enterApp(id) {
     return;
   }
   loadImgCache();
+  // v1.37: 정지·승인 대기 상태에서 미리 받은 목록은 비어 있음 → 쓰지 않고 새로 받음
+  if (S.me.status && S.me.status !== 'active') S.pre = null;
   // v1.18: 정지 기간이 끝났으면 풀고 들어감
   if (S.me.status === 'suspended' && api.refreshMyStatus) {
     try { if ((await api.refreshMyStatus()) === 'active') S.me = await api.getMyProfile(); } catch { /* 예전 데이터베이스 */ }
   }
-  if (S.me.status && S.me.status !== 'active') { renderBlocked(S.me.status); return; }
+  if (S.me.status && S.me.status !== 'active') { S.pre = null; renderBlocked(S.me.status); return; }
   // v1.17: 약관 동의 전에 가입한 회원은 한 번 동의를 받음 (데이터베이스가 예전 버전이면 건너뜀)
   if ('terms_agreed_at' in S.me && !S.me.terms_agreed_at && api.agreeTerms) {
     if (!(await askTerms())) return;
+    S.pre = null;   // v1.37: 동의 화면에 머문 사이 바뀌었을 수 있어서 새로 받음
   }
   cacheProfile(S.me);
   buildShell();
@@ -1172,7 +1189,7 @@ async function enterApp(id) {
 async function loadAppInfo() {
   if (!api.appInfo) return;
   try {
-    const i = await api.appInfo();
+    const i = await (takePre('info') || api.appInfo());
     S.keepDays = i && Number(i.media_keep_days) > 0 ? Number(i.media_keep_days) : 0;
     S.keepFrom = i && i.media_keep_from ? Date.parse(i.media_keep_from) || 0 : 0;
     S.dbVersion = i && i.db_version ? String(i.db_version) : null;
@@ -1508,6 +1525,7 @@ function leaveApp() {
   if (backPending) flushBack();   // v1.28: 창 기록 되돌리기를 기다리지 않음
   if (S.room) closeRoom();   // v1.27: 방 타이머·감시 정리
   if (S.unsub) { try { S.unsub(); } catch { /* 무시 */ } }
+  S.pre = null;
   if (IN_APP && (S.pushOn || nat.saved)) { nat.gen++; appUnregister(); }   // v1.35: 로그인이 풀림(세션 만료 등) → 이 휴대폰으로 알림이 더 오지 않게
   clearImgCache();
   Object.assign(S, {
@@ -1577,7 +1595,7 @@ function backFromRoom() {
 // 데이터 불러오기
 // ---------------------------------------------------------------------
 async function loadFriends() {
-  S.friends = await api.listFriends();
+  S.friends = await (takePre('friends') || api.listFriends());
   S.friends.forEach(cacheProfile);
   if (S.tab === 'friends' && !S.room) renderMain();
 }
@@ -1610,7 +1628,7 @@ async function loadPhone() {
 const roomTime = (r) => Date.parse(r && r.last_message_at) || 0;
 const roomOrder = (a, b) => (b.is_notice ? 1 : 0) - (a.is_notice ? 1 : 0) || roomTime(b) - roomTime(a);
 async function loadRooms() {
-  S.rooms = (await api.listRooms()).sort(roomOrder);
+  S.rooms = (await (takePre('rooms') || api.listRooms())).sort(roomOrder);
   S.roomsLoaded = true;
   S.muted = new Map(S.rooms.map((r) => [r.room_id, !!r.muted]));
   // 보고 있던 단체방에서 내보내졌으면 닫기 (실시간 알림을 못 받은 경우 대비)
@@ -3230,7 +3248,7 @@ function showAdForm(ad) {
 const isBlocked = (id) => !!id && S.blocks.has(id);
 async function loadBlocks() {
   if (!api.myBlocks) return;
-  try { S.blocks = new Set((await api.myBlocks()).map((b) => b.id)); }
+  try { S.blocks = new Set((await (takePre('blocks') || api.myBlocks())).map((b) => b.id)); }
   catch (e) { console.warn('blocks', e); }   // 데이터베이스가 예전 버전이면 차단 없이
 }
 function blockedChanged() {
@@ -5521,9 +5539,40 @@ if (IN_APP) { try { setupNativeApp(); } catch (e) { console.warn('app setup', e)
 // v1.34: 끼리톡 앱 2.0 안에서는 서비스 워커를 쓰지 않음 (앱 화면에는 웹 알림이 없고, 인터넷이 끊기면 앱의 안내 화면이 뜸)
 if (IN_APP && 'serviceWorker' in navigator && navigator.serviceWorker.getRegistrations) {
   navigator.serviceWorker.getRegistrations().then((rs) => rs.forEach((r) => r.unregister())).catch(() => {});
+  try { if (window.caches) caches.keys().then((ks) => ks.filter((k) => k.startsWith('kkiritalk-')).forEach((k) => caches.delete(k))).catch(() => {}); } catch { /* 없음 */ }   // v1.37: 쓰지 않는 저장 파일 정리
 }
 if ('serviceWorker' in navigator && !window.__MINITALK_API__ && !IN_APP) {
   navigator.serviceWorker.register('./sw.js').catch((e) => console.warn('SW 등록 실패', e));
+  // v1.37: 새 버전(서비스 워커)이 준비되면 새 버전으로 다시 열기
+  //   앱 파일을 휴대폰에 저장해 두고 쓰므로 이렇게 하지 않으면 업데이트가 다음에 켤 때 보임.
+  //   쓰는 중에는 끊지 않게: 아직 첫 화면(불러오는 중)이면 바로, 아니면 회원이 앱을 내려 둘 때(화면이 안 보일 때) 조용히.
+  const hadController = !!navigator.serviceWorker.controller;
+  let swReloadWanted = false; let swReloaded = false;
+  const swBusy = () => !!($('.sheet-back') || $('.viewer') || $('#capBox:not([hidden])')
+    || ($('#msgInput') && $('#msgInput').value.trim())
+    || $$('#authForm input').some((i) => i.type !== 'checkbox' && i.value)
+    || (S.room && S.room.msgs && S.room.msgs.some((m) => String(m.id).startsWith('tmp-'))));   // 보내는 중인 사진·메시지
+  const swTryReload = () => {
+    if (!swReloadWanted || swReloaded) return;
+    const loading = !!$('#app > .splash');
+    if (!loading && (document.visibilityState !== 'hidden' || swBusy())) return;
+    swReloaded = true;
+    location.reload();
+  };
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController) return;   // 처음 설치는 이미 새 버전
+    swReloadWanted = true;
+    swTryReload();
+  });
+  // 앱을 오래 켜 둔 경우에도 하루에 몇 번은 새 버전을 확인 (다시 보일 때 1시간이 지났으면)
+  let swChecked = Date.now();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') { swTryReload(); return; }
+    if (Date.now() - swChecked > 3600e3) {
+      swChecked = Date.now();
+      navigator.serviceWorker.getRegistration().then((r) => r && r.update()).catch(() => {});
+    }
+  });
   navigator.serviceWorker.addEventListener('message', (e) => {
     if (e.data && e.data.type === 'open' && e.data.hash) go(e.data.hash);
     if (e.data && e.data.type === 'resubscribed' && S.entered) enablePush({ silent: true }).catch(() => {});

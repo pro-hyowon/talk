@@ -15,6 +15,14 @@
   <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
   <link rel="preload" href="./fonts/GmarketSansMedium.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="./css/style.css">
+  <!-- v1.37: 앱 프로그램 파일을 한꺼번에 미리 받기 (하나 받고 나서 다음 것을 알게 되는 줄서기를 없애 첫 화면이 빨리 뜸) -->
+  <link rel="modulepreload" href="./js/app.js">
+  <link rel="modulepreload" href="./js/config.js">
+  <link rel="modulepreload" href="./js/icons.js">
+  <link rel="modulepreload" href="./js/stickers.js">
+  <link rel="modulepreload" href="./js/qr.js">
+  <link rel="modulepreload" href="./js/api.js">
+  <link rel="modulepreload" href="./js/vendor/supabase.js">
 </head>
 <body>
   <div id="app">

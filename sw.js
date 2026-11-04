@@ -1,5 +1,5 @@
 // 끼리톡 서비스 워커 — 앱 화면 캐시(오프라인에서도 열림) + 푸시 알림 수신·클릭 처리
-const CACHE = 'kkiritalk-v1.36';
+const CACHE = 'kkiritalk-v1.37';
 const SHELL = [
   './',
   './index.html',
@@ -20,8 +20,18 @@ const SHELL = [
   './fonts/GmarketSansBold.woff2',
 ];
 
+// v1.37: 앱 화면 파일은 설치(업데이트)할 때 한 번에 받아 두고, 켤 때는 휴대폰에 저장된 것을 바로 씀 → 빨리 열림
+//   (예전: 켤 때마다 인터넷에서 전부 다시 받아서 1초 가까이 걸림. 새 버전은 이 파일의 CACHE 이름이 바뀌면 전부 새로 받음)
+const SHELL_PATHS = new Set(SHELL.map((p) => new URL(p, self.registration.scope).pathname));
+
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // v1.37: 휴대폰의 HTTP 캐시를 거치지 않고 서버에서 새로 받음. 하나라도 실패하거나 다른 주소로 넘겨지면 설치를 멈추고
+  //   지금 버전을 그대로 씀 (반쯤 섞인 버전이 저장되지 않게) — 다음에 켤 때 다시 시도
+  e.waitUntil(caches.open(CACHE).then((c) => Promise.all(SHELL.map(async (u) => {
+    const res = await fetch(new Request(u, { cache: 'reload' }));
+    if (!res.ok || res.redirected) throw new Error('앱 파일을 받지 못했어요: ' + u);
+    await c.put(u, res);
+  }))).then(() => self.skipWaiting(), (err) => caches.delete(CACHE).then(() => { throw err; })));
 });
 
 self.addEventListener('activate', (e) => {
@@ -37,7 +47,16 @@ self.addEventListener('fetch', (e) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
 
-  // 같은 사이트 파일: 항상 최신을 먼저 받고, 안 되면(오프라인) 캐시 사용
+  // v1.37: 앱 화면 파일(같은 버전 묶음) → 저장해 둔 것 먼저, 없으면 인터넷
+  if (url.origin === self.location.origin && SHELL_PATHS.has(url.pathname)) {
+    e.respondWith(caches.open(CACHE).then((c) => c.match(req, { ignoreSearch: true })
+      .then((hit) => hit || (req.mode === 'navigate' ? c.match('./index.html') : null)))
+      .then((hit) => hit || fetch(req))
+      .catch(() => fetch(req)));
+    return;
+  }
+
+  // 그 밖의 같은 사이트 파일(약관·아이콘 등): 항상 최신을 먼저 받고, 안 되면(오프라인) 캐시 사용
   //   v1.27: 신호가 약해 4초 넘게 응답이 없으면 저장해 둔 것을 먼저 보여 줌 (첫 화면에서 멈춰 있지 않게)
   if (url.origin === self.location.origin) {
     const net = fetch(req).then((res) => {
