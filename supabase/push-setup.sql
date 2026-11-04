@@ -19,6 +19,10 @@ create table if not exists public.push_subscriptions (
   created_at timestamptz not null default now()
 );
 create index if not exists push_subscriptions_user_idx on public.push_subscriptions(user_id);
+-- v1.39: 기기마다 알림 표시 (알림 내용·팝업)
+alter table public.push_subscriptions add column if not exists preview text not null default 'full' check (preview in ('full', 'name', 'none'));
+alter table public.push_subscriptions add column if not exists popup boolean not null default true;
+alter table public.push_subscriptions add column if not exists prefs_at bigint not null default 0;
 
 alter table public.push_subscriptions enable row level security;
 
@@ -63,11 +67,13 @@ begin
 end;
 $$;
 
--- v1.35: 끼리톡 앱 2.0 의 기기 등록 (schema.sql 에도 같은 내용 — 고칠 때 함께)
-create or replace function public.save_app_push_token(p_token text, p_user_agent text default null)
+-- v1.35: 끼리톡 앱 2.0 의 기기 등록 (schema.sql 에도 같은 내용 — 고칠 때 함께), v1.38: 알림 소리
+drop function if exists public.save_app_push_token(text, text);
+create or replace function public.save_app_push_token(p_token text, p_user_agent text default null, p_sound text default null)
 returns void language plpgsql security definer set search_path = public as $$
 declare
   v_ep text;
+  v_snd text := case when p_sound ~ '^[a-z0-9]{1,20}$' then p_sound else '-' end;   -- v1.27: 이 휴대폰의 알림 소리 (앱 기기는 p256dh 칸에 저장, '-' = 기본)
 begin
   if auth.uid() is null then raise exception '로그인이 필요해요'; end if;
   if not public.is_active() then raise exception '사용할 수 없는 계정이에요'; end if;
@@ -80,14 +86,14 @@ begin
       select endpoint from push_subscriptions where user_id = auth.uid() and endpoint <> v_ep order by created_at limit 1);
   end if;
   insert into push_subscriptions (endpoint, user_id, p256dh, auth, user_agent)
-  values (v_ep, auth.uid(), '-', '-', left(p_user_agent, 200))
+  values (v_ep, auth.uid(), v_snd, '-', left(p_user_agent, 200))
   on conflict (endpoint) do update
     set user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,
         user_agent = excluded.user_agent, created_at = now();
 end;
 $$;
-revoke execute on function public.save_app_push_token(text, text) from public, anon;
-grant execute on function public.save_app_push_token(text, text) to authenticated;
+revoke execute on function public.save_app_push_token(text, text, text) from public, anon;
+grant execute on function public.save_app_push_token(text, text, text) to authenticated;
 
 -- 이 기기 알림 끄기 (로그아웃할 때도 호출)
 create or replace function public.delete_push_subscription(p_endpoint text)
@@ -131,7 +137,7 @@ begin
   select function_url, secret, show_preview into v_url, v_secret, v_preview from private.push_config where id = 1;
   if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return new; end if;
 
-  select jsonb_agg(jsonb_build_object('endpoint', s.endpoint, 'p256dh', s.p256dh, 'auth', s.auth))
+  select jsonb_agg(jsonb_build_object('endpoint', s.endpoint, 'p256dh', s.p256dh, 'auth', s.auth, 'preview', to_jsonb(s)->>'preview', 'popup', to_jsonb(s)->'popup'))
     into v_subs
     from push_subscriptions s
     join room_members m on m.user_id = s.user_id and m.room_id = new.room_id
@@ -169,6 +175,7 @@ begin
     url := v_url,
     body := jsonb_build_object(
       'subs', v_subs, 'title', v_title, 'body', v_body,
+      'name_body', '새 메시지가 도착했어요.', 'none_body', '새 메시지가 도착했어요.',   -- v1.39: 기기마다 '이름만'·'표시 안 함'
       'room_id', new.room_id, 'message_id', new.id),
     headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
     timeout_milliseconds := 8000

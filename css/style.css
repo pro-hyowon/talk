@@ -468,6 +468,11 @@ button.item:active { background: var(--soft-bg); }
 .emo-btn.on { color: var(--mint-text); background: var(--mint-100); }
 .sticker-panel { margin: 0 -12px calc(-8px - var(--safe-b)); padding: 4px 12px calc(10px + var(--safe-b)); max-height: 264px; overflow-y: auto; border-top: 1px solid var(--line); background: #fff; -webkit-overflow-scrolling: touch; }
 .stk-sec { font-size: 12px; color: var(--ink3); padding: 10px 4px 4px; }
+/* v1.38: 이모티콘 묶음 탭 (최근·톡이·친구·연인·가족·직장) — 위에 붙어 있고 옆으로 밀어 볼 수 있음 */
+.stk-tabs { position: sticky; top: -4px; z-index: 1; display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; margin: 0 -12px 4px; padding: 8px 12px 8px; background: #fff; }
+.stk-tabs::-webkit-scrollbar { display: none; }
+.stk-tab { flex: none; height: 32px; padding: 0 14px; border-radius: 16px; font-size: 13px; font-weight: 700; color: var(--ink2); background: var(--soft-bg); }
+.stk-tab.on { color: #fff; background: var(--mint-press); }
 .stk-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
 .stk { aspect-ratio: 1; border-radius: 16px; display: flex; align-items: center; justify-content: center; }
 .stk:active { background: var(--soft-bg); }
@@ -589,8 +594,24 @@ button.item:active { background: var(--soft-bg); }
 @keyframes stX-stop { 0%,100%{transform:none}35%,60%{transform:scale(1.22) translateX(1.5px)} }
 :is(.play, .stk.on, .stk-big) .ax-wiggle { animation: stX-wiggle .9s ease-in-out var(--n); }
 @keyframes stX-wiggle { 0%,100%{transform:rotate(0)}25%{transform:rotate(-14deg)}75%{transform:rotate(14deg)} }
+/* v1.38: 사람처럼 움직이는 톡이 — 관절(.jt)은 자기 자리(0,0)를 중심으로 --a ↔ --b 각도 사이를 오감 (같은 시간 --d) */
+.sticker-svg .jt { transform: rotate(var(--a, 0deg)); transform-box: view-box; transform-origin: 0 0; }
+/* 몸 전체 움직임은 발(60,80)을 중심으로 — 팔다리가 움직여도 중심이 흔들리지 않게 */
+.sticker-svg .ab.fig { transform-box: view-box; transform-origin: 60px 80px; }
+:is(.play, .stk.on, .stk-big) .sticker-svg { --n2: 6; }
+:is(.stk.on, .stk-big) .sticker-svg { --n2: infinite; }
+:is(.play, .stk.on, .stk-big) .sticker-svg .jt { animation: stJ var(--d, .5s) ease-in-out var(--dl, 0s) var(--n2) alternate both; }
+@keyframes stJ { from { transform: rotate(var(--a, 0deg)); } to { transform: rotate(var(--b, 0deg)); } }
+:is(.play, .stk.on, .stk-big) .ab-hop { animation: stB-hop .9s ease-in-out var(--n); }
+@keyframes stB-hop { 0%,100%{transform:none}18%{transform:scale(1.08,.88)}45%{transform:translateY(-7px) scale(.96,1.05)}70%{transform:scale(1.06,.93)}85%{transform:none} }
+:is(.play, .stk.on, .stk-big) .ab-run { animation: stB-run .4s ease-in-out var(--n2); }
+@keyframes stB-run { 0%,100%{transform:translateY(0) rotate(-5deg)}50%{transform:translateY(-4px) rotate(-7deg)} }
+:is(.play, .stk.on, .stk-big) .ab-dance { animation: stB-dance 1s ease-in-out var(--n); }
+@keyframes stB-dance { 0%,100%{transform:rotate(-7deg) translateX(-2px)}25%{transform:translateY(-4px)}50%{transform:rotate(7deg) translateX(2px)}75%{transform:translateY(-4px)} }
+:is(.play, .stk.on, .stk-big) .ab-bowdeep { animation: stB-bowdeep 1.4s ease-in-out var(--n); }
+@keyframes stB-bowdeep { 0%,100%{transform:none}35%,65%{transform:translateY(4px) scale(1.04,.86)} }
 @media (prefers-reduced-motion: reduce) {
-  .sticker-svg .ab, .sticker-svg .ax, .sticker-svg .ae { animation: none !important; }
+  .sticker-svg .ab, .sticker-svg .ax, .sticker-svg .ae, .sticker-svg .jt { animation: none !important; }
 }
 .sticker-svg { overflow: visible; }
 .mw.nolast .meta-col .tm { display: none; }
@@ -1016,6 +1037,12 @@ html.kb-open .composer { padding-bottom: 8px; }
 .snd-row.on { font-weight: 700; }
 .snd-row.on .ck { background: var(--mint); color: #fff; box-shadow: none; }
 .snd-row.vib { padding-right: 8px; }
+/* v1.39: 알림 표시 — 알림 미리 보기 */
+.disp-demo { display: flex; gap: 10px; align-items: flex-start; margin: 12px 0 12px; padding: 12px 14px; border-radius: 16px; background: var(--soft-bg); }
+.disp-demo .dd-ic { flex: none; width: 28px; height: 28px; border-radius: 8px; }
+.disp-demo .dd-tx { min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: 13.5px; line-height: 1.4; }
+.disp-demo .dd-tx b { font-size: 14px; }
+.disp-demo .dd-tx span { color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .snd-guide { padding: 12px 14px; border-radius: 14px; background: var(--field); font-size: 13.5px; line-height: 1.65; color: var(--ink2); word-break: keep-all; }
 .snd-guide > b { display: block; font-size: 14px; color: var(--ink); margin-bottom: 4px; }
 .snd-guide ol { margin: 0; padding-left: 18px; }

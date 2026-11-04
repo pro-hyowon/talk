@@ -88,7 +88,7 @@ export async function encryptPayload(p256dhB64: string, authB64: string, plainte
   return concat(salt, rs, new Uint8Array([asPublic.length]), asPublic, cipher);
 }
 
-export type Sub = { endpoint: string; p256dh: string; auth: string };
+export type Sub = { endpoint: string; p256dh: string; auth: string; preview?: string | null; popup?: boolean | null };
 
 export async function sendWebPush(sub: Sub, payload: string, vapid: { publicKey: string; signKey: CryptoKey; subject: string }, ttl = 86400): Promise<number> {
   const body = await encryptPayload(sub.p256dh, sub.auth, enc.encode(payload));
@@ -147,11 +147,35 @@ async function newAccessToken(sa: ServiceAccount, tokenUrl: string): Promise<str
   return fcmToken.value;
 }
 
-// 앱이 만드는 알림 채널 ('끼톡!' 소리). 앱의 MainActivity.CHANNEL_ID 와 같아야 해요.
-export const FCM_CHANNEL = 'kkiri_messages_v2';
+// v1.38: 앱 기기마다 고른 알림 소리 (앱 기기는 push_subscriptions.p256dh 칸에 소리 이름, '-' = 기본)
+//   소리 이름 → 앱 안의 소리 파일(res/raw) 이름. 앱의 KkiriSounds.ALL 과 같은 목록이어야 해요 (null = 소리 없음)
+export const APP_SOUNDS: Record<string, string | null> = {
+  kkitok2: 'kkitok_melody', kkitok: 'kkitok', kkiriring: 'kkiriring', drops: 'drops', marimba: 'marimba', boing: 'boing',
+  knock: 'knock', sparkle: 'sparkle', dingdongdaeng: 'dingdongdaeng', whistle: 'whistle', harp: 'harp', musicbox: 'musicbox',
+  dingdong: 'dingdong', pop: 'pop', chime: 'chime', tok: 'tok', bell: 'bell', none: null,
+};
+export const DEFAULT_SOUND = 'kkitok2';
+export const soundOf = (p256dh: unknown) => (typeof p256dh === 'string' && Object.hasOwn(APP_SOUNDS, p256dh) ? p256dh : DEFAULT_SOUND);
+// 앱이 만드는 알림 채널: kkiri_s_<소리>_v1 (앱의 KkiriSounds.channelId 와 같은 규칙)
+//   v1.39: 알림 팝업을 끈 기기는 kkiri_q_<소리>_v1 (알림창에만 조용히 — 팝업 없는 채널)
+export const fcmChannel = (sound: string, popup: unknown = true) => `kkiri_${popup === false ? 'q' : 's'}_${soundOf(sound)}_v1`;
+
+// v1.39: 기기마다 고른 '알림 내용' — 'full'(이름 + 메시지, 기본) · 'name'(이름만) · 'none'(표시 안 함)
+//   데이터베이스가 보내 준 대신 쓸 문구(name_body, none_title, none_body)가 있으면 그것으로, 없으면 기본 문구
+export type Msg = { title: string; body: string; tag: string; url: string };
+export type Alt = { name_body?: unknown; none_title?: unknown; none_body?: unknown };
+const str = (v: unknown) => (typeof v === 'string' && v ? v : null);
+export function msgFor(msg: Msg, preview: unknown, alt: Alt = {}): Msg {
+  if (msg.tag === 'kkiri-test') return msg;   // 알림 테스트는 그대로 (오는지 확인하는 용도)
+  if (preview === 'name') return { ...msg, body: str(alt.name_body) ?? msg.body };   // 메시지가 아닌 알림(친구 요청 등)은 그대로
+  if (preview === 'none') return { ...msg, title: str(alt.none_title) ?? '끼리톡', body: str(alt.none_body) ?? '새 알림이 있어요.' };
+  return msg;
+}
 
 // 한 기기로 보내기 → HTTP 상태와 구글 오류 코드 (UNREGISTERED = 앱이 지워졌거나 등록이 만료됨)
-export async function sendFcm(token: string, msg: { title: string; body: string; tag: string; url: string }, sa: ServiceAccount, access: string, base: string): Promise<{ status: number; code: string }> {
+export async function sendFcm(token: string, msg: Msg, sa: ServiceAccount, access: string, base: string, sound = DEFAULT_SOUND, popup: unknown = true): Promise<{ status: number; code: string }> {
+  const quiet = popup === false;
+  const snd = soundOf(sound); const raw = APP_SOUNDS[snd];
   const res = await fetch(`${base}/v1/projects/${encodeURIComponent(sa.project_id)}/messages:send`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${access}`, 'Content-Type': 'application/json' },
@@ -162,8 +186,8 @@ export async function sendFcm(token: string, msg: { title: string; body: string;
       android: {
         priority: 'HIGH', ttl: '86400s',
         notification: {
-          channel_id: FCM_CHANNEL, tag: msg.tag, sound: 'kkitok', icon: 'ic_stat_kkiri', color: '#4FD1AE',
-          notification_priority: 'PRIORITY_HIGH', default_vibrate_timings: true,   // 안드로이드 7 이하(채널 없음)에서도 위에 뜨고 진동
+          channel_id: fcmChannel(snd, popup), tag: msg.tag, ...(raw ? { sound: raw } : {}), icon: 'ic_stat_kkiri', color: '#4FD1AE',
+          notification_priority: quiet ? 'PRIORITY_DEFAULT' : 'PRIORITY_HIGH', default_vibrate_timings: true,   // 안드로이드 7 이하(채널 없음)에서도 (팝업을 끄지 않았으면) 위에 뜨고 진동
         },
       },
     } }),
@@ -214,7 +238,7 @@ export async function handler(req: Request): Promise<Response> {
   if (!publicKey || !privateKey) return new Response('VAPID keys missing', { status: 500 });
   cachedKey ??= await importVapidPrivateKey(publicKey, privateKey);
 
-  let data: { subs?: Sub[]; title?: string; body?: string; room_id?: string };
+  let data: { subs?: Sub[]; title?: string; body?: string; room_id?: string } & Alt;
   try { data = await req.json(); } catch { return new Response('bad json', { status: 400 }); }
   const subs = Array.isArray(data.subs) ? data.subs.slice(0, 500) : [];
   const msg = {
@@ -223,7 +247,7 @@ export async function handler(req: Request): Promise<Response> {
     tag: data.room_id ?? 'minitalk',
     url: data.room_id ? `./#/room/${data.room_id}` : './',
   };
-  const payload = JSON.stringify(msg);
+  const alt: Alt = { name_body: data.name_body, none_title: data.none_title, none_body: data.none_body };
   const isApp = (s: Sub) => typeof s?.endpoint === 'string' && s.endpoint.startsWith('fcm:');
   const webSubs = subs.filter((s) => !isApp(s));
   const appSubs = subs.filter(isApp);
@@ -231,7 +255,7 @@ export async function handler(req: Request): Promise<Response> {
   const dead: string[] = [];
   let sent = 0, failed = 0;
   const results = await Promise.allSettled(
-    webSubs.map((s) => sendWebPush(s, payload, { publicKey, signKey: cachedKey!, subject })),
+    webSubs.map((s) => sendWebPush(s, JSON.stringify(msgFor(msg, s.preview, alt)), { publicKey, signKey: cachedKey!, subject })),
   );
   results.forEach((r, i) => {
     if (r.status === 'fulfilled' && r.value >= 200 && r.value < 300) sent++;
@@ -251,7 +275,7 @@ export async function handler(req: Request): Promise<Response> {
     if (!sa || !access) failed += appSubs.length;
     else {
       const base = Deno.env.get('FCM_BASE_URL') ?? 'https://fcm.googleapis.com';
-      const fr = await Promise.allSettled(appSubs.map((s) => sendFcm(s.endpoint.slice(4), msg, sa, access, base)));
+      const fr = await Promise.allSettled(appSubs.map((s) => sendFcm(s.endpoint.slice(4), msgFor(msg, s.preview, alt), sa, access, base, soundOf(s.p256dh), s.popup)));
       fr.forEach((r, i) => {
         if (r.status === 'fulfilled' && r.value.status >= 200 && r.value.status < 300) sent++;
         else if (r.status === 'fulfilled' && deadFcm(r.value)) dead.push(appSubs[i].endpoint);

@@ -712,7 +712,7 @@ begin
   if to_regclass('private.push_config') is null then return; end if;
   select function_url, secret, show_preview into v_url, v_secret, v_preview from private.push_config where id = 1;
   if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return; end if;
-  select jsonb_agg(jsonb_build_object('endpoint', s.endpoint, 'p256dh', s.p256dh, 'auth', s.auth))
+  select jsonb_agg(jsonb_build_object('endpoint', s.endpoint, 'p256dh', s.p256dh, 'auth', s.auth, 'preview', to_jsonb(s)->>'preview', 'popup', to_jsonb(s)->'popup'))
     into v_subs
     from push_subscriptions s join profiles p on p.id = s.user_id and p.status = 'active'
    where s.user_id = p_to;
@@ -722,7 +722,8 @@ begin
     body := jsonb_build_object('subs', v_subs, 'title', '친구 요청',
               'body', case when coalesce(v_preview, true)
                            then coalesce(v_name, '누군가') || '님이 나를 친구로 추가했어요. 나도 추가하면 대화할 수 있어요.'
-                           else '새 친구 요청이 있어요.' end),
+                           else '새 친구 요청이 있어요.' end,
+              'none_body', '새 친구 요청이 있어요.'),   -- v1.39: 이 기기는 '알림 내용 표시 안 함'
     headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
     timeout_milliseconds := 8000
   );
@@ -755,7 +756,7 @@ begin
   select function_url, secret, show_preview into v_url, v_secret, v_preview from private.push_config where id = 1;
   if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return new; end if;
 
-  select jsonb_agg(jsonb_build_object('endpoint', s.endpoint, 'p256dh', s.p256dh, 'auth', s.auth))
+  select jsonb_agg(jsonb_build_object('endpoint', s.endpoint, 'p256dh', s.p256dh, 'auth', s.auth, 'preview', to_jsonb(s)->>'preview', 'popup', to_jsonb(s)->'popup'))
     into v_subs
     from push_subscriptions s
     join room_members m on m.user_id = s.user_id and m.room_id = new.room_id
@@ -793,6 +794,7 @@ begin
     url := v_url,
     body := jsonb_build_object(
       'subs', v_subs, 'title', v_title, 'body', v_body,
+      'name_body', '새 메시지가 도착했어요.', 'none_body', '새 메시지가 도착했어요.',   -- v1.39: 기기마다 '이름만'·'표시 안 함'
       'room_id', new.room_id, 'message_id', new.id),
     headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
     timeout_milliseconds := 8000
@@ -1632,7 +1634,7 @@ begin
   if to_regclass('private.push_config') is null then return; end if;
   select function_url, secret, show_preview into v_url, v_secret, v_preview from private.push_config where id = 1;
   if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return; end if;
-  select jsonb_agg(jsonb_build_object('endpoint', s.endpoint, 'p256dh', s.p256dh, 'auth', s.auth))
+  select jsonb_agg(jsonb_build_object('endpoint', s.endpoint, 'p256dh', s.p256dh, 'auth', s.auth, 'preview', to_jsonb(s)->>'preview', 'popup', to_jsonb(s)->'popup'))
     into v_subs
     from push_subscriptions s join profiles p on p.id = s.user_id and p.status = 'active'
    where s.user_id = p_to;
@@ -1642,7 +1644,8 @@ begin
     body := jsonb_build_object('subs', v_subs, 'title', case when p_via = 'invite' then '새 친구' else '친구 연결' end,
               'body', case when not coalesce(v_preview, true) then '새 친구가 생겼어요.'
                            when p_via = 'invite' then coalesce(v_name, '회원') || '님이 내 초대 링크로 친구가 됐어요. 이제 대화할 수 있어요.'
-                           else '관리자가 ' || coalesce(v_name, '회원') || '님과 친구로 연결해 줬어요. 이제 대화할 수 있어요.' end),
+                           else '관리자가 ' || coalesce(v_name, '회원') || '님과 친구로 연결해 줬어요. 이제 대화할 수 있어요.' end,
+              'none_body', '새 친구가 생겼어요.'),
     headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
     timeout_milliseconds := 8000
   );
@@ -2346,7 +2349,7 @@ begin
   if to_regclass('private.push_config') is null then return; end if;
   execute 'select function_url, secret from private.push_config where id = 1' into v_url, v_secret;
   if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return; end if;
-  execute 'select jsonb_agg(jsonb_build_object(''endpoint'', s.endpoint, ''p256dh'', s.p256dh, ''auth'', s.auth))
+  execute 'select jsonb_agg(jsonb_build_object(''endpoint'', s.endpoint, ''p256dh'', s.p256dh, ''auth'', s.auth, ''preview'', to_jsonb(s)->>''preview'', ''popup'', to_jsonb(s)->''popup''))
              from push_subscriptions s join profiles p on p.id = s.user_id and p.is_admin and p.status = ''active'''
      into v_subs;
   if v_subs is null then return; end if;
@@ -2527,13 +2530,14 @@ begin
   if coalesce(cardinality(p_users), 0) = 0 or to_regclass('private.push_config') is null then return; end if;
   execute 'select function_url, secret from private.push_config where id = 1' into v_url, v_secret;
   if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return; end if;
-  execute 'select jsonb_agg(jsonb_build_object(''endpoint'', s.endpoint, ''p256dh'', s.p256dh, ''auth'', s.auth))
+  execute 'select jsonb_agg(jsonb_build_object(''endpoint'', s.endpoint, ''p256dh'', s.p256dh, ''auth'', s.auth, ''preview'', to_jsonb(s)->>''preview'', ''popup'', to_jsonb(s)->''popup''))
              from push_subscriptions s join profiles p on p.id = s.user_id and p.status in (''active'', ''pending'')
             where s.user_id = any ($1)' into v_subs using p_users;
   if v_subs is null then return; end if;
   perform net.http_post(
     url := v_url,
-    body := jsonb_build_object('subs', v_subs, 'title', p_title, 'body', p_body),
+    body := jsonb_build_object('subs', v_subs, 'title', p_title, 'body', p_body,
+              'name_body', '새 알림이 있어요.', 'none_body', '새 알림이 있어요.'),   -- v1.39: 문의 제목 등은 '이름'·'표시 안 함' 기기에서 숨김
     headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
     timeout_milliseconds := 8000
   );
@@ -2793,8 +2797,8 @@ begin
   end if;
   execute 'select function_url, secret from private.push_config where id = 1' into v_url, v_secret;
   if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return jsonb_build_object('status', 'not_setup', 'devices', 0); end if;
-  execute 'select count(*)::int, jsonb_agg(jsonb_build_object(''endpoint'', endpoint, ''p256dh'', p256dh, ''auth'', auth))
-             from push_subscriptions where user_id = $1' into v_n, v_subs using v_target;
+  execute 'select count(*)::int, jsonb_agg(jsonb_build_object(''endpoint'', s.endpoint, ''p256dh'', s.p256dh, ''auth'', s.auth, ''popup'', to_jsonb(s)->''popup''))
+             from push_subscriptions s where s.user_id = $1' into v_n, v_subs using v_target;
   if coalesce(v_n, 0) = 0 then
     insert into private.push_tests (user_id, by_admin, devices) values (v_target, case when v_target <> v_me then v_me end, 0);
     return jsonb_build_object('status', 'no_device', 'devices', 0);
@@ -3163,7 +3167,7 @@ returns jsonb language sql stable security definer set search_path = public, pri
                             'media_keep_from', (select media_keep_from from private.app_settings where id = 1),
                             'msg_keep_days', public.msg_keep_days(),
                             'msg_keep_from', (select msg_keep_from from private.app_settings where id = 1),
-                            'db_version', '1.26');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
+                            'db_version', '1.28');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
 $$;
 
 -- 회원 앱: 내 방에서 보관 기간이 지난 사진·파일을 몇 개씩 받아 저장 공간에서 지움
@@ -3709,6 +3713,10 @@ create trigger profiles_avatar_guard before update of avatar_url on public.profi
 do $do$
 begin
   if to_regclass('public.push_subscriptions') is not null then
+    -- v1.39: 기기마다 알림 표시 — preview: 'full'(이름 + 메시지) · 'name'(이름만) · 'none'(표시 안 함), popup: 끼리톡 앱의 알림 팝업
+    execute $a$alter table public.push_subscriptions add column if not exists preview text not null default 'full' check (preview in ('full', 'name', 'none'))$a$;
+    execute 'alter table public.push_subscriptions add column if not exists popup boolean not null default true';
+    execute 'alter table public.push_subscriptions add column if not exists prefs_at bigint not null default 0';   -- 표시 설정을 고른 때(휴대폰 시각, ms) — 늦게 도착한 예전 값이 새 값을 덮지 않게
     execute $f$
 create or replace function public.save_push_subscription(
   p_endpoint text, p_p256dh text, p_auth text, p_user_agent text default null)
@@ -3734,11 +3742,14 @@ $f$;
     execute 'revoke execute on function public.save_push_subscription(text, text, text, text) from public, anon';
     execute 'grant execute on function public.save_push_subscription(text, text, text, text) to authenticated';
     -- v1.26: 끼리톡 앱 2.0 의 기기 등록 (구글 알림 서비스 토큰 → endpoint 'fcm:<토큰>', 보내는 곳은 send-push 함수)
+    -- v1.27: 알림 소리(p_sound) 추가 — 예전 2칸짜리 함수는 지우고 새로 (같은 이름이 두 개면 헷갈림)
+    execute 'drop function if exists public.save_app_push_token(text, text)';
     execute $f$
-create or replace function public.save_app_push_token(p_token text, p_user_agent text default null)
+create or replace function public.save_app_push_token(p_token text, p_user_agent text default null, p_sound text default null)
 returns void language plpgsql security definer set search_path = public as $$
 declare
   v_ep text;
+  v_snd text := case when p_sound ~ '^[a-z0-9]{1,20}$' then p_sound else '-' end;   -- v1.27: 이 휴대폰의 알림 소리 (앱 기기는 p256dh 칸에 저장, '-' = 기본)
 begin
   if auth.uid() is null then raise exception '로그인이 필요해요'; end if;
   if not public.is_active() then raise exception '사용할 수 없는 계정이에요'; end if;
@@ -3751,18 +3762,59 @@ begin
       select endpoint from push_subscriptions where user_id = auth.uid() and endpoint <> v_ep order by created_at limit 1);
   end if;
   insert into push_subscriptions (endpoint, user_id, p256dh, auth, user_agent)
-  values (v_ep, auth.uid(), '-', '-', left(p_user_agent, 200))
+  values (v_ep, auth.uid(), v_snd, '-', left(p_user_agent, 200))
   on conflict (endpoint) do update
     set user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,
         user_agent = excluded.user_agent, created_at = now();
 end;
 $$;
 $f$;
-    execute 'revoke execute on function public.save_app_push_token(text, text) from public, anon';
-    execute 'grant execute on function public.save_app_push_token(text, text) to authenticated';
+    execute 'revoke execute on function public.save_app_push_token(text, text, text) from public, anon';
+    execute 'grant execute on function public.save_app_push_token(text, text, text) to authenticated';
   end if;
 end
 $do$;
+
+-- v1.39: 이 기기의 알림 표시 (알림 내용·팝업) — 다른 사람 기기는 못 바꿈. 알림 설정 전이면 false
+--   p_at: 휴대폰에서 고른 때 — 저장된 것보다 예전 값이면 무시 (느린 인터넷에서 순서가 뒤바뀌어도 마지막에 고른 값이 남게)
+drop function if exists public.set_push_prefs(text, text, boolean);
+create or replace function public.set_push_prefs(p_endpoint text, p_preview text, p_popup boolean default true, p_at bigint default null)
+returns boolean language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then raise exception '로그인이 필요해요'; end if;
+  if p_preview is null or p_preview not in ('full', 'name', 'none') then raise exception '잘못된 알림 표시 설정이에요'; end if;
+  if to_regclass('public.push_subscriptions') is null then return false; end if;
+  update push_subscriptions set preview = p_preview, popup = coalesce(p_popup, true), prefs_at = coalesce(p_at, prefs_at)
+   where endpoint = p_endpoint and user_id = auth.uid() and (p_at is null or p_at >= prefs_at);
+  return found;
+end;
+$$;
+revoke execute on function public.set_push_prefs(text, text, boolean, bigint) from public, anon;
+grant execute on function public.set_push_prefs(text, text, boolean, bigint) to authenticated;
+
+-- v1.39: 기기 등록 + 표시 설정을 한 번에 (새 기기 정보가 '이름 + 메시지'로 잠깐이라도 생기지 않게 — 같은 처리 안에서 저장)
+create or replace function public.save_push_device(
+  p_endpoint text, p_p256dh text, p_auth text, p_user_agent text default null,
+  p_preview text default 'full', p_popup boolean default true, p_at bigint default 0)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  perform public.save_push_subscription(p_endpoint, p_p256dh, p_auth, p_user_agent);
+  perform public.set_push_prefs(p_endpoint, case when p_preview in ('full', 'name', 'none') then p_preview else 'full' end, p_popup, coalesce(p_at, 0));
+end;
+$$;
+create or replace function public.save_app_device(
+  p_token text, p_user_agent text default null, p_sound text default null,
+  p_preview text default 'full', p_popup boolean default true, p_at bigint default 0)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  perform public.save_app_push_token(p_token, p_user_agent, p_sound);
+  perform public.set_push_prefs('fcm:' || p_token, case when p_preview in ('full', 'name', 'none') then p_preview else 'full' end, p_popup, coalesce(p_at, 0));
+end;
+$$;
+revoke execute on function public.save_push_device(text, text, text, text, text, boolean, bigint) from public, anon;
+revoke execute on function public.save_app_device(text, text, text, text, boolean, bigint) from public, anon;
+grant execute on function public.save_push_device(text, text, text, text, text, boolean, bigint) to authenticated;
+grant execute on function public.save_app_device(text, text, text, text, boolean, bigint) to authenticated;
 
 -- ---------------------------------------------------------------------
 -- 10. [관리자 지정] 'YOUR_ADMIN_ID' 를 내 아이디(앱에서 가입한 아이디)로 바꾸세요.

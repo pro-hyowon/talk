@@ -3,10 +3,10 @@
 // =====================================================================
 import { CONFIG } from './config.js';
 import { SPRITE } from './icons.js';
-import { STICKERS, stickerSvg } from './stickers.js';
+import { STICKERS, STICKER_PACKS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.37';
+const VERSION = '1.39';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -416,8 +416,9 @@ async function enablePush({ silent = false, granted = false } = {}) {
     if (sub && !sameServerKey(sub)) { try { await sub.unsubscribe(); } catch { /* 무시 */ } sub = null; }
     if (!sub) sub = await limitTime(push.subscribe(), 20000, '휴대폰의 알림 서비스가 응답하지 않아요');
   } catch (e) { throw stageErr(e, 'push'); }
-  try { await limitTime(api.savePush(sub, inKkiriStoreApp() ? 'store' : ''), 15000, '서버에 연결하지 못했어요'); } catch (e) { throw stageErr(e, 'save'); }
+  try { await limitTime(api.savePush(sub, inKkiriStoreApp() ? 'store' : '', dispSave()), 15000, '서버에 연결하지 못했어요'); } catch (e) { throw stageErr(e, 'save'); }
   S.pushOn = true;
+  S.pushEp = sub.endpoint;   // v1.39: 알림 표시는 위 저장에 함께 들어감
   return true;
 }
 function limitTime(p, ms, msg) {
@@ -436,13 +437,13 @@ async function disablePush() {
     try { await api.deletePush(sub.endpoint); } catch (e) { console.warn(e); }
     try { await sub.unsubscribe(); } catch { /* 무시 */ }
   }
-  S.pushOn = false;
+  S.pushOn = false; S.pushEp = '';
 }
 async function detachPush() {
   if (IN_APP) return disableAppPush({ logout: true });
   if (!push.supported()) return;
   try { const sub = await push.current(); if (sub) await api.deletePush(sub.endpoint); } catch (e) { console.warn(e); }
-  S.pushOn = false;
+  S.pushOn = false; S.pushEp = '';
 }
 function notifOn() {
   if (notifOffPref()) return false;
@@ -490,7 +491,7 @@ function appPushListen() {
       // 앱이 켜져 있는 동안 구글이 토큰을 바꿔 줌 → 알림을 켜 둔 상태면 서버에도 새로 저장
       if (S.entered && S.pushOn && !notifOffPref() && nat.saved !== v && appPushReady()) {
         const old = nat.saved;
-        api.saveAppPush(v).then(() => {
+        api.saveAppPush(v, appSoundKey(), dispSave()).then(() => {   // v1.39: 새 등록 정보에도 표시 설정 (함께 저장)
           nat.saved = v;
           if (old) api.deletePush('fcm:' + old).catch(() => {});   // 예전 토큰은 더 이상 안 쓰임
         }).catch((e) => console.warn('push token', e));
@@ -568,7 +569,8 @@ async function enableAppPush({ silent = false } = {}) {
   let tok;
   try { tok = await appRegister(); } catch (e) { throw stageErr(e, 'push'); }
   if (changed()) return false;
-  try { await limitTime(api.saveAppPush(tok), 15000, '서버에 연결하지 못했어요'); } catch (e) { throw stageErr(e, 'save'); }
+  if (popupSupported() && nat.ready) await limitTime(nat.ready, 6000, 'ready').catch(() => {});   // v1.39: 휴대폰의 알림 종류 준비가 끝난 뒤 (팝업 값을 정확히)
+  try { await limitTime(api.saveAppPush(tok, appSoundKey(), dispSave()), 15000, '서버에 연결하지 못했어요'); } catch (e) { throw stageErr(e, 'save'); }
   if (changed()) {
     if (who === S.uid) api.deletePush('fcm:' + tok).catch(() => appUnregister());
     else appUnregister();
@@ -663,7 +665,7 @@ async function runAppNotifTestInner() {
     const st = await appNotifStatus();
     if (!alive()) return;
     if (st.blocked) { closeIt(); showNotifHelp('denied', Object.assign(new Error('테스트 알림은 도착했지만 휴대폰 설정에서 알림이 꺼져 있음'), { stage: 'phone' })); return; }
-    set(`<h3>알림이 잘 도착했어요 👍</h3><p>서버에서 이 휴대폰까지 알림이 정상으로 와요.</p><p class="nh-note">지금은 ${esc(APP)}을 보고 있어서 알림창에는 띄우지 않았어요. 앱을 닫아 두거나 다른 앱을 쓰는 동안에는 <b>'끼톡!'</b> 소리와 함께 알림이 떠요.</p>
+    set(`<h3>알림이 잘 도착했어요 👍</h3><p>서버에서 이 휴대폰까지 알림이 정상으로 와요.</p><p class="nh-note">지금은 ${esc(APP)}을 보고 있어서 알림창에는 띄우지 않았어요. 앱을 닫아 두거나 다른 앱을 쓰는 동안에는 ${!knHas('setSound') ? `'끼톡!' 소리와 함께 알림이 떠요.` : soundPref() === 'none' ? '<b>소리 없이</b> 알림이 떠요(더보기 → 알림 소리에서 바꿀 수 있어요).' : `<b>더보기 → 알림 소리</b>에서 고른 소리(${esc(soundLabel(soundPref()).replace(' (기본)', ''))})와 함께 알림이 떠요.`}</p>
       <button class="btn" data-nt="ok" style="margin-top:14px">확인</button>`);
     const b = $('[data-nt="ok"]', sheet); if (b) b.onclick = () => closeIt();
     return;
@@ -1243,9 +1245,15 @@ async function sweepExpired() {
 // v1.22: 알림 소리 — 앱을 보고 있을 때 울릴 소리를 고름 (기기마다 저장)
 //   앱을 닫아 두었을 때 오는 휴대폰 알림의 소리는 웹앱이 정할 수 없어 휴대폰 설정에서 고르도록 안내
 // ---------------------------------------------------------------------
-const SOUNDS = [['kkitok', '끼톡! (기본)'], ['kkitok2', '끼톡 멜로디'], ['dingdong', '띵동'], ['pop', '뽁'], ['chime', '차임벨'], ['tok', '톡톡'], ['bell', '맑은 종'], ['none', '소리 없음']];
+// v1.38: 기본을 '끼톡 멜로디'로, 끼리톡 전용 소리 10가지 추가 (앱 2.0 의 KkiriSounds·서버 send-push 의 APP_SOUNDS 와 같은 목록)
+const DEFAULT_SOUND = 'kkitok2';
+const SOUNDS = [['kkitok2', '끼톡 멜로디 (기본)'], ['kkitok', '끼톡!'],
+  ['kkiriring', '끼리링'], ['drops', '퐁퐁퐁'], ['marimba', '마림바'], ['boing', '뾰롱'], ['knock', '똑똑'],
+  ['sparkle', '별빛'], ['dingdongdaeng', '딩동댕'], ['whistle', '휘릭'], ['harp', '하프'], ['musicbox', '오르골'],
+  ['dingdong', '띵동'], ['pop', '뽁'], ['chime', '차임벨'], ['tok', '톡톡'], ['bell', '맑은 종'], ['none', '소리 없음']];
 // v1.23: 끼리톡 전용 알림음 (파일) — 휴대폰 알림음으로도 쓸 수 있게 내려받기 제공
-const SOUND_FILES = { kkitok: ['./sounds/kkitok.mp3', 'kkitok.mp3'], kkitok2: ['./sounds/kkitok-melody.mp3', 'kkitok-melody.mp3'] };
+const SOUND_FILES = { kkitok: ['./sounds/kkitok.mp3', 'kkitok.mp3'], kkitok2: ['./sounds/kkitok-melody.mp3', 'kkitok-melody.mp3'],
+  ...Object.fromEntries(['kkiriring', 'drops', 'marimba', 'boing', 'knock', 'sparkle', 'dingdongdaeng', 'whistle', 'harp', 'musicbox'].map((k) => [k, [`./sounds/${k}.mp3`, `kkiritalk-${k}.mp3`]])) };
 const soundBufs = new Map();
 async function loadSoundBuf(name) {
   if (soundBufs.has(name)) return soundBufs.get(name);
@@ -1258,9 +1266,93 @@ async function loadSoundBuf(name) {
 }
 const SOUND_KEY = 'kkiri-sound'; const VIB_KEY = 'kkiri-vibrate';
 const soundLabel = (k) => (SOUNDS.find((x) => x[0] === k) || SOUNDS[0])[1];
-function soundPref() { try { const v = localStorage.getItem(SOUND_KEY); return SOUNDS.some((x) => x[0] === v) ? v : 'kkitok'; } catch { return S.sound || 'kkitok'; } }
+function soundPref() { try { const v = localStorage.getItem(SOUND_KEY); return SOUNDS.some((x) => x[0] === v) ? v : DEFAULT_SOUND; } catch { return S.sound || DEFAULT_SOUND; } }
 function vibratePref() { try { return localStorage.getItem(VIB_KEY) !== '0'; } catch { return S.vibrate !== false; } }
 function setSoundPref(k) { S.sound = k; try { localStorage.setItem(SOUND_KEY, k); } catch { /* 저장 안 됨 */ } }
+// v1.38: 끼리톡 앱 2.0 — 고른 소리를 앱을 닫아 두었을 때 오는 알림에도 (휴대폰에 그 소리 알림 종류를 만들고, 서버에도 저장)
+// 휴대폰(알림 종류)과 서버(보낼 소리)에 같은 소리를 저장 — 미리 듣기로 여러 개를 빠르게 눌러도 마지막 것만, 차례대로, 실패하면 다시
+const sndQ = { want: null, busy: false, timer: 0 };
+function applyAppSound(k = soundPref()) {
+  if (!IN_APP || !knHas('setSound')) return false;
+  sndQ.want = `${k}|${popupSupported() ? dispPref().popup : true}`;   // v1.39: 소리 + 알림 팝업
+  clearTimeout(sndQ.timer);
+  sndQ.timer = setTimeout(runAppSound, 400);
+  return true;
+}
+async function runAppSound() {
+  if (sndQ.busy) return;   // 돌고 있는 쪽이 바뀐 소리(sndQ.want)를 이어서 처리
+  sndQ.busy = true;
+  try {
+    let fails = 0;
+    for (;;) {
+      const want = sndQ.want; const [k, pop] = want.split('|');
+      try { notePopup(await limitTime(KN().setSound(popupSupported() ? { key: k, popup: pop !== 'false' } : { key: k }), 5000, 'sound')); } catch (e) { console.warn('sound', e); }
+      let ok = true;
+      if (S.pushOn && nat.saved && appPushReady()) { try { await limitTime(api.saveAppPush(nat.saved, k), 15000, 'sound save'); } catch (e) { ok = false; console.warn('sound save', e); } }
+      syncDisplay();   // v1.39: 팝업을 바꿨으면 서버도 (그 채널로 보내게)
+      appNotifStatus().catch(() => {});   // 새 알림 종류의 켜짐/꺼짐
+      if (sndQ.want !== want) { fails = 0; continue; }   // 그 사이에 또 바꿈 → 마지막 것으로 한 번 더
+      if (ok || ++fails >= 3) break;                  // 서버 저장 실패는 3번까지 (그래도 안 되면 다음에 앱을 켤 때 다시 저장돼요)
+      await new Promise((r) => setTimeout(r, 3000 * fails));
+    }
+  } finally { sndQ.busy = false; }
+}
+// 서버에 저장할 소리 — 소리 고르기를 모르는 예전 앱이면 보내지 않음(서버는 기본 소리로)
+const appSoundKey = () => (knHas('setSound') ? soundPref() : null);
+// v1.39: 휴대폰이 알려 준 지금의 알림 팝업 (setSound 결과)
+function notePopup(r) { if (r && typeof r.popup === 'boolean') nat.popup = r.popup; return r; }
+
+// ---------------------------------------------------------------------
+// v1.39: 알림 표시 — 이 휴대폰(기기)마다: 알림 내용(이름 + 메시지 / 이름 / 표시 안 함), 끼리톡 앱은 알림 팝업(받기 / 사용 안 함)
+//   서버의 기기 정보(push_subscriptions.preview·popup)에 저장 → send-push 가 기기마다 내용을 바꿔서 보냄
+// ---------------------------------------------------------------------
+const DISP_KEY = 'kkiri-notif-disp';
+const PREVIEWS = [['full', '이름 + 메시지'], ['name', '이름'], ['none', '표시 안 함']];
+function dispPref() {
+  let j = S.disp || {};
+  try { j = JSON.parse(localStorage.getItem(DISP_KEY) || 'null') || j; } catch { /* 저장 안 됨 */ }
+  return { preview: PREVIEWS.some((x) => x[0] === j.preview) ? j.preview : 'full', popup: j.popup !== false, at: Number(j.at) > 0 ? Number(j.at) : 0 };
+}
+function setDispPref(d) { d = { ...d, at: Math.max(Date.now(), (d.at || 0) + 1) }; S.disp = d; try { localStorage.setItem(DISP_KEY, JSON.stringify(d)); } catch { /* 저장 안 됨 */ } }
+// 서버에 보낼 표시 설정 — 팝업은 휴대폰이 실제로 적용했다고 알려 준 값 (그래야 서버가 휴대폰에 있는 알림 종류로 보냄)
+function dispForServer() {
+  const d = dispPref();
+  const popup = popupSupported() ? (typeof nat.popup === 'boolean' ? nat.popup : d.popup) : true;
+  return { preview: d.preview, popup, at: d.at };
+}
+// 서버 저장에 표시 설정도 함께 보낼 수 있는지 (데이터베이스 1.28 이상)
+const dispSave = () => (api.setPushPrefs && !dbOutdated() ? dispForServer() : undefined);
+const popupSupported = () => IN_APP && knHas('setPopup');   // 팝업 끄기는 이 기능이 들어간 끼리톡 앱에서만
+const previewLabel = (k) => (PREVIEWS.find((x) => x[0] === k) || PREVIEWS[0])[1];
+const pushEndpoint = () => (IN_APP ? (nat.saved ? 'fcm:' + nat.saved : '') : (S.pushEp || ''));
+// 이 기기의 알림 표시를 서버에 맞춤 — 기기 등록(저장) 뒤와 설정을 바꿀 때. 차례대로, 실패하면 2번 더
+const dispQ = { busy: false, again: false };
+async function syncDisplay() {
+  if (dispQ.busy) { dispQ.again = true; return; }
+  dispQ.busy = true;
+  try {
+    let fails = 0;
+    do {
+      dispQ.again = false;
+      const ep = pushEndpoint();
+      if (!S.pushOn || !ep || !api.setPushPrefs || dbOutdated()) return;
+      if (popupSupported() && nat.ready) await limitTime(nat.ready, 6000, 'ready').catch(() => {});
+      const d = dispForServer();
+      try { await limitTime(api.setPushPrefs(ep, d.preview, d.popup, d.at), 15000, 'display'); fails = 0; } catch (e) {
+        console.warn('display', e);
+        if (++fails < 3) { await new Promise((r) => setTimeout(r, 3000 * fails)); dispQ.again = true; }
+      }
+    } while (dispQ.again);
+  } finally { dispQ.busy = false; }
+}
+// 앱이 열려 있지만 화면을 내려 둔 동안 직접 띄우는 알림도 같은 규칙으로 (kind: msg · friend · conn)
+function notifContent(title, body, kind = 'msg') {
+  const p = dispPref().preview;
+  const hidden = kind === 'msg' ? '새 메시지가 도착했어요.' : kind === 'friend' ? '새 친구 요청이 있어요.' : '새 친구가 생겼어요.';
+  if (p === 'name') return [title, kind === 'msg' ? hidden : body];
+  if (p === 'none') return [APP, hidden];
+  return [title, body];
+}
 function setVibratePref(on) { S.vibrate = on; try { localStorage.setItem(VIB_KEY, on ? '1' : '0'); } catch { /* 저장 안 됨 */ } }
 let audioCtx = null;
 function getAudio() {
@@ -1322,6 +1414,44 @@ const PHONE_GUIDE = {
   ios: ['아이폰', `<p>아이폰은 홈 화면에 추가한 앱의 알림 소리를 따로 고를 수 없고, 아이폰 기본 알림음이 울려요.</p><ol><li><b>설정</b> → <b>알림</b> → <b>${esc(APP)}</b></li><li><b>사운드</b>를 켜거나 끌 수 있어요</li></ol>`],
   pc: ['컴퓨터', '<p>컴퓨터는 운영체제(윈도우·맥) 알림 설정에서 브라우저 알림 소리를 바꿀 수 있어요.</p>'],
 };
+// v1.39: 알림 표시 (알림 팝업 · 알림 내용)
+const dispSub = () => { const d = dispPref(); return `알림 내용: ${previewLabel(d.preview)}${popupSupported() ? ` · 팝업 ${d.popup ? '받기' : '사용 안 함'}` : ''}`; };
+function showDisplaySettings() {
+  const row = (attr, k, label, on) => `<button class="snd-row ${on ? 'on' : ''}" ${attr}="${k}" role="radio" aria-checked="${on}"><span>${esc(label)}</span><span class="ck">${ic('check', 16)}</span></button>`;
+  const demo = () => {
+    const [t, b] = notifContent('앨리스', '내일 몇 시에 볼까? 😀');
+    return `<img class="dd-ic" src="./icons/icon-192.png" alt="" width="28" height="28"><span class="dd-tx"><b>${esc(t)}</b><span>${esc(b)}</span></span>`;
+  };
+  const d0 = dispPref();
+  openSheet({
+    title: '알림 표시',
+    body: `${popupSupported() ? `<div class="snd-sec">알림 팝업</div>
+      <p class="sheet-desc" style="margin-top:0">새 메시지가 오면 화면 위쪽에 잠깐 띄워 보여 줘요. 사용 안 함을 고르면 소리만 나고 알림창에 조용히 쌓여요.</p>
+      <div class="card snd-list" role="radiogroup" aria-label="알림 팝업">${row('data-pop', 'on', '받기', d0.popup)}${row('data-pop', 'off', '사용 안 함', !d0.popup)}</div>` : ''}
+      <div class="snd-sec">알림 내용</div>
+      <p class="sheet-desc" style="margin-top:0">휴대폰 알림창과 잠금 화면에 보이는 내용이에요. 다른 사람이 볼까 걱정되면 '이름'이나 '표시 안 함'을 골라 주세요.</p>
+      <div class="card snd-list" role="radiogroup" aria-label="알림 내용">${PREVIEWS.map(([k, l]) => row('data-prev', k, l, d0.preview === k)).join('')}</div>
+      <div class="disp-demo" id="dispDemo" aria-label="알림 미리 보기">${demo()}</div>
+      <p class="sheet-desc">이 휴대폰에만 적용돼요. 다른 기기는 그 기기에서 따로 골라 주세요.</p>
+      ${S.pushOn ? '' : `<p class="sheet-desc">지금은 알림이 꺼져 있어요. 알림을 켜면 이 설정대로 보여 드려요.</p>`}
+      <button class="btn" data-close style="margin-top:6px">확인</button>`,
+    onMount(sheet) {
+      sheet.addEventListener('click', (e) => {
+        const pv = e.target.closest('[data-prev]');
+        const pp = e.target.closest('[data-pop]');
+        if (!pv && !pp) return;
+        const d = dispPref();
+        if (pv) d.preview = pv.dataset.prev; else d.popup = pp.dataset.pop === 'on';
+        setDispPref(d);
+        $$(pv ? '[data-prev]' : '[data-pop]', sheet).forEach((b) => { const on = b === (pv || pp); b.classList.toggle('on', on); b.setAttribute('aria-checked', on); });
+        const dm = $('#dispDemo', sheet); if (dm) dm.innerHTML = demo();
+        if (pp) applyAppSound(); else syncDisplay();   // 팝업은 휴대폰 알림 종류도 바꿈 (그 뒤 서버도 맞춤)
+        if (S.tab === 'more' && !S.room) renderMain();
+      });
+    },
+  });
+}
+
 function showSoundSettings() {
   const kind = phoneKind();
   const canVib = 'vibrate' in navigator && kind !== 'ios' && kind !== 'pc';
@@ -1332,21 +1462,32 @@ function showSoundSettings() {
       <div class="card snd-list">${SOUNDS.map(([k, l]) => `<button class="snd-row ${soundPref() === k ? 'on' : ''}" data-snd="${k}" role="radio" aria-checked="${soundPref() === k}"><span>${esc(l)}</span><span class="ck">${ic('check', 16)}</span></button>`).join('')}
         ${canVib ? `<div class="snd-row vib"><span>진동도 함께</span><button class="switch ${vibratePref() ? 'on' : ''}" data-vib role="switch" aria-checked="${vibratePref()}" aria-label="진동"></button></div>` : ''}</div>
       <div class="snd-sec">앱을 닫아 두었을 때 (휴대폰 알림)</div>
-      ${IN_APP ? `<p class="sheet-desc" style="margin-top:0">${esc(APP)} 앱의 기본 알림 소리는 <b>'끼톡!'</b>이에요. 다른 소리로 바꾸려면 휴대폰 <b>설정 → 애플리케이션 → ${esc(APP)} → 알림 → 새 메시지 알림 → 소리</b>에서 바꿀 수 있어요.</p>` : `
+      ${IN_APP ? (knHas('setSound') ? `<p class="sheet-desc" style="margin-top:0">위에서 고른 소리가 <b>앱을 닫아 두었을 때 오는 알림</b>에도 똑같이 울려요. 기본은 <b>'끼톡 멜로디'</b>예요.</p>`
+        : `<p class="sheet-desc" style="margin-top:0">${esc(APP)} 앱의 기본 알림 소리는 <b>'끼톡!'</b>이에요. 다른 소리로 바꾸려면 휴대폰 <b>설정 → 애플리케이션 → ${esc(APP)} → 알림 → 새 메시지 알림 → 소리</b>에서 바꿀 수 있어요.</p>`) : `
       <p class="sheet-desc" style="margin-top:0">휴대폰에 뜨는 알림의 소리는 <b>휴대폰 설정</b>에서 바꿀 수 있어요. 휴대폰 기본 알림음이나 다른 소리를 고를 수 있어요.</p>
       <div class="snd-guide"><b>${PHONE_GUIDE[kind][0]}</b>${PHONE_GUIDE[kind][1]}</div>
-      ${kind === 'ios' ? '' : `<div class="snd-sec">휴대폰 알림음을 '끼톡!' 으로 바꾸기</div>
+      ${kind === 'ios' ? '' : `<div class="snd-sec">휴대폰 알림음을 끼리톡 소리로 바꾸기</div>
       <p class="sheet-desc" style="margin-top:0">소리 파일을 받아 두면 위 방법의 <b>소리</b> 화면에서 고를 수 있어요. (목록 맨 위의 <b>+</b> 또는 <b>내 소리 추가</b>를 누르고 '다운로드(Download)' 폴더의 kkitok 파일 선택)</p>
-      <div class="snd-dl">${Object.entries(SOUND_FILES).map(([k, [u, fn]]) => `<a class="btn line sm" href="${u}" download="${fn}" data-dl="${k}">${ic('download', 16)}${esc(soundLabel(k).replace(' (기본)', ''))} 받기</a>`).join('')}</div>`}
+      <div class="snd-dl">${['kkitok2', 'kkitok'].map((k) => [k, SOUND_FILES[k]]).map(([k, [u, fn]]) => `<a class="btn line sm" href="${u}" download="${fn}" data-dl="${k}">${ic('download', 16)}${esc(soundLabel(k).replace(' (기본)', ''))} 받기</a>`).join('')}<a class="btn line sm" id="sndDlPick" href="#" hidden>${ic('download', 16)}<span></span></a></div>`}
       <details class="snd-other"><summary>다른 휴대폰은?</summary>${Object.entries(PHONE_GUIDE).filter(([k]) => k !== kind && k !== 'pc').map(([, [n, h]]) => `<div class="snd-guide"><b>${n}</b>${h}</div>`).join('')}</details>`}
       <button class="btn" data-close style="margin-top:14px">확인</button>`,
     onMount(sheet) {
+      // v1.38: 브라우저 — 지금 고른 끼리톡 소리 파일도 받을 수 있게 (휴대폰 알림음으로 쓰려면)
+      const sndDlUpdate = () => {
+        const a = $('#sndDlPick', sheet); if (!a) return;
+        const k = soundPref(); const f = SOUND_FILES[k];
+        a.hidden = !f || k === 'kkitok' || k === 'kkitok2';
+        if (f) { a.href = f[0]; a.setAttribute('download', f[1]); a.dataset.dl = k; $('span', a).textContent = `${soundLabel(k)} 받기`; }
+      };
+      sndDlUpdate();
       sheet.addEventListener('click', (e) => {
         const r = e.target.closest('[data-snd]');
         if (r) {
           setSoundPref(r.dataset.snd);
           $$('[data-snd]', sheet).forEach((b) => { const on = b === r; b.classList.toggle('on', on); b.setAttribute('aria-checked', on); });
           playSound(r.dataset.snd);
+          applyAppSound(r.dataset.snd);   // v1.38: 앱 — 휴대폰 알림 소리도
+          sndDlUpdate();
           if (S.tab === 'more' && !S.room) renderMain();
           return;
         }
@@ -1401,7 +1542,7 @@ function maybeAskNotif(tries = 0) {
   }, 1500);
 }
 
-// v1.27: 알림을 켠 안드로이드 휴대폰에 한 번만 — 앱을 닫아 두었을 때도 '끼톡!' 으로 울리게 하는 방법 안내
+// v1.27: 알림을 켠 안드로이드 휴대폰에 한 번만 — 앱을 닫아 두었을 때도 끼리톡 소리(v1.38: 기본 '끼톡 멜로디')로 울리게 하는 방법 안내
 //   (앱을 닫았을 때 오는 알림의 소리는 웹앱이 정할 수 없고, 휴대폰 설정에서 소리 파일을 골라야 함)
 const SND_TIP_KEY = 'kkiri-snd-tip';
 function maybeSoundTip() {
@@ -1413,15 +1554,15 @@ function maybeSoundTip() {
     if ($('.sheet-back')) return;
     openSheet({
       title: '끼톡 알림음', bare: true,
-      body: `<div class="confirm notif-ask"><span class="notif-ask-ic">${ic('bell', 30)}</span><h3>앱을 닫아도 '끼톡!' 으로 울리게 할까요?</h3>
-        <p>앱을 보고 있을 때는 '끼톡!' 이 울리지만, <b>앱을 닫아 두었을 때 오는 알림 소리는 휴대폰이 정해요.</b><br>소리 파일을 받아 휴대폰 설정에서 ${esc(APP)} 알림음으로 한 번만 골라 두면 늘 '끼톡!' 으로 울려요.</p></div>
-        <div class="btn-col" style="gap:8px"><a class="btn" href="${SOUND_FILES.kkitok[0]}" download="${SOUND_FILES.kkitok[1]}" data-tip-dl>${ic('download', 18)}끼톡 소리 받기</a>
+      body: `<div class="confirm notif-ask"><span class="notif-ask-ic">${ic('bell', 30)}</span><h3>앱을 닫아도 끼톡 소리로 울리게 할까요?</h3>
+        <p>앱을 보고 있을 때는 '끼톡 멜로디'가 울리지만, <b>앱을 닫아 두었을 때 오는 알림 소리는 휴대폰이 정해요.</b><br>소리 파일을 받아 휴대폰 설정에서 ${esc(APP)} 알림음으로 한 번만 골라 두면 늘 끼톡 소리로 울려요.</p></div>
+        <div class="btn-col" style="gap:8px"><a class="btn" href="${SOUND_FILES.kkitok2[0]}" download="${SOUND_FILES.kkitok2[1]}" data-tip-dl>${ic('download', 18)}끼톡 멜로디 받기</a>
           <button class="btn line" data-tip-how>설정 방법 보기</button>
           <button class="btn text" data-no>다음에</button></div>`,
       onMount(sheet, close) {
         $('[data-no]', sheet).onclick = () => { close(); toast('더보기 → 알림 소리에서 언제든 할 수 있어요'); };
         $('[data-tip-how]', sheet).onclick = () => { close(); setTimeout(showSoundSettings, 250); };
-        $('[data-tip-dl]', sheet).addEventListener('click', () => { setTimeout(() => { close(); setTimeout(showSoundSettings, 250); toast("받은 파일(kkitok)을 휴대폰 알림 소리에서 골라 주세요", { ms: 4500 }); }, 400); });
+        $('[data-tip-dl]', sheet).addEventListener('click', () => { setTimeout(() => { close(); setTimeout(showSoundSettings, 250); toast("받은 파일(kkitok-melody)을 휴대폰 알림 소리에서 골라 주세요", { ms: 4500 }); }, 400); });
       },
     });
   }, 1800);
@@ -1878,6 +2019,7 @@ function renderMore(head, body) {
       <div class="item tap" data-act="notif-row"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림<span class="sub">${nb ? esc(nb.text) : notifSub(on)}</span></span>
         <button class="switch ${on ? 'on' : ''}${nb ? ' busy' : ''}" data-act="notif" role="switch" aria-checked="${on}" aria-busy="${nb ? 'true' : 'false'}" aria-label="새 메시지 알림"></button></div>
       <button class="item" data-act="notif-sound"><span class="tile lemon">${ic('bell', 19)}</span><span class="label">알림 소리<span class="sub">${esc(soundLabel(soundPref()))}${vibratePref() && 'vibrate' in navigator ? ' · 진동' : ''} · 휴대폰 알림음 바꾸기</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      ${api.setPushPrefs && !dbOutdated() && (IN_APP ? appPushReady() : push.supported()) ? `<button class="item" data-act="notif-display"><span class="tile sky">${ic('chat', 19)}</span><span class="label">알림 표시<span class="sub">${esc(dispSub())}</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>` : ''}
       ${api.sendTestPush && !dbOutdated() && (!IN_APP || appPushReady()) ? `<button class="item" data-act="notif-test"><span class="tile mint">${ic('send', 19)}</span><span class="label">알림 테스트<span class="sub">내 휴대폰으로 알림이 오는지 확인해요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>` : ''}
       ${isStandalone() ? '' : `<button class="item" data-act="install"><span class="tile mint">${ic('install', 19)}</span><span class="label">홈 화면에 설치</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>`}
     </div>
@@ -2665,6 +2807,7 @@ function stkHtml(id, size = 120) {
   return `<img class="cst" src="${esc(c.url)}" width="${size}" height="${size}" alt="${esc(c.title)}" loading="lazy" decoding="async" draggable="false">`;
 }
 const RECENT_KEY = 'minitalk-recent-stickers';
+const STK_TAB_KEY = 'kkiri-stk-tab';   // v1.38: 이모티콘 창에서 마지막으로 본 탭
 function recentStickers() {
   try { const v = JSON.parse(localStorage.getItem(RECENT_KEY) || '[]'); return Array.isArray(v) ? v.filter(stickerOk).slice(0, 8) : []; }
   catch { return []; }
@@ -2682,13 +2825,30 @@ function toggleStickers(open) {
     const label = (id) => (isCustom(id) ? (S.cst.get(id) || {}).title : (STICKERS.find((x) => x.id === id) || {}).label) || '이모티콘';
     const cell = (id) => `<button class="stk" data-act="pick-sticker" data-id="${esc(id)}" aria-label="${esc(label(id))} 이모티콘">${stkHtml(id, 76)}</button>`;
     const extra = [...S.cst.values()].filter((c) => c.active).map((c) => c.id);
-    panel.innerHTML = `${rec.length ? `<div class="stk-sec">최근 사용</div><div class="stk-grid">${rec.map(cell).join('')}</div>` : ''}
-      ${extra.length ? `<div class="stk-sec">새 이모티콘</div><div class="stk-grid">${extra.map(cell).join('')}</div>` : ''}
-      ${rec.length || extra.length ? '<div class="stk-sec">톡이</div>' : ''}<div class="stk-grid">${STICKERS.map((x) => cell(x.id)).join('')}</div>`;
-    panel.scrollTop = 0;
+    // v1.38: 탭 — 최근 · 톡이 · 친구 · 연인 · 가족 · 직장 · (운영자가 올린) 새 이모티콘. 고른 탭은 기억
+    const tabs = [...(rec.length ? [['recent', '최근', rec]] : []), ...STICKER_PACKS.map((pk) => [pk.id, pk.name, pk.list.map((x) => x.id)]), ...(extra.length ? [['custom', '새 이모티콘', extra]] : [])];
+    let cur = S.stkTab;
+    if (!cur) { try { cur = localStorage.getItem(STK_TAB_KEY); } catch { /* 저장 안 됨 */ } }
+    if (!tabs.some((t) => t[0] === cur)) cur = rec.length ? 'recent' : 'toki';
+    const showTab = (id) => {
+      S.stkTab = id;
+      try { localStorage.setItem(STK_TAB_KEY, id); } catch { /* 저장 안 됨 */ }
+      const t = tabs.find((x) => x[0] === id) || tabs[0];
+      $$('.stk-tab', panel).forEach((b) => { const on = b.dataset.tab === t[0]; b.classList.toggle('on', on); b.setAttribute('aria-selected', String(on)); });
+      const g = $('#stkGrid', panel); if (g) g.innerHTML = t[2].map(cell).join('');
+      const pick = S.room && S.room.pick; if (pick) $$('.stk', panel).forEach((b) => b.classList.toggle('on', b.dataset.id === pick));
+      panel.scrollTop = 0;
+    };
+    panel.innerHTML = `<div class="stk-tabs" role="tablist" aria-label="이모티콘 묶음">${tabs.map(([id, name]) => `<button type="button" class="stk-tab" role="tab" data-tab="${id}" aria-selected="false">${esc(name)}</button>`).join('')}</div>
+      <div class="stk-grid" id="stkGrid" role="tabpanel"></div>`;
+    $$('.stk-tab', panel).forEach((b) => { b.onclick = (e) => { e.stopPropagation(); showTab(b.dataset.tab); }; });
+    showTab(cur);
     const ta = $('#msgInput'); if (ta) ta.blur();
   }
   panel.hidden = !show;
+  if (show) requestAnimationFrame(() => {   // 보이게 된 뒤에 고른 탭이 화면 안에 오게 (좁은 휴대폰)
+    const onTab = $('.stk-tab.on', panel); if (onTab && onTab.scrollIntoView) onTab.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  });
   if (b) { b.classList.toggle('on', show); b.setAttribute('aria-expanded', String(show)); }
   if (show && S.room && S.room.atBottom) requestAnimationFrame(() => scrollBottom());
 }
@@ -3796,8 +3956,9 @@ function maybeNotify(m) {
   if (document.hidden) {
     if (S.pushOn) return; // 서버 알림(Web Push)이 대신 보여 줌
     if (localNotifOk()) {
-      navigator.serviceWorker.ready.then((reg) => reg.showNotification(title, {
-        body: text.slice(0, 120), tag: m.room_id, renotify: true,
+      const [nt, nb] = notifContent(title, text.slice(0, 120));   // v1.39: 알림 내용 설정
+      navigator.serviceWorker.ready.then((reg) => reg.showNotification(nt, {
+        body: nb, tag: m.room_id, renotify: true,
         icon: './icons/icon-192.png', badge: './icons/badge-72.png',
         data: { url: './#/room/' + m.room_id },
       })).catch(() => {});
@@ -4002,7 +4163,8 @@ function onFriend(p) {
   if (document.hidden) {
     if (S.pushOn) return; // 서버 알림이 대신 보여 줌
     if (localNotifOk()) {
-      navigator.serviceWorker.ready.then((reg) => reg.showNotification('친구 요청', { body: text, tag: 'friend-' + p.from_id, icon: './icons/icon-192.png', badge: './icons/badge-72.png', data: { url: './#/friends' } })).catch(() => {});
+      const [nt, nb] = notifContent('친구 요청', text, 'friend');
+      navigator.serviceWorker.ready.then((reg) => reg.showNotification(nt, { body: nb, tag: 'friend-' + p.from_id, icon: './icons/icon-192.png', badge: './icons/badge-72.png', data: { url: './#/friends' } })).catch(() => {});
     }
     return;
   }
@@ -4390,7 +4552,7 @@ async function renderHomeSec() {
 }
 
 // ---------- v1.20.2: 데이터베이스(schema.sql) 버전 확인 ----------
-const DB_VERSION_NEEDED = '1.26';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
+const DB_VERSION_NEEDED = '1.28';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
 const verNum = (v) => String(v || '0').split('.').reduce((a, x, i) => a + (Number(x) || 0) / (1000 ** i), 0);
 const dbOutdated = () => verNum(S.dbVersion) < verNum(DB_VERSION_NEEDED);
 function dbUpdateCard() {
@@ -5227,7 +5389,8 @@ function onConnected(p) {
   if (document.hidden) {
     if (S.pushOn) return;   // 서버 알림이 대신 보여 줌
     if (localNotifOk()) {
-      navigator.serviceWorker.ready.then((reg) => reg.showNotification(invite ? '새 친구' : '친구 연결', { body: text, tag: 'conn-' + p.friend_id, icon: './icons/icon-192.png', badge: './icons/badge-72.png', data: { url: './#/friends' } })).catch(() => {});
+      const [nt, nb] = notifContent(invite ? '새 친구' : '친구 연결', text, 'conn');
+      navigator.serviceWorker.ready.then((reg) => reg.showNotification(nt, { body: nb, tag: 'conn-' + p.friend_id, icon: './icons/icon-192.png', badge: './icons/badge-72.png', data: { url: './#/friends' } })).catch(() => {});
     }
     return;
   }
@@ -5390,6 +5553,7 @@ app.addEventListener('click', async (e) => {
     case 'admin-clean': cleanOrphans(false, el); break;
     case 'admin-clean-expired': cleanExpired(false, el); break;
     case 'notif-sound': showSoundSettings(); break;   // v1.22
+    case 'notif-display': showDisplaySettings(); break;   // v1.39
     case 'admin-purge-msgs': {   // v1.21
       if (!S.msgKeepDays) { toast('대화 보관 기간이 \'기간 없이\' 로 되어 있어요'); break; }
       if (!(await ask('기간 지난 대화를 지금 지울까요?', `보낸 지 ${S.msgKeepDays}일이 지난 대화(글)를 서버에서 지워요. 되돌릴 수 없어요.`, '지우기', true))) break;
@@ -5499,6 +5663,7 @@ async function checkInstallReferrer() {
 }
 function setupNativeApp() {
   appPushListen();   // v1.35: 알림을 눌러 앱이 켜진 경우도 놓치지 않게 가장 먼저
+  if (knHas('setSound')) nat.ready = KN().setSound(popupSupported() ? { key: soundPref(), popup: dispPref().popup } : { key: soundPref() }).then(notePopup).catch(() => {});   // v1.38: 고른 알림 소리의 알림 종류 준비
   checkInstallReferrer();   // v1.36
   const App = capPlugin('App');
   if (!App) return;

@@ -16,7 +16,7 @@ function friendly(error) {
     [/captcha/i, '로봇이 아닌지 확인하지 못했어요. 잠시 후 다시 시도해 주세요'],   // v1.28
     [/너무 빨리 보내고/, '메시지를 너무 빨리 보내고 있어요. 잠시 후 다시 보내 주세요'],
     [/banned/i, '이용이 정지된 계정이에요. 관리자에게 문의해 주세요'],
-    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|claim_phone|edit_message|my_suspension|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|admin_remove_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad|block_user|unblock_user|my_blocks|report_content|agree_terms|my_media_files|delete_my_account|refresh_my_status|create_inquiry|my_inquiries|inquiry_thread|reply_inquiry|close_inquiry|app_info|expired_media|admin_expired_media|admin_usage|admin_set_usage_settings|admin_purge_messages|admin_add_sticker|admin_set_sticker|admin_delete_sticker|admin_move_sticker|admin_log_action|send_test_push|test_push_result|admin_push_info|save_app_push_token)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|claim_phone|edit_message|my_suspension|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|admin_remove_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad|block_user|unblock_user|my_blocks|report_content|agree_terms|my_media_files|delete_my_account|refresh_my_status|create_inquiry|my_inquiries|inquiry_thread|reply_inquiry|close_inquiry|app_info|expired_media|admin_expired_media|admin_usage|admin_set_usage_settings|admin_purge_messages|admin_add_sticker|admin_set_sticker|admin_delete_sticker|admin_move_sticker|admin_log_action|send_test_push|test_push_result|admin_push_info|save_app_push_token|set_push_prefs|save_push_device|save_app_device)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found|'reply_to' column|relation "public\.ads"|table 'public\.ads'|public\.ads|custom_stickers/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/already registered|already exists/i, '이미 사용 중인 아이디예요'],
     [/Database error saving new user/i, '가입할 수 없는 아이디예요. 영문 소문자·숫자·밑줄(_) 3~20자로 입력해 주세요'],
@@ -406,15 +406,22 @@ export function createApi() {
 
     // ---------- 푸시 알림 구독 ----------
     // v1.35: env='store' — 예전 플레이 스토어 앱(웹 방식)에서 켠 알림이라고 표시 → 새 앱(2.0)으로 업데이트하면 서버가 정리 (같은 알림 두 번 방지)
-    async savePush(sub, env) {
+    async savePush(sub, env, disp) {
       const j = sub.toJSON();
-      must(await sb.rpc('save_push_subscription', {
-        p_endpoint: j.endpoint, p_p256dh: j.keys.p256dh, p_auth: j.keys.auth, p_user_agent: (env === 'store' ? 'KkiriEnv/store ' : '') + navigator.userAgent,
-      }));
+      const base = { p_endpoint: j.endpoint, p_p256dh: j.keys.p256dh, p_auth: j.keys.auth, p_user_agent: (env === 'store' ? 'KkiriEnv/store ' : '') + navigator.userAgent };
+      // v1.39: disp(알림 표시)를 주면 같은 처리 안에서 함께 저장 (데이터베이스 1.28)
+      if (disp) { must(await sb.rpc('save_push_device', { ...base, p_preview: disp.preview, p_popup: disp.popup !== false, p_at: disp.at || 0 })); return; }
+      must(await sb.rpc('save_push_subscription', base));
     },
     // v1.35: 끼리톡 앱 2.0 — 구글 알림 서비스(FCM) 토큰 저장 (서버에는 'fcm:<토큰>' 으로)
-    async saveAppPush(token) {
-      must(await sb.rpc('save_app_push_token', { p_token: token, p_user_agent: navigator.userAgent }));
+    async saveAppPush(token, sound, disp) {   // v1.38: 이 휴대폰의 알림 소리도 함께 (서버가 그 소리로 보냄)
+      // v1.39: disp(알림 표시)를 주면 같은 처리 안에서 함께 저장 (데이터베이스 1.28)
+      if (disp) { must(await sb.rpc('save_app_device', { p_token: token, p_user_agent: navigator.userAgent, p_sound: sound || null, p_preview: disp.preview, p_popup: disp.popup !== false, p_at: disp.at || 0 })); return; }
+      must(await sb.rpc('save_app_push_token', { p_token: token, p_user_agent: navigator.userAgent, p_sound: sound || null }));
+    },
+    // v1.39: 이 기기의 알림 표시 (알림 내용 'full'|'name'|'none', 끼리톡 앱의 알림 팝업)
+    async setPushPrefs(endpoint, preview, popup, at) {
+      return must(await sb.rpc('set_push_prefs', { p_endpoint: endpoint, p_preview: preview, p_popup: popup !== false, p_at: at || 0 }));
     },
     async deletePush(endpoint) {
       must(await sb.rpc('delete_push_subscription', { p_endpoint: endpoint }));
