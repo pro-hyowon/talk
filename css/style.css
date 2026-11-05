@@ -1151,3 +1151,54 @@ a.btn { text-decoration: none; }
 #admPush .warn { color: var(--berry); }
 #admPush .push-res p { margin: 8px 0 0; font-size: 13.5px; line-height: 1.55; color: var(--ink2); word-break: keep-all; }
 #admPush .push-res p.warn { color: var(--berry); }
+
+/* v1.41: 비밀번호를 잊었을 때 · 복구 코드 · 관리자 요청 처리 */
+.forgot-btn { min-height: 40px; padding: 0 14px; border-radius: 12px; font-size: 14px; font-weight: 600; color: var(--mint-text); text-decoration: underline; text-underline-offset: 3px; }
+.forgot-btn:active { background: var(--gray-btn); }
+.fp-list { box-shadow: inset 0 0 0 1.5px var(--line); }
+.fp-list .item { width: 100%; text-align: left; }
+.temp-pw.rc-code { font-size: 26px; letter-spacing: 2px; user-select: all; -webkit-user-select: all; }
+.rc-nudge { padding: 16px 16px 14px; margin-bottom: 12px; background: var(--mint-100); color: var(--mint-text); }
+.rc-nudge.warn { background: #FFF4E5; color: #8A4B08; }
+.rc-n-t { display: flex; gap: 10px; align-items: flex-start; }
+.rc-n-t b { display: block; font-size: 15px; color: var(--ink); }
+.rc-n-t span { display: block; margin-top: 3px; font-size: 13px; line-height: 1.5; color: var(--ink2); }
+.rc-n-b { display: flex; gap: 6px; justify-content: flex-end; margin-top: 10px; }
+.rc-n-b .btn.sm { height: 40px; padding: 0 16px; font-size: 14px; border-radius: 12px; }
+.pwr { padding: 14px; margin-bottom: 10px; border-radius: 16px; background: #fff; box-shadow: inset 0 0 0 1.5px var(--line); }
+.pwr-h { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; font-size: 15px; }
+.pwr-h span { font-size: 13px; color: var(--ink3); }
+.pwr-h .pwr-t { margin-left: auto; font-size: 12px; }
+.pwr-p { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 8px; font-size: 14px; color: var(--ink2); }
+.pwr-p .link-btn { height: 28px; padding: 0 10px; font-size: 12px; }
+.pwr-ok { margin-top: 6px; font-size: 13px; font-weight: 600; color: var(--mint-text); }
+.pwr-warn { display: flex; gap: 6px; align-items: flex-start; margin-top: 6px; padding: 8px 10px; border-radius: 10px; background: #FFF4E5; color: #8A4B08; font-size: 13px; line-height: 1.5; }
+.pwr-warn svg { margin-top: 2px; }
+.pwr-n { margin-top: 8px; font-size: 13px; line-height: 1.5; color: var(--ink2); word-break: break-word; }
+.pwr-b { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; margin-top: 10px; }
+.pwr-b .btn.sm { height: 40px; padding: 0 14px; font-size: 14px; border-radius: 12px; }
+.pwr-msg { margin-top: 14px; padding: 12px 14px; border-radius: 14px; background: var(--soft-bg); font-size: 13.5px; line-height: 1.6; color: var(--ink2); word-break: break-all; }
+a.btn { text-decoration: none; display: flex; align-items: center; justify-content: center; }
+.pwr-tag { padding: 1px 7px; border-radius: 6px; background: #FDECEC; color: #B42318 !important; font-size: 11.5px !important; font-weight: 700; }
+
+/* v1.42: 로그인 화면 — 비밀번호 찾기 요청 상태 */
+#pwTicket { margin-top: 14px; }
+.pwt { padding: 14px 14px 12px; border-radius: 16px; background: var(--soft-bg); }
+.pwt.ok { background: var(--mint-100); }
+.pwt.warn { background: #FFF4E5; }
+.pwt-t { display: flex; gap: 10px; align-items: flex-start; color: var(--ink2); }
+.pwt.ok .pwt-t { color: var(--mint-text); }
+.pwt.warn .pwt-t { color: #8A4B08; }
+.pwt-t b { display: block; font-size: 14.5px; color: var(--ink); }
+.pwt-t span { display: block; margin-top: 3px; font-size: 13px; line-height: 1.5; color: var(--ink2); }
+.pwt-t span b { display: inline; font-size: inherit; }
+.pwt-b { display: flex; gap: 6px; justify-content: flex-end; margin-top: 10px; }
+.pwt-b:empty { display: none; }
+.pwt-b .btn.sm { height: 40px; padding: 0 16px; font-size: 14px; border-radius: 12px; }
+.pwr-ok { display: flex; gap: 6px; align-items: flex-start; }
+.pwr-ok svg { margin-top: 2px; }
+.pwt-code { margin-top: 6px !important; color: var(--ink) !important; }
+.pwt-code b { font-size: 15px; letter-spacing: 1px; }
+.pw-code-big { margin: 4px 0 14px; padding: 16px; border-radius: 16px; background: var(--soft-bg); text-align: center; font-size: 13px; color: var(--ink2); }
+.pw-code-big b { display: block; margin: 4px 0 6px; font-size: 30px; font-weight: 700; letter-spacing: 4px; color: var(--ink); }
+.pw-code-big span { display: block; line-height: 1.5; }

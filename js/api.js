@@ -16,7 +16,7 @@ function friendly(error) {
     [/captcha/i, '로봇이 아닌지 확인하지 못했어요. 잠시 후 다시 시도해 주세요'],   // v1.28
     [/너무 빨리 보내고/, '메시지를 너무 빨리 보내고 있어요. 잠시 후 다시 보내 주세요'],
     [/banned/i, '이용이 정지된 계정이에요. 관리자에게 문의해 주세요'],
-    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|claim_phone|edit_message|my_suspension|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|admin_remove_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad|block_user|unblock_user|my_blocks|report_content|agree_terms|my_media_files|delete_my_account|refresh_my_status|create_inquiry|my_inquiries|inquiry_thread|reply_inquiry|close_inquiry|app_info|expired_media|admin_expired_media|admin_usage|admin_set_usage_settings|admin_purge_messages|admin_add_sticker|admin_set_sticker|admin_delete_sticker|admin_move_sticker|admin_log_action|send_test_push|test_push_result|admin_push_info|save_app_push_token|set_push_prefs|save_push_device|save_app_device)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
+    [/Could not find the function public\.(admin_|touch_last_seen|get_my_phone|set_my_phone|set_phone_findable|claim_phone|edit_message|my_suspension|match_contacts|my_suggestions|dismiss_suggestion|my_friend_requests|dismiss_request|kick_from_room|delete_message|react_message|admin_orphan_media|admin_connect_friends|admin_user_friends|admin_remove_friends|my_invite_code|reset_invite_code|invite_preview|accept_invite|set_room_muted|admin_save_ad|admin_delete_ad|admin_move_ad|block_user|unblock_user|my_blocks|report_content|agree_terms|my_media_files|delete_my_account|refresh_my_status|create_inquiry|my_inquiries|inquiry_thread|reply_inquiry|close_inquiry|app_info|expired_media|admin_expired_media|admin_usage|admin_set_usage_settings|admin_purge_messages|admin_add_sticker|admin_set_sticker|admin_delete_sticker|admin_move_sticker|admin_log_action|send_test_push|test_push_result|admin_push_info|save_app_push_token|set_push_prefs|save_push_device|save_app_device|admin_edit_notice|admin_delete_notice|create_recovery_code|my_security|clear_temp_password|reset_password_with_code|request_password_help|admin_pw_requests|admin_resolve_pw_request|pw_request_status|reset_password_with_ticket|note_device|cancel_pw_request)/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/messages_kind_check|messages_sticker_check|messages_file_check|Bucket not found|'reply_to' column|relation "public\.ads"|table 'public\.ads'|public\.ads|custom_stickers/i, '데이터베이스 업데이트가 필요해요 (schema.sql 다시 실행)'],
     [/already registered|already exists/i, '이미 사용 중인 아이디예요'],
     [/Database error saving new user/i, '가입할 수 없는 아이디예요. 영문 소문자·숫자·밑줄(_) 3~20자로 입력해 주세요'],
@@ -50,6 +50,16 @@ export function createApi() {
     configured: true,
 
     // ---------- 로그인 ----------
+    // v1.42: 서버에 묻지 않고, 이 기기에 저장된 로그인 정보에서 누구인지만 (켤 때 지난 화면을 바로 보여 주려고 — 데이터는 여전히 서버 확인 뒤)
+    peekUid() {
+      try {
+        const key = `sb-${new URL(CONFIG.SUPABASE_URL).hostname.split('.')[0]}-auth-token`;
+        const j = JSON.parse(localStorage.getItem(key) || 'null');
+        let id = j && ((j.user && j.user.id) || (j.currentSession && j.currentSession.user && j.currentSession.user.id));
+        if (!id && j && j.refresh_token) { const u = JSON.parse(localStorage.getItem(key + '-user') || 'null'); id = u && ((u.user && u.user.id) || u.id); }
+        return typeof id === 'string' && /^[0-9a-f-]{36}$/i.test(id) && j && j.refresh_token ? id : null;
+      } catch { return null; }
+    },
     async getSession() {
       const { data } = await sb.auth.getSession();
       uid = data.session?.user?.id || null;
@@ -79,6 +89,34 @@ export function createApi() {
       return uid;
     },
     async signOut() { await sb.auth.signOut(); uid = null; },
+    // v1.41: 비밀번호를 잊었을 때 (로그인 전에도 됨)
+    async resetWithCode(username, code, password) {
+      const r = must(await sb.rpc('reset_password_with_code', { p_username: username, p_code: code, p_password: password }));
+      if (!r || !r.ok) throw new Error((r && r.error) || '비밀번호를 바꾸지 못했어요');
+      return r.code;   // 새 복구 코드
+    },
+    // v1.42: extra = { dev: 이 기기 표시, device: 알림 주소, kind } → 돌려받은 표(ticket)는 이 기기에만 보관
+    async requestPasswordHelp(username, phone, note, extra = {}) {
+      const r = must(await sb.rpc('request_password_help', { p_username: username, p_phone: phone, p_note: note || '',
+        p_dev: extra.dev || null, p_device: extra.device || null, p_kind: extra.kind || null }));
+      if (!r || !r.ok) throw new Error((r && r.error) || '요청을 보내지 못했어요');
+      return r.ticket ? { ticket: r.ticket, code: r.code || '' } : null;
+    },
+    async cancelPwRequest(ticket) { must(await sb.rpc('cancel_pw_request', { p_ticket: ticket })); },
+    async pwRequestStatus(ticket) { const r = must(await sb.rpc('pw_request_status', { p_ticket: ticket })); return (r && r.status) || 'unknown'; },
+    async resetWithTicket(ticket, password) {
+      const r = must(await sb.rpc('reset_password_with_ticket', { p_ticket: ticket, p_password: password }));
+      if (!r || !r.ok) throw new Error((r && r.error) || '비밀번호를 바꾸지 못했어요');
+      return r;   // { code, username }
+    },
+    async noteDevice(dev) { must(await sb.rpc('note_device', { p_dev: dev })); },
+    async createRecoveryCode(password) {   // 지금 비밀번호를 확인한 뒤 만들어 줌
+      const r = must(await sb.rpc('create_recovery_code', { p_password: password }));
+      if (!r || !r.ok) throw new Error((r && r.error) || '복구 코드를 만들지 못했어요');
+      return r.code;
+    },
+    async mySecurity() { return must(await sb.rpc('my_security')); },
+    async clearTempPassword() { must(await sb.rpc('clear_temp_password')); },
     async changePassword(current, password, captchaToken) {
       const { data } = await sb.auth.getUser();
       const email = data && data.user && data.user.email;
@@ -219,14 +257,17 @@ export function createApi() {
     },
 
     // ---------- 메시지 ----------
-    async getMessages(roomId, beforeId) {
+    // v1.40: live = 지운 메시지는 빼고 (공지방 — 지운 공지는 화면에 안 보이므로 한 번에 받는 50개를 보이는 공지로 채움)
+    async getMessages(roomId, beforeId, live) {
       let q = sb.from('messages').select('*').eq('room_id', roomId).order('id', { ascending: false }).limit(PAGE);
       if (beforeId) q = q.lt('id', beforeId);
+      if (live) q = q.neq('kind', 'deleted');
       return must(await q).reverse();
     },
-    async getMessagesAfter(roomId, afterId) {
-      return must(await sb.from('messages').select('*').eq('room_id', roomId)
-        .gt('id', afterId || 0).order('id', { ascending: true }).limit(200));
+    async getMessagesAfter(roomId, afterId, live) {
+      let q = sb.from('messages').select('*').eq('room_id', roomId).gt('id', afterId || 0);
+      if (live) q = q.neq('kind', 'deleted');
+      return must(await q.order('id', { ascending: true }).limit(200));
     },
     // v1.29: 화면을 안 보던 사이 수정·삭제된 메시지 (보이는 범위 안에서만)
     async getChangedSince(roomId, fromId, since) {
@@ -388,6 +429,8 @@ export function createApi() {
     async adminSetStatus(id, status) { must(await sb.rpc('admin_set_status', { p_user: id, p_status: status })); },
     async adminSetAdmin(id, on) { must(await sb.rpc('admin_set_admin', { p_user: id, p_on: on })); },
     async adminResetPassword(id) { return must(await sb.rpc('admin_reset_password', { p_user: id })); },
+    async adminPwRequests() { return must(await sb.rpc('admin_pw_requests')) || []; },   // v1.41
+    async adminResolvePwRequest(id, action, code) { return must(await sb.rpc('admin_resolve_pw_request', code ? { p_id: id, p_action: action, p_code: code } : { p_id: id, p_action: action })); },
     // v1.17: 강제 탈퇴 — 프로필 사진(와 wipe 면 보낸 사진·파일)을 저장 공간에서 지운 뒤 계정 삭제
     async adminDeleteUser(id, wipe = false) {
       try {
@@ -403,6 +446,9 @@ export function createApi() {
     },
     async adminClearPhone(id) { must(await sb.rpc('admin_clear_phone', { p_user: id })); },
     async adminBroadcast(text) { return must(await sb.rpc('admin_broadcast', { p_text: text })); },
+    // v1.40: 공지 고치기·지우기 (관리자)
+    async adminEditNotice(id, content) { const rows = must(await sb.rpc('admin_edit_notice', { p_id: id, p_content: content })); return rows && rows[0]; },
+    async adminDeleteNotice(id) { must(await sb.rpc('admin_delete_notice', { p_id: id })); },
 
     // ---------- 푸시 알림 구독 ----------
     // v1.35: env='store' — 예전 플레이 스토어 앱(웹 방식)에서 켠 알림이라고 표시 → 새 앱(2.0)으로 업데이트하면 서버가 정리 (같은 알림 두 번 방지)

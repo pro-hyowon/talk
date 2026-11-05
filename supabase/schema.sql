@@ -1487,6 +1487,10 @@ begin
   if to_regclass('private.reports') is not null then
     execute 'delete from private.reports where status = ''done'' and handled_at < now() - interval ''1 year''';
   end if;
+  -- v1.41: 비밀번호 찾기 기록 정리 (시도 2일 · 요청 30일)
+  if to_regprocedure('public.cleanup_recovery()') is not null then
+    begin perform public.cleanup_recovery(); exception when others then null; end;
+  end if;
   -- v1.21: 보관 기간이 지난 글 지우기 (2분에 한 번, 조금씩 — 따로 예약 작업이 필요 없게)
   --        정리가 늦어지거나 실패해도 앱 열기(접속 기록)는 그대로 되게 따로 감쌈
   if to_regprocedure('public.purge_old_messages(integer, boolean)') is not null then
@@ -1599,6 +1603,7 @@ declare
   v_bytes bytea := extensions.gen_random_bytes(8);
 begin
   perform public.admin_guard();
+  perform pg_advisory_xact_lock(hashtext('pwreset:' || p_user::text));   -- 같은 회원을 동시에 처리하지 않게
   for i in 0..7 loop
     v_pw := v_pw || substr(v_chars, 1 + (get_byte(v_bytes, i) % length(v_chars)), 1);
   end loop;
@@ -1606,10 +1611,438 @@ begin
      set encrypted_password = extensions.crypt(v_pw, extensions.gen_salt('bf')), updated_at = now()
    where id = p_user;
   if not found then raise exception '회원을 찾을 수 없어요'; end if;
+  -- v1.41: 임시 비밀번호로 로그인하면 새 비밀번호로 바꾸라고 안내 + 이 회원의 '비밀번호 찾기 요청'은 처리됨으로
+  insert into private.temp_passwords (user_id) values (p_user) on conflict (user_id) do update set at = now();
+  update private.pw_requests set status = 'done', handled_at = now(), handled_by = auth.uid(), device = null where user_id = p_user and status in ('open', 'approved');
+  delete from private.known_devices where user_id = p_user;
+  if to_regclass('auth.sessions') is not null then execute 'delete from auth.sessions where user_id = $1' using p_user; end if;   -- 로그인된 기기는 모두 로그아웃
+  perform public.admin_log_action('reset_password', p_user::text);
+  begin
+    perform public.push_to_users(array[p_user], '비밀번호가 바뀌었어요', '운영팀이 임시 비밀번호로 바꿨어요. 직접 요청하지 않았다면 1:1 문의로 알려 주세요.');
+  exception when others then null;
+  end;
   return v_pw;
 end;
 $$;
 
+-- ---------------------------------------------------------------------
+-- v1.41: 비밀번호를 잊었을 때
+--   ① 복구 코드: 회원이 미리 만들어 둔 코드(12자리)로 혼자 바로 새 비밀번호 — 서버에는 코드를 알 수 없게 바꾼 값만 저장
+--   ② 코드가 없으면 '비밀번호 찾기 요청' (아이디 + 휴대폰 번호) → 관리자가 확인하고 임시 비밀번호를 알려 줌
+--   둘 다 로그인 전에 쓰므로 여러 번 시도하지 못하게 횟수를 제한하고, 아이디가 있는지 없는지 알 수 없게 같은 답을 줌
+-- ---------------------------------------------------------------------
+create table if not exists private.recovery_codes (
+  user_id    uuid primary key references public.profiles(id) on delete cascade,
+  code_hash  text not null,
+  created_at timestamptz not null default now()
+);
+create table if not exists private.recovery_attempts (
+  id       bigint generated always as identity primary key,
+  kind     text not null,          -- code: 복구 코드로 바꾸기 · help: 비밀번호 찾기 요청
+  username text not null,
+  ok       boolean not null default false,
+  at       timestamptz not null default now()
+);
+alter table private.recovery_attempts add column if not exists ip text;   -- 같은 곳에서 여러 번 하는 것 막기 (2일 뒤 지움)
+create index if not exists recovery_attempts_user_idx on private.recovery_attempts(username, at);
+create index if not exists recovery_attempts_ip_idx on private.recovery_attempts(ip, at);
+create index if not exists recovery_attempts_at_idx on private.recovery_attempts(at);
+create table if not exists private.pw_requests (
+  id          bigint generated always as identity primary key,
+  user_id     uuid not null references public.profiles(id) on delete cascade,
+  phone       text,                -- 요청할 때 입력한 번호 (처리 뒤 30일 지나면 지움)
+  phone_match boolean not null default false,   -- 가입할 때 등록한 번호와 같은지
+  note        text,
+  status      text not null default 'open' check (status in ('open', 'done', 'dismissed')),
+  created_at  timestamptz not null default now(),
+  handled_at  timestamptz,
+  handled_by  uuid
+);
+create index if not exists pw_requests_open_idx on private.pw_requests(status, created_at);
+create table if not exists private.temp_passwords (
+  user_id uuid primary key references public.profiles(id) on delete cascade,
+  at      timestamptz not null default now()
+);
+-- v1.42: 요청한 기기로 결과 알림 + 승인되면 그 기기에서 바로 새 비밀번호 (임시 비밀번호 문자 없이)
+alter table private.pw_requests add column if not exists ticket_hash text;      -- 요청한 기기만 아는 표(번호)의 해시
+alter table private.pw_requests add column if not exists device jsonb;          -- 요청한 기기의 알림 주소 (승인·거절 알림용, 처리하면 지움)
+alter table private.pw_requests add column if not exists dev_known boolean not null default false;   -- 전에 이 계정으로 로그인했던 기기인지
+alter table private.pw_requests add column if not exists dev_kind text;         -- 앱 / 휴대폰 브라우저 / 컴퓨터
+alter table private.pw_requests add column if not exists approved_at timestamptz;
+alter table private.pw_requests add column if not exists dev_hash text;         -- 요청한 기기 표시의 해시 (같은 기기에서 다시 보낸 요청 정리용)
+alter table private.pw_requests add column if not exists confirm_code text;     -- 고객 화면에 보이는 확인 번호 6자리 (관리자가 전화로 물어봄)
+alter table private.pw_requests drop constraint if exists pw_requests_status_check;
+alter table private.pw_requests add constraint pw_requests_status_check check (status in ('open', 'approved', 'done', 'dismissed'));
+create index if not exists pw_requests_ticket_idx on private.pw_requests(ticket_hash);
+create table if not exists private.known_devices (
+  user_id  uuid not null references public.profiles(id) on delete cascade,
+  dev_hash text not null,                  -- 기기마다 만든 무작위 값의 해시 (값 자체는 휴대폰에만)
+  last_at  timestamptz not null default now(),
+  primary key (user_id, dev_hash)
+);
+revoke all on private.recovery_codes, private.recovery_attempts, private.pw_requests, private.temp_passwords, private.known_devices from public, anon, authenticated;
+
+-- 복구 코드 새로 만들기 (예전 코드는 못 쓰게 됨) — 반환: XXXX-XXXX-XXXX (이때 한 번만 보여 줌)
+-- v1.42: 이 기기로 로그인했다는 표시 (비밀번호 찾기 요청이 '전에 쓰던 기기'에서 왔는지 관리자에게 알려 주려고)
+create or replace function public.note_device(p_dev text)
+returns void language plpgsql volatile security definer set search_path = public, extensions as $$
+declare v_h text;
+begin
+  if auth.uid() is null or p_dev is null or char_length(p_dev) not between 16 and 80 then return; end if;
+  v_h := encode(extensions.digest(p_dev, 'sha256'), 'hex');
+  insert into private.known_devices (user_id, dev_hash) values (auth.uid(), v_h)
+  on conflict (user_id, dev_hash) do update set last_at = now();
+  delete from private.known_devices where user_id = auth.uid() and dev_hash in (
+    select dev_hash from private.known_devices where user_id = auth.uid() order by last_at desc offset 20);
+end;
+$$;
+-- 한 기기로만 보내는 알림 (내부용) — 로그인 전 화면에서 요청한 기기
+-- 바로 승인해도 되는 요청인지: 최근 90일 안에 이 계정으로 로그인했던 기기 + 등록한 번호와 같음 + 다른 기기에서 온 요청이 함께 없음
+create or replace function public.pw_req_safe(p_id bigint)
+returns boolean language sql stable security definer set search_path = public as $$
+  select coalesce((select r.dev_known and r.phone_match and r.dev_hash is not null
+      and not exists (select 1 from private.pw_requests o where o.user_id = r.user_id and o.status = 'open' and o.id <> r.id and o.dev_hash is distinct from r.dev_hash)
+    from private.pw_requests r where r.id = p_id), false);
+$$;
+revoke execute on function public.pw_req_safe(bigint) from public, anon, authenticated;
+create or replace function public.push_to_device(p_dev jsonb, p_title text, p_body text)
+returns void language plpgsql security definer set search_path = public, extensions as $$
+declare v_url text; v_secret text;
+begin
+  if p_dev is null or coalesce(p_dev ->> 'endpoint', '') = '' or to_regclass('private.push_config') is null then return; end if;
+  execute 'select function_url, secret from private.push_config where id = 1' into v_url, v_secret;
+  if v_url is null or v_url like '%YOUR_PROJECT_REF%' then return; end if;
+  perform net.http_post(
+    url := v_url,
+    body := jsonb_build_object('subs', jsonb_build_array(jsonb_build_object('endpoint', p_dev ->> 'endpoint', 'p256dh', p_dev ->> 'p256dh', 'auth', p_dev ->> 'auth', 'preview', 'full', 'popup', true)),
+              'title', p_title, 'body', p_body),
+    headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', v_secret),
+    timeout_milliseconds := 8000);
+exception when others then
+  raise warning 'push_to_device 실패: %', sqlerrm;
+end;
+$$;
+revoke execute on function public.push_to_device(jsonb, text, text) from public, anon, authenticated;
+create or replace function public.req_ip()
+returns text language plpgsql stable set search_path = public as $$
+declare h json; v text;
+begin
+  begin h := current_setting('request.headers', true)::json; exception when others then return null; end;
+  if h is null then return null; end if;
+  v := coalesce(nullif(h ->> 'cf-connecting-ip', ''), split_part(coalesce(h ->> 'x-forwarded-for', ''), ',', 1));
+  return nullif(left(btrim(v), 60), '');
+end;
+$$;
+revoke execute on function public.req_ip() from public, anon, authenticated;
+-- 정리 (앱을 열 때·요청할 때마다 조금씩): 시도 기록 2일, 비밀번호 찾기 요청 30일
+create or replace function public.cleanup_recovery()
+returns void language sql security definer set search_path = public as $$
+  delete from private.recovery_attempts where at < now() - interval '2 days';
+  delete from private.pw_requests where coalesce(handled_at, created_at) < now() - interval '30 days';
+  update private.pw_requests set device = null where device is not null and (status in ('done', 'dismissed') or created_at < now() - interval '7 days');
+$$;
+revoke execute on function public.cleanup_recovery() from public, anon, authenticated;
+create or replace function public.new_recovery_code(p_user uuid)
+returns text language plpgsql volatile security definer set search_path = public, extensions as $$
+declare
+  v_chars text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   -- 헷갈리는 0·O·1·I 빼고 32자
+  v_b     bytea := extensions.gen_random_bytes(12);
+  v_code  text := '';
+begin
+  for i in 0..11 loop v_code := v_code || substr(v_chars, 1 + (get_byte(v_b, i) % 32), 1); end loop;
+  insert into private.recovery_codes (user_id, code_hash, created_at)
+  values (p_user, extensions.crypt(v_code, extensions.gen_salt('bf', 8)), now())
+  on conflict (user_id) do update set code_hash = excluded.code_hash, created_at = now();
+  return substr(v_code, 1, 4) || '-' || substr(v_code, 5, 4) || '-' || substr(v_code, 9, 4);
+end;
+$$;
+revoke execute on function public.new_recovery_code(uuid) from public, anon, authenticated;
+drop function if exists public.create_recovery_code();
+create or replace function public.create_recovery_code(p_password text)
+returns jsonb language plpgsql volatile security definer set search_path = public, extensions as $$
+declare
+  v_uid uuid := auth.uid();
+  v_key text := 'u:' || coalesce(auth.uid()::text, '');
+begin
+  if v_uid is null or not exists (select 1 from profiles where id = v_uid) then raise exception '로그인이 필요해요'; end if;
+  if (select count(*) from private.recovery_attempts where kind = 'make' and username = v_key and not ok and at > now() - interval '1 hour') >= 5 then
+    return jsonb_build_object('ok', false, 'error', '비밀번호를 여러 번 틀렸어요. 1시간 뒤에 다시 해 주세요');
+  end if;
+  if not exists (select 1 from auth.users where id = v_uid and encrypted_password = extensions.crypt(coalesce(p_password, ''), encrypted_password)) then
+    insert into private.recovery_attempts (kind, username, ok, ip) values ('make', v_key, false, public.req_ip());
+    return jsonb_build_object('ok', false, 'error', '비밀번호가 맞지 않아요');
+  end if;
+  return jsonb_build_object('ok', true, 'code', public.new_recovery_code(v_uid));
+end;
+$$;
+-- 내 계정 안전 상태: 임시 비밀번호로 로그인했는지, 복구 코드가 있는지
+create or replace function public.my_security()
+returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object(
+    'temp_pw',     exists (select 1 from private.temp_passwords where user_id = auth.uid()),
+    'recovery',    exists (select 1 from private.recovery_codes where user_id = auth.uid()),
+    'recovery_at', (select created_at from private.recovery_codes where user_id = auth.uid()));
+$$;
+create or replace function public.clear_temp_password()
+returns void language sql security definer set search_path = public as $$
+  delete from private.temp_passwords where user_id = auth.uid();
+$$;
+
+-- 복구 코드로 새 비밀번호 (로그인 전) — 반환 { ok, code(새 복구 코드) } 또는 { ok:false, error }
+--   틀린 기록이 남도록 오류를 던지지 않고 결과로 돌려줌. 아이디마다 1시간에 5번까지 틀릴 수 있음
+create or replace function public.reset_password_with_code(p_username text, p_code text, p_password text)
+returns jsonb language plpgsql volatile security definer set search_path = public, extensions as $$
+declare
+  v_user text := left(lower(btrim(coalesce(p_username, ''))), 40);
+  v_code text := upper(regexp_replace(coalesce(p_code, ''), '[^A-Za-z0-9]', '', 'g'));
+  v_ip   text := public.req_ip();
+  v_uid  uuid;
+  v_hash text;
+  v_new  text;
+begin
+  if v_user = '' or v_code = '' then return jsonb_build_object('ok', false, 'error', '아이디와 복구 코드를 입력해 주세요'); end if;
+  if char_length(coalesce(p_password, '')) < 6 then return jsonb_build_object('ok', false, 'error', '새 비밀번호는 6자 이상 입력해 주세요'); end if;
+  if octet_length(p_password) > 72 then return jsonb_build_object('ok', false, 'error', '새 비밀번호가 너무 길어요'); end if;
+  perform public.cleanup_recovery();
+  -- 횟수 제한: 아이디마다 1시간 5번 틀림 · 같은 곳(IP)에서 1시간 20번 틀림 · 전체 1분 600번(이상한 폭주 막기)
+  if (select count(*) from private.recovery_attempts where kind = 'code' and at > now() - interval '1 minute') >= 600 then
+    return jsonb_build_object('ok', false, 'error', '지금 요청이 많아요. 잠시 후 다시 해 주세요');
+  end if;
+  if v_ip is not null and (select count(*) from private.recovery_attempts where kind = 'code' and ip = v_ip and not ok and at > now() - interval '1 hour') >= 20 then
+    return jsonb_build_object('ok', false, 'error', '복구 코드를 여러 번 틀렸어요. 1시간 뒤에 다시 해 주세요');
+  end if;
+  if (select count(*) from private.recovery_attempts where kind = 'code' and username = v_user and not ok and at > now() - interval '1 hour') >= 5 then
+    return jsonb_build_object('ok', false, 'error', '복구 코드를 여러 번 틀렸어요. 1시간 뒤에 다시 해 주세요');
+  end if;
+  if char_length(v_code) <> 12 then   -- 자리 수가 틀리면 아이디를 찾아보기 전에 거절 (누구든 똑같이 빠르게)
+    insert into private.recovery_attempts (kind, username, ok, ip) values ('code', v_user, false, v_ip);
+    return jsonb_build_object('ok', false, 'error', '아이디 또는 복구 코드가 맞지 않아요');
+  end if;
+  select p.id into v_uid from profiles p where p.username = v_user;
+  if v_uid is not null then
+    perform pg_advisory_xact_lock(hashtext('pwreset:' || v_uid::text));   -- 같은 회원을 동시에 처리하지 않게
+    select code_hash into v_hash from private.recovery_codes where user_id = v_uid;
+  end if;
+  -- 코드가 없어도 같은 만큼 계산 (걸리는 시간으로 아이디·코드가 있는지 알 수 없게)
+  if v_hash is null then perform extensions.crypt(v_code, extensions.gen_salt('bf', 8)); end if;
+  if v_hash is null or extensions.crypt(v_code, v_hash) <> v_hash then
+    insert into private.recovery_attempts (kind, username, ok, ip) values ('code', v_user, false, v_ip);
+    return jsonb_build_object('ok', false, 'error', '아이디 또는 복구 코드가 맞지 않아요');
+  end if;
+  update auth.users set encrypted_password = extensions.crypt(p_password, extensions.gen_salt('bf')), updated_at = now() where id = v_uid;
+  -- 다른 기기에 로그인된 것은 모두 로그아웃 (누가 몰래 로그인해 있었어도 끊기게)
+  if to_regclass('auth.sessions') is not null then execute 'delete from auth.sessions where user_id = $1' using v_uid; end if;
+  delete from private.temp_passwords where user_id = v_uid;
+  delete from private.known_devices where user_id = v_uid;
+  update private.pw_requests set status = 'done', handled_at = now(), device = null where user_id = v_uid and status in ('open', 'approved');
+  v_new := public.new_recovery_code(v_uid);   -- 쓴 코드는 다시 못 쓰게 새 코드로
+  insert into private.recovery_attempts (kind, username, ok, ip) values ('code', v_user, true, v_ip);
+  begin
+    perform public.push_to_users(array[v_uid], '비밀번호가 바뀌었어요', '복구 코드로 비밀번호를 바꿨어요. 직접 바꾼 게 아니라면 바로 1:1 문의로 알려 주세요.');
+  exception when others then null;
+  end;
+  return jsonb_build_object('ok', true, 'code', v_new);
+end;
+$$;
+
+-- 비밀번호 찾기 요청 (로그인 전, 복구 코드가 없을 때) — 아이디가 없거나 번호가 달라도 같은 답 (있는지 알아내지 못하게)
+--   아이디가 있으면 관리자 목록에 올라가고(가입 번호와 같은지 표시), 관리자에게 알림
+drop function if exists public.request_password_help(text, text, text);
+create or replace function public.request_password_help(p_username text, p_phone text, p_note text default '', p_dev text default null, p_device jsonb default null, p_kind text default null)
+returns jsonb language plpgsql volatile security definer set search_path = public, extensions as $$
+declare
+  v_user   text := left(lower(btrim(coalesce(p_username, ''))), 40);
+  v_phone  text := public.norm_phone(p_phone);
+  v_ip     text := public.req_ip();
+  v_ticket text := encode(extensions.gen_random_bytes(18), 'hex');   -- 요청한 기기만 아는 값 (승인되면 이걸로 새 비밀번호)
+  v_code   text := lpad(((('x' || encode(extensions.gen_random_bytes(4), 'hex'))::bit(32)::bigint) % 1000000)::text, 6, '0');   -- 확인 번호
+  v_dh     text := case when p_dev is not null and char_length(p_dev) between 16 and 80 then encode(extensions.digest(p_dev, 'sha256'), 'hex') end;
+  v_new    boolean := p_kind is not null;   -- 1.42 앱에서 온 요청 (예전 앱은 승인 방식을 몰라서 임시 비밀번호로 처리)
+  v_dev    jsonb;
+  v_ep     text := coalesce(p_device ->> 'endpoint', '');
+  v_uid    uuid;
+  v_match  boolean;
+  v_known  boolean := false;
+  v_quiet  boolean;
+  v_told   boolean;
+begin
+  if v_user = '' then return jsonb_build_object('ok', false, 'error', '아이디를 입력해 주세요'); end if;
+  if v_phone is null then return jsonb_build_object('ok', false, 'error', '휴대폰 번호를 정확히 입력해 주세요 (예: 010-1234-5678)'); end if;
+  perform public.cleanup_recovery();
+  -- 횟수 제한: 전체 1시간 300번 · 같은 곳(IP) 1시간 5번 · 같은 아이디+번호 하루 3번 · 같은 아이디 하루 10번
+  if (select count(*) from private.recovery_attempts where kind = 'help' and at > now() - interval '1 hour') >= 300 then
+    return jsonb_build_object('ok', false, 'error', '지금 요청이 많아요. 잠시 후 다시 해 주세요');
+  end if;
+  if v_ip is not null and (select count(*) from private.recovery_attempts where kind = 'help' and ip = v_ip and at > now() - interval '1 hour') >= 5 then
+    return jsonb_build_object('ok', false, 'error', '요청을 여러 번 보냈어요. 1시간 뒤에 다시 해 주세요');
+  end if;
+  if (select count(*) from private.recovery_attempts where kind = 'help' and username = v_user || '|' || v_phone and at > now() - interval '1 day') >= 3
+     or (select count(*) from private.recovery_attempts where kind = 'help' and split_part(username, '|', 1) = v_user and at > now() - interval '1 day') >= 10 then
+    return jsonb_build_object('ok', false, 'error', '오늘은 이미 요청했어요. 운영팀이 확인하고 연락드릴게요');
+  end if;
+  insert into private.recovery_attempts (kind, username, ok, ip) values ('help', v_user || '|' || v_phone, true, v_ip);
+  -- 알림 주소는 알려진 알림 서비스 주소만 받음 (아무 주소로나 보내지 않게)
+  if char_length(v_ep) <= 800 and (v_ep ~ '^fcm:[A-Za-z0-9_:.-]{20,}$'
+      or (v_ep ~ '^https://(fcm\.googleapis\.com|updates\.push\.services\.mozilla\.com|web\.push\.apple\.com|[a-z0-9.-]+\.push\.apple\.com|[a-z0-9.-]+\.notify\.windows\.com)/'
+          and coalesce(p_device ->> 'p256dh', '') ~ '^[A-Za-z0-9_-]{20,200}$' and coalesce(p_device ->> 'auth', '') ~ '^[A-Za-z0-9_-]{8,100}$')) then
+    v_dev := jsonb_build_object('endpoint', v_ep, 'p256dh', p_device ->> 'p256dh', 'auth', p_device ->> 'auth');
+  end if;
+  select p.id into v_uid from profiles p where p.username = v_user;
+  if v_uid is not null then
+    v_match := exists (select 1 from user_phones u where u.user_id = v_uid and u.phone = v_phone);
+    if v_dh is not null then
+      v_known := exists (select 1 from private.known_devices k where k.user_id = v_uid and k.dev_hash = v_dh and k.last_at > now() - interval '90 days');
+    end if;
+    v_told := exists (select 1 from private.pw_requests where user_id = v_uid and created_at > now() - interval '1 hour');
+    v_quiet := exists (select 1 from private.pw_requests where status = 'open' and created_at > now() - interval '3 minutes');   -- 관리자 알림은 3분에 한 번까지 (아직 처리 안 한 요청이 있을 때만 생략)
+    -- 같은 기기에서 다시 보낸 요청이면 예전 것은 닫음 (그 기기는 새 표만 가지고 있으니까)
+    if v_dh is not null then
+      update private.pw_requests set status = 'dismissed', handled_at = now(), device = null where user_id = v_uid and status = 'open' and dev_hash = v_dh;
+    end if;
+    -- 요청마다 따로 남김 (다른 사람이 같은 아이디로 요청해도 진짜 주인의 요청을 덮어쓰지 못하게)
+    insert into private.pw_requests (user_id, phone, phone_match, note, ticket_hash, device, dev_known, dev_kind, dev_hash, confirm_code)
+    values (v_uid, v_phone, v_match, left(btrim(coalesce(p_note, '')), 200), case when v_new then encode(extensions.digest(v_ticket, 'sha256'), 'hex') end, v_dev, v_known,
+            case p_kind when 'app' then '끼리톡 앱' when 'mobile' then '휴대폰 브라우저' when 'desktop' then '컴퓨터' else null end, v_dh, case when v_new then v_code end);
+    begin
+      -- 계정 주인에게도 알림 (1시간에 한 번까지) — 본인이 한 게 아니면 알아챌 수 있게
+      if not v_told then
+        perform public.push_to_users(array[v_uid], '비밀번호 찾기 요청이 접수됐어요',
+          '직접 요청한 게 아니라면 걱정하지 마세요. 운영팀이 본인인지 확인한 뒤에만 처리해요.');
+      end if;
+      -- 관리자에게 알림 (3분 안에 이미 알렸으면 생략 — 목록에서 모두 보임)
+      if not v_quiet then
+        perform public.push_to_users(array(select id from profiles where is_admin and status = 'active'),
+          '비밀번호 찾기 요청', '@' || v_user || ' 님이 비밀번호 찾기를 요청했어요. 더보기 → 관리자 → 현황에서 승인해 주세요.');
+      end if;
+    exception when others then null;
+    end;
+  end if;
+  return jsonb_build_object('ok', true, 'ticket', v_ticket, 'code', v_code);   -- 없는 아이디도 똑같이 (아이디가 있는지 알 수 없게)
+end;
+$$;
+-- 요청한 기기: 내 요청이 어떻게 됐는지 (open · approved · dismissed · done · expired)
+create or replace function public.pw_request_status(p_ticket text)
+returns jsonb language plpgsql stable security definer set search_path = public, extensions as $$
+declare v_r private.pw_requests%rowtype;
+begin
+  if coalesce(p_ticket, '') !~ '^[0-9a-f]{36}$' then return jsonb_build_object('status', 'unknown'); end if;
+  select * into v_r from private.pw_requests where ticket_hash = encode(extensions.digest(p_ticket, 'sha256'), 'hex');
+  if not found then return jsonb_build_object('status', 'open'); end if;   -- 없는 아이디로 한 요청도 '확인 중' (아이디가 있는지 알 수 없게)
+  if v_r.status = 'approved' and v_r.approved_at < now() - interval '24 hours' then return jsonb_build_object('status', 'expired'); end if;
+  return jsonb_build_object('status', v_r.status);
+end;
+$$;
+-- 승인된 요청: 요청한 기기에서 새 비밀번호 정하기 (승인 후 24시간 안, 한 번만)
+-- 요청한 기기: 요청 취소 (비밀번호가 생각났거나 잘못 보냄)
+create or replace function public.cancel_pw_request(p_ticket text)
+returns void language plpgsql volatile security definer set search_path = public, extensions as $$
+begin
+  if coalesce(p_ticket, '') !~ '^[0-9a-f]{36}$' then return; end if;
+  update private.pw_requests set status = 'dismissed', handled_at = now(), device = null
+   where ticket_hash = encode(extensions.digest(p_ticket, 'sha256'), 'hex') and status in ('open', 'approved');
+end;
+$$;
+create or replace function public.reset_password_with_ticket(p_ticket text, p_password text)
+returns jsonb language plpgsql volatile security definer set search_path = public, extensions as $$
+declare
+  v_ip  text := public.req_ip();
+  v_r   private.pw_requests%rowtype;
+  v_new text;
+  v_user text;
+begin
+  if char_length(coalesce(p_password, '')) < 6 then return jsonb_build_object('ok', false, 'error', '새 비밀번호는 6자 이상 입력해 주세요'); end if;
+  if octet_length(p_password) > 72 then return jsonb_build_object('ok', false, 'error', '새 비밀번호가 너무 길어요'); end if;
+  if v_ip is not null and (select count(*) from private.recovery_attempts where kind = 'ticket' and ip = v_ip and not ok and at > now() - interval '1 hour') >= 20 then
+    return jsonb_build_object('ok', false, 'error', '잠시 후 다시 해 주세요');
+  end if;
+  if coalesce(p_ticket, '') ~ '^[0-9a-f]{36}$' then
+    select * into v_r from private.pw_requests where ticket_hash = encode(extensions.digest(p_ticket, 'sha256'), 'hex');
+  end if;
+  if v_r.id is null or v_r.status <> 'approved' then
+    insert into private.recovery_attempts (kind, username, ok, ip) values ('ticket', '-', false, v_ip);
+    return jsonb_build_object('ok', false, 'error', case when v_r.status in ('done') then '이미 새 비밀번호를 정했어요. 로그인해 주세요' else '아직 승인되지 않았어요' end);
+  end if;
+  if v_r.approved_at < now() - interval '24 hours' then
+    return jsonb_build_object('ok', false, 'error', '승인한 지 24시간이 지났어요. 다시 요청해 주세요');
+  end if;
+  perform pg_advisory_xact_lock(hashtext('pwreset:' || v_r.user_id::text));
+  select * into v_r from private.pw_requests where id = v_r.id for update;
+  if v_r.status <> 'approved' then return jsonb_build_object('ok', false, 'error', '이미 새 비밀번호를 정했어요. 로그인해 주세요'); end if;
+  update auth.users set encrypted_password = extensions.crypt(p_password, extensions.gen_salt('bf')), updated_at = now() where id = v_r.user_id;
+  if to_regclass('auth.sessions') is not null then execute 'delete from auth.sessions where user_id = $1' using v_r.user_id; end if;
+  delete from private.temp_passwords where user_id = v_r.user_id;
+  delete from private.known_devices where user_id = v_r.user_id;
+  update private.pw_requests set status = 'done', handled_at = now(), device = null where user_id = v_r.user_id and status in ('open', 'approved');
+  v_new := public.new_recovery_code(v_r.user_id);
+  select username into v_user from profiles where id = v_r.user_id;
+  begin
+    perform public.push_to_users(array[v_r.user_id], '비밀번호가 바뀌었어요', '비밀번호 찾기로 새 비밀번호를 정했어요. 직접 바꾼 게 아니라면 바로 1:1 문의로 알려 주세요.');
+  exception when others then null;
+  end;
+  return jsonb_build_object('ok', true, 'code', v_new, 'username', v_user);
+end;
+$$;
+-- 관리자: 처리할 비밀번호 찾기 요청
+drop function if exists public.admin_pw_requests();
+create function public.admin_pw_requests()
+returns table (id bigint, user_id uuid, username text, display_name text, status text, phone text, reg_phone text,
+               phone_match boolean, note text, created_at timestamptz, dev_known boolean, dev_kind text, can_notify boolean, can_approve boolean, safe boolean)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  perform public.admin_guard();
+  return query
+  select r.id, r.user_id, p.username, p.display_name, p.status, r.phone, u.phone, r.phone_match, r.note, r.created_at,
+         r.dev_known, r.dev_kind, r.device is not null, r.ticket_hash is not null, public.pw_req_safe(r.id)
+    from private.pw_requests r join profiles p on p.id = r.user_id
+    left join user_phones u on u.user_id = r.user_id
+   where r.status = 'open'
+   order by r.created_at;
+end;
+$$;
+-- 관리자: 요청 처리 — reset: 임시 비밀번호를 만들어 돌려줌 / dismiss: 그냥 닫음
+drop function if exists public.admin_resolve_pw_request(bigint, text);
+create or replace function public.admin_resolve_pw_request(p_id bigint, p_action text, p_code text default null)
+returns text language plpgsql volatile security definer set search_path = public as $$
+declare
+  v_r  private.pw_requests%rowtype;
+  v_pw text;
+begin
+  perform public.admin_guard();
+  select * into v_r from private.pw_requests where id = p_id;
+  if found then perform pg_advisory_xact_lock(hashtext('pwreset:' || v_r.user_id::text)); end if;
+  select * into v_r from private.pw_requests where id = p_id for update;
+  if not found or v_r.status <> 'open' then raise exception '이미 처리된 요청이에요'; end if;
+  if p_action = 'approve' then   -- v1.42: 승인 → 요청한 기기에서 바로 새 비밀번호 (24시간 안)
+    if v_r.ticket_hash is null then raise exception '예전 버전 앱에서 온 요청이라 승인할 수 없어요. 임시 비밀번호로 처리해 주세요'; end if;
+    -- 바로 승인해도 되는 요청이 아니면, 고객 화면에 보이는 확인 번호를 전화로 물어 넣어야 함 (요청한 사람이 진짜 주인인지)
+    if not public.pw_req_safe(p_id) and coalesce(regexp_replace(p_code, '[^0-9]', '', 'g'), '') <> coalesce(v_r.confirm_code, '-') then
+      raise exception '%', case when coalesce(p_code, '') = '' then '확인 번호가 필요해요' else '확인 번호가 맞지 않아요' end;
+    end if;
+    update private.pw_requests set status = 'approved', approved_at = now(), handled_at = now(), handled_by = auth.uid() where id = p_id;
+    -- 같은 회원의 다른 요청은 닫음 (다른 기기에서 온 요청까지 승인되지 않게 — 이미 승인된 것도)
+    update private.pw_requests set status = 'dismissed', handled_at = now(), handled_by = auth.uid(), device = null
+     where user_id = v_r.user_id and status in ('open', 'approved') and id <> p_id;
+    perform public.admin_log_action('approve_pw_request', v_r.user_id::text);
+    begin
+      perform public.push_to_device(v_r.device, '비밀번호 찾기가 승인됐어요', '끼리톡을 열어 새 비밀번호를 정해 주세요. (24시간 안에)');
+      perform public.push_to_users(array[v_r.user_id], '비밀번호 찾기가 승인됐어요', '직접 요청한 게 아니라면 바로 1:1 문의로 알려 주세요.');
+    exception when others then null;
+    end;
+  elsif p_action = 'reset' then
+    v_pw := public.admin_reset_password(v_r.user_id);   -- 이 회원의 열린 요청도 함께 '처리됨'
+  elsif p_action = 'dismiss' then
+    update private.pw_requests set status = 'dismissed', handled_at = now(), handled_by = auth.uid(), device = null where id = p_id;
+    perform public.admin_log_action('dismiss_pw_request', v_r.user_id::text);
+    begin
+      perform public.push_to_device(v_r.device, '비밀번호 찾기 요청', '요청이 처리되지 않았어요. 끼리톡을 열어 확인해 주세요.');
+    exception when others then null;
+    end;
+  else
+    raise exception '잘못된 처리예요';
+  end if;
+  return v_pw;
+end;
+$$;
 -- 강제 탈퇴 (계정·친구·참여 정보 삭제, 보낸 메시지는 "(알 수 없음)"으로 남음)
 -- v1.13: 관리자가 연결해 준 친구 알림 (앱 화면 + 앱을 닫아도 오는 알림)
 drop function if exists public.notify_connected(uuid, uuid);
@@ -2107,6 +2540,74 @@ begin
   insert into messages (room_id, sender_id, kind, content)
   values (v_room, v_me, 'text', left(trim(p_text), 2000));
   return v_room;
+end;
+$$;
+
+-- v1.40: 공지 고치기·지우기 (관리자 누구나, 기간 제한 없음)
+--   회원 화면에는 '수정됨'·'삭제된 메시지예요' 표시 없이 고친 글로 바뀌거나 사라져요
+--   회원이 아주 많으면(100명 넘음) 실시간으로 한꺼번에 보내지 않고, 회원이 공지방을 열 때 바뀐 내용을 받아요
+drop function if exists public.admin_edit_notice(bigint, text);
+create function public.admin_edit_notice(p_id bigint, p_content text)
+returns table (content text, edited_at timestamptz)
+language plpgsql security definer set search_path = public as $$
+declare
+  v_me   uuid := public.admin_guard();
+  v_m    messages%rowtype;
+  v_new  text := btrim(coalesce(p_content, ''));
+  v_last bigint;
+  v_at   timestamptz := now();
+begin
+  select m.* into v_m from messages m join rooms r on r.id = m.room_id and r.is_notice where m.id = p_id;
+  if not found or v_m.kind = 'deleted' then raise exception '공지를 찾을 수 없어요'; end if;
+  if v_m.kind <> 'text' then raise exception '글로 쓴 공지만 수정할 수 있어요'; end if;
+  if v_new = '' then raise exception '내용을 입력해 주세요'; end if;
+  if char_length(v_new) > 2000 then raise exception '2000자까지 쓸 수 있어요'; end if;
+  if v_new = v_m.content then return query select v_m.content, v_m.edited_at; return; end if;
+  update messages m set content = v_new, edited_at = v_at where m.id = p_id;
+  select max(x.id) into v_last from messages x where x.room_id = v_m.room_id and x.kind not in ('system', 'deleted');
+  if v_last = p_id then update rooms r set last_message = left(v_new, 100) where r.id = v_m.room_id; end if;
+  perform public.admin_log_action('edit_notice', p_id::text);
+  if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null
+     and (select count(*) from (select 1 from room_members where room_id = v_m.room_id limit 101) x) <= 100 then
+    begin
+      perform realtime.send(jsonb_build_object('id', p_id, 'room_id', v_m.room_id, 'content', v_new, 'edited_at', v_at, 'last', v_last = p_id),
+                            'edited', 'user:' || rm.user_id::text, true)
+         from room_members rm where rm.room_id = v_m.room_id and rm.user_id is distinct from v_me;
+    exception when others then null;
+    end;
+  end if;
+  return query select v_new, v_at;
+end;
+$$;
+
+create or replace function public.admin_delete_notice(p_id bigint)
+returns void language plpgsql security definer set search_path = public as $$
+declare
+  v_me   uuid := public.admin_guard();
+  v_m    messages%rowtype;
+  v_prev text;
+begin
+  select m.* into v_m from messages m join rooms r on r.id = m.room_id and r.is_notice where m.id = p_id;
+  if not found then raise exception '공지를 찾을 수 없어요'; end if;
+  if v_m.kind = 'deleted' then return; end if;
+  update messages set kind = 'deleted', content = '-', deleted_at = now() where id = p_id;
+  delete from message_reactions where message_id = p_id;
+  delete from private.message_edits where message_id = p_id;
+  -- 지운 공지가 가장 최근 것이었으면, 채팅 목록 미리보기를 남아 있는 가장 최근 공지로 ('삭제된 메시지예요' 대신)
+  if not exists (select 1 from messages y where y.room_id = v_m.room_id and y.id > p_id and y.kind not in ('system', 'deleted')) then
+    select left(x.content, 100) into v_prev from messages x
+     where x.room_id = v_m.room_id and x.kind = 'text' order by x.id desc limit 1;
+    update rooms set last_message = v_prev where id = v_m.room_id;
+  end if;
+  perform public.admin_log_action('delete_notice', p_id::text);
+  if to_regprocedure('realtime.send(jsonb,text,text,boolean)') is not null
+     and (select count(*) from (select 1 from room_members where room_id = v_m.room_id limit 101) x) <= 100 then
+    begin
+      perform realtime.send(jsonb_build_object('id', p_id, 'room_id', v_m.room_id), 'deleted', 'user:' || m.user_id::text, true)
+         from room_members m where m.room_id = v_m.room_id and m.user_id is distinct from v_me;
+    exception when others then null;
+    end;
+  end if;
 end;
 $$;
 
@@ -2642,6 +3143,7 @@ begin
     'messages_today',(select count(*) from messages where created_at >= (v_today::timestamp at time zone 'Asia/Seoul') and kind <> 'system'),
     'open_reports',  (select count(*) from private.reports where status = 'open'),
     'open_inquiries',(select count(*) from private.inquiries where status = 'open'),
+    'pw_requests',   (select count(distinct user_id) from private.pw_requests where status = 'open'),   -- v1.41
     'require_approval', coalesce((select require_approval from private.app_settings where id = 1), false),
     'series', (
       select jsonb_agg(jsonb_build_object(
@@ -2666,7 +3168,8 @@ begin
   return jsonb_build_object(
     'pending',   (select count(*) from profiles where status = 'pending'),
     'reports',   (select count(*) from private.reports where status = 'open'),
-    'inquiries', (select count(*) from private.inquiries where status = 'open'));
+    'inquiries', (select count(*) from private.inquiries where status = 'open'),
+    'pw_requests', (select count(distinct user_id) from private.pw_requests where status = 'open'));   -- v1.41
 end;
 $$;
 
@@ -3167,7 +3670,7 @@ returns jsonb language sql stable security definer set search_path = public, pri
                             'media_keep_from', (select media_keep_from from private.app_settings where id = 1),
                             'msg_keep_days', public.msg_keep_days(),
                             'msg_keep_from', (select msg_keep_from from private.app_settings where id = 1),
-                            'db_version', '1.28');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
+                            'db_version', '1.31');   -- v1.20: 앱이 '데이터베이스 업데이트 필요' 를 알아챌 수 있게 (schema.sql 을 고칠 때 함께 올림)
 $$;
 
 -- 회원 앱: 내 방에서 보관 기간이 지난 사진·파일을 몇 개씩 받아 저장 공간에서 지움
@@ -3425,7 +3928,7 @@ declare
     'my_invite_code()', 'reset_invite_code()', 'invite_preview(text)', 'accept_invite(text)', 'set_room_muted(uuid, boolean)',
     'admin_list_users(text)', 'admin_set_status(uuid, text)', 'admin_set_admin(uuid, boolean)',
     'admin_reset_password(uuid)', 'admin_delete_user(uuid, boolean)', 'admin_user_media(uuid)', 'admin_get_settings()',
-    'admin_set_settings(boolean)', 'admin_broadcast(text)', 'admin_orphan_media()',
+    'admin_set_settings(boolean)', 'admin_broadcast(text)', 'admin_edit_notice(bigint, text)', 'admin_delete_notice(bigint)', 'admin_orphan_media()',
     'admin_connect_friends(uuid, uuid[])', 'admin_user_friends(uuid)', 'admin_remove_friends(uuid, uuid[])',
     'admin_save_ad(bigint, text, text, text, boolean)', 'admin_delete_ad(bigint)', 'admin_move_ad(bigint, integer)', 'ad_click(bigint)',
     'block_user(uuid)', 'unblock_user(uuid)', 'my_blocks()', 'report_content(uuid, bigint, text, text)',
@@ -3438,7 +3941,8 @@ declare
     'admin_member_page(text, text, text, integer, integer)', 'admin_member_detail(uuid)', 'admin_list_inquiries(text, integer, integer)',
     'app_info()', 'expired_media(integer)', 'admin_expired_media(integer)', 'admin_usage()', 'admin_set_usage_settings(integer, text, integer)', 'admin_purge_messages()', 'admin_log_action(text, text)',
     'my_suspension()', 'edit_message(bigint, text)', 'admin_add_sticker(text, text)', 'admin_set_sticker(bigint, boolean, text)', 'admin_delete_sticker(bigint)', 'admin_move_sticker(bigint, integer)',
-    'send_test_push(uuid)', 'test_push_result(bigint)', 'admin_push_info(uuid)'];
+    'send_test_push(uuid)', 'test_push_result(bigint)', 'admin_push_info(uuid)',
+    'create_recovery_code(text)', 'my_security()', 'clear_temp_password()', 'admin_pw_requests()', 'admin_resolve_pw_request(bigint, text, text)', 'note_device(text)'];
   helper_fns text[] := array[
     'is_active()', 'is_active_user(uuid)', 'is_admin()', 'is_room_member(uuid)', 'is_room_member_text(text)',
     'shares_room_with(uuid)', 'is_notice_room(uuid)', 'admin_guard()',
@@ -3465,6 +3969,15 @@ begin
   execute 'revoke execute on function public.lift_expired_suspensions(uuid) from public, anon, authenticated';
   execute 'revoke execute on function public.notify_admins_inquiry() from public, anon, authenticated';
   execute 'grant execute on function public.invite_preview(text) to anon';   -- 로그인 전 초대 화면용
+  -- v1.41: 비밀번호를 잊었을 때 (로그인 전) — 횟수 제한은 함수 안에서
+  execute 'revoke execute on function public.new_recovery_code(uuid) from public, anon, authenticated';   -- 내부용
+  execute 'grant execute on function public.reset_password_with_code(text, text, text) to anon, authenticated';
+  execute 'grant execute on function public.request_password_help(text, text, text, text, jsonb, text) to anon, authenticated';
+  execute 'grant execute on function public.pw_request_status(text) to anon, authenticated';                 -- v1.42
+  execute 'grant execute on function public.reset_password_with_ticket(text, text) to anon, authenticated';  -- v1.42
+  execute 'grant execute on function public.cancel_pw_request(text) to anon, authenticated';
+  execute 'revoke execute on function public.pw_req_safe(bigint) from public, anon, authenticated';   -- 내부용
+  execute 'revoke execute on function public.push_to_device(jsonb, text, text) from public, anon, authenticated';   -- 내부용
   execute 'revoke execute on function public.purge_old_messages(integer, boolean) from public, anon, authenticated';   -- v1.21 내부용
   execute 'grant execute on function public.app_info() to anon';   -- v1.21: 약관 페이지가 보관 기간을 보여 주게 (설정값만 있음)
 end;

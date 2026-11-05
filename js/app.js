@@ -6,7 +6,7 @@ import { SPRITE } from './icons.js';
 import { STICKERS, STICKER_PACKS, stickerSvg } from './stickers.js';
 import { qrSvg } from './qr.js';
 
-const VERSION = '1.39';
+const VERSION = '1.42';
 const READ_LIVE_MAX = 20;   // 이 인원 이하 방은 읽음 표시를 실시간으로, 넘으면 5초마다 확인 (schema.sql 과 같은 값)
 // v1.17: 앱 이름이 끼리톡으로 바뀜 — 설정 파일에 예전 이름(미니톡)이 그대로 있으면 새 이름으로 표시
 const APP = !CONFIG.APP_NAME || CONFIG.APP_NAME === '\uBBF8\uB2C8\uD1A1' ? '끼리톡' : CONFIG.APP_NAME;
@@ -501,7 +501,7 @@ function appPushListen() {
     // 알림을 눌러 앱이 열림 (앱이 꺼져 있었어도 이 이벤트가 옴)
     P.addListener('pushNotificationActionPerformed', (a) => { const n = (a && a.notification) || {}; openFromAppNotif(n.data, n.id); });
     // 앱을 보고 있을 때 도착한 알림 — '알림 테스트' 확인용
-    P.addListener('pushNotificationReceived', (n) => { const d = (n && n.data) || {}; if (d.tag === 'kkiri-test' && nat.test) nat.test(); });
+    P.addListener('pushNotificationReceived', (n) => { const d = (n && n.data) || {}; if (d.tag === 'kkiri-test' && nat.test) nat.test(); else onPushArrived(); });
   } catch (e) { console.warn('push listen', e); }
 }
 const TAPPED_KEY = 'kkiri-tapped';
@@ -968,6 +968,10 @@ async function boot() {
   if (!api) return renderFatal('서버 연결 모듈을 불러오지 못했어요. 인터넷 연결을 확인한 뒤 새로고침해 주세요.');
   if (!api.configured) return renderSetup();
   api.onAuthChange((id) => { if (id) enterApp(id); else leaveApp(); });
+  // v1.42: 카카오톡처럼 — 이 기기에 저장해 둔 지난 화면(친구·채팅 목록)을 바로 보여 주고, 서버 확인은 뒤에서
+  const peek = api.peekUid ? api.peekUid() : null;
+  const snap = peek ? readSnap(peek) : null;
+  if (snap) { enterApp(peek, { snap }); return; }
   let id = null;
   try { id = await api.getSession(); } catch (e) { console.warn(e); }
   if (id) await enterApp(id); else renderAuth();
@@ -1071,13 +1075,15 @@ function renderAuth(mode = 'login') {
       <button class="btn" type="submit" id="authBtn">${signup ? '가입 신청하기' : '로그인'}</button>
     </form>
     ${signup ? `<div class="note-mint">${ic('shield', 18)}아이디는 가입 후 바꿀 수 없어요. 관리자 설정에 따라 승인 후 이용할 수 있어요.</div>`
-    : '<div class="foot-note">비밀번호를 잊었다면 관리자에게 초기화를 요청하세요.</div>'}
+    : `<div id="pwTicket" hidden></div><div class="foot-note">${api.resetWithCode ? '<button type="button" class="forgot-btn" id="forgotBtn">비밀번호를 잊었어요</button>' : '비밀번호를 잊었다면 관리자에게 초기화를 요청하세요.'}</div>`}
     ${legalLinksHtml()}`);
 
   setOffline(!navigator.onLine);
   showInviteBanner();
   $$('.seg button').forEach((b) => (b.onclick = () => renderAuth(b.dataset.mode)));
   const form = $('#authForm');
+  const fb = $('#forgotBtn'); if (fb) fb.onclick = () => showForgotPassword((($('#f-username') || {}).value || '').trim().toLowerCase());
+  if (!signup) checkPwTicket();   // v1.42: 비밀번호 찾기 요청이 승인됐는지
   form.addEventListener('input', (e) => {
     if (e.target.name) setFieldErr(form, e.target.name, '');
     if (e.target.name === 'phone') { const row = $('#phoneAgreeRow', form); if (row) row.hidden = !e.target.value.trim(); }   // v1.28: 번호를 넣을 때만 [선택] 동의
@@ -1114,11 +1120,13 @@ function renderAuth(mode = 'login') {
       const id = signup
         ? await api.signUp({ username, password: f.password, displayName: f.displayName, captchaToken })
         : await api.signIn({ username, password: f.password, captchaToken });
+      if (!signup) { const pw = f.password; S.loginPw = pw; setTimeout(() => { if (S.loginPw === pw) S.loginPw = ''; }, 10 * 60e3); }   // v1.41: 임시 비밀번호 바꾸기 창에만 (저장 안 함)
       let phoneErr = null;
       if (phone && api.setMyPhone) {
         try { const v = await api.setMyPhone(phone, true); S.phone = { phone: v, findable: true }; } catch (pe) { phoneErr = pe; }
       }
       await enterApp(id);
+      if (signup && api.createRecoveryCode && !window.__noRcOffer) { const pw = f.password; setTimeout(() => offerRecoveryAfterReset(pw, { signup: true }), 1200); }   // v1.42: 가입하자마자 복구 코드 (휴대폰을 바꿔도 혼자 찾게)
       if (phoneErr) toast(`가입은 됐지만 휴대폰 번호는 저장하지 못했어요. ${phoneErr.message} (더보기 → 휴대폰 번호에서 다시 등록하거나 확인을 요청할 수 있어요)`, { error: true, ms: 7000 });
     } catch (ex) {
       const msg = ex.message || '오류가 발생했어요.';
@@ -1126,6 +1134,46 @@ function renderAuth(mode = 'login') {
       btn.disabled = false; btn.textContent = signup ? '가입 신청하기' : '로그인';
     }
   };
+}
+
+// ---------------------------------------------------------------------
+// v1.42: 빠른 시작 — 지난번 친구·채팅 목록을 이 기기에만 저장해 두었다가 켤 때 바로 보여 줌 (로그아웃하면 지움)
+// ---------------------------------------------------------------------
+const SNAP_PREFIX = 'kkiri-snap-';
+function readSnap(uid) {
+  try {
+    const v = JSON.parse(localStorage.getItem(SNAP_PREFIX + uid) || 'null');
+    if (!v || v.v !== 1 || v.ver !== VERSION || !v.me || v.me.id !== uid || (v.me.status && v.me.status !== 'active')) return null;
+    if ('terms_agreed_at' in v.me && !v.me.terms_agreed_at) return null;
+    if (!Array.isArray(v.friends) || !Array.isArray(v.rooms) || Date.now() - (v.at || 0) > 30 * 864e5) return null;
+    return v;
+  } catch { return null; }
+}
+let snapT = null;
+function saveSnapSoon() {
+  clearTimeout(snapT);
+  const uid = S.uid;
+  snapT = setTimeout(() => {
+    if (!S.entered || S.uid !== uid || !S.me || S.me.id !== uid || (S.me.status && S.me.status !== 'active') || !S.roomsLoaded || S.fromSnap || !S.snapOk) return;
+    const v = { v: 1, ver: VERSION, at: Date.now(), me: S.me, friends: S.friends, rooms: S.rooms, blocks: [...(S.blocks || [])],
+      info: { keepDays: S.keepDays, keepFrom: S.keepFrom, dbVersion: S.dbVersion, msgKeepDays: S.msgKeepDays, msgKeepFrom: S.msgKeepFrom } };
+    try { localStorage.setItem(SNAP_PREFIX + uid, JSON.stringify(v)); }
+    catch { try { localStorage.removeItem(SNAP_PREFIX + uid); } catch { /* 저장 공간 없음 */ } }
+  }, 1200);
+}
+function clearSnaps() {
+  clearTimeout(snapT);
+  try { Object.keys(localStorage).filter((k) => k.startsWith(SNAP_PREFIX)).forEach((k) => localStorage.removeItem(k)); } catch { /* 없음 */ }
+}
+function applySnap(v) {
+  S.me = v.me; cacheProfile(S.me);
+  S.friends = v.friends; S.friends.forEach(cacheProfile);
+  S.rooms = v.rooms.slice().sort(roomOrder); S.roomsLoaded = true;
+  S.muted = new Map(S.rooms.map((r) => [r.room_id, !!r.muted]));
+  S.rooms.forEach((r) => (r.members || []).forEach(cacheProfile));
+  S.blocks = new Set(v.blocks || []);
+  const i = v.info || {};
+  S.keepDays = i.keepDays || 0; S.keepFrom = i.keepFrom || 0; S.dbVersion = i.dbVersion || null; S.msgKeepDays = i.msgKeepDays || 0; S.msgKeepFrom = i.msgKeepFrom || 0;
 }
 
 // v1.37: 켤 때 내 정보와 친구·채팅 목록을 기다리지 않고 한꺼번에 요청 (서버 왕복 한 번 줄임)
@@ -1140,16 +1188,62 @@ function takePre(k) {
   const p = pre[k]; pre[k] = null;
   return p;
 }
-async function enterApp(id) {
-  if (S.entered && S.uid === id) return;
-  S.uid = id; S.entered = true;
+async function enterApp(id, { snap = null } = {}) {
+  if (S.entered && S.uid === id) { if (S.snapWait) resumeSnap(id); return; }   // 기다리던 중 로그인 확인이 됨 → 바로 이어서
+  S.uid = id; S.entered = true; S.snapOk = false; S.friendsOk = false; S.roomsOk = false;
+  if (snap) {   // v1.42: 지난 화면을 바로
+    try {
+      S.fromSnap = true;
+      loadImgCache(); applySnap(snap); buildShell(); updateBadges(); route();
+      if (!location.hash || location.hash === '#/') renderMain();
+    } catch (e) {   // 저장해 둔 화면이 맞지 않음 → 버리고 평소대로 (매번 막히지 않게)
+      console.warn('snap', e); clearSnaps(); S.fromSnap = false; S.entered = false; S.uid = null;
+      if (S.room) { try { closeRoom(); } catch { /* 무시 */ } }
+      app.innerHTML = splashHtml();
+      return api.getSession().then((sid) => (sid ? enterApp(sid) : renderAuth())).catch(() => renderAuth());
+    }
+    return resumeSnap(id);
+  }
   app.innerHTML = splashHtml();
+  return enterRest(id);
+}
+// 지난 화면을 보여 주는 동안 로그인 확인 → 됐으면 이어서, 아직 모르면(인터넷·잠깐 오류) 기다렸다 다시, 정말 풀렸으면 로그인 화면
+async function resumeSnap(id) {
+  stopSnapWait();
+  let sid = null;
+  try { sid = await api.getSession(); } catch (e) { console.warn(e); }
+  if (!S.entered || S.uid !== id) return;
+  if (sid === id) return enterRest(id, true);
+  if (api.peekUid() === id) { waitSnap(id); return; }   // 로그인 정보는 그대로 있음 → 확인을 못 했을 뿐 (로그아웃이 아님)
+  S.fromSnap = false; clearSnaps();
+  leaveApp();   // 로그인이 풀림 → 로그인 화면
+  if (sid) enterApp(sid);
+}
+const SNAP_RETRY = [5, 15, 30, 60];
+function waitSnap(id) {
+  stopSnapWait();
+  const n = S.snapTries = (S.snapTries || 0) + 1;
+  const go = () => { if (S.entered && S.uid === id && S.snapWait) resumeSnap(id); };
+  const onVis = () => { if (!document.hidden) go(); };
+  const t = setTimeout(go, SNAP_RETRY[Math.min(n - 1, SNAP_RETRY.length - 1)] * 1000);
+  window.addEventListener('online', go); document.addEventListener('visibilitychange', onVis);
+  S.snapWait = () => { clearTimeout(t); window.removeEventListener('online', go); document.removeEventListener('visibilitychange', onVis); };
+  setOffline(!navigator.onLine);
+}
+function stopSnapWait() { if (S.snapWait) { S.snapWait(); S.snapWait = null; } }
+async function enterRest(id, snapMode = false) {
   setOffline(!navigator.onLine);
   prefetchLists();
   try {
     S.me = await api.getMyProfile();
   } catch (e) {
     S.pre = null;
+    if (!S.entered || S.uid !== id) return;
+    if (snapMode && S.fromSnap && (!navigator.onLine || /인터넷 연결|Failed to fetch|NetworkError|Load failed|timeout|시간|5\d\d|서버/i.test(e.message || ''))) {   // 지난 화면을 둔 채로 잠시 뒤 다시
+      waitSnap(id);
+      return;
+    }
+    if (snapMode) S.fromSnap = false;
     S.entered = false; S.uid = null;
     // v1.27: 인터넷이 안 될 때는 로그인 화면 대신 '연결되면 다시 시도' 화면 (로그인은 그대로 유지)
     if (!navigator.onLine || /인터넷 연결|Failed to fetch|NetworkError|Load failed/i.test(e.message || '')) { renderOfflineStart(id); return; }
@@ -1157,34 +1251,50 @@ async function enterApp(id) {
     showErr(e);
     return;
   }
-  loadImgCache();
+  if (!S.entered || S.uid !== id) return;   // 기다리는 사이 로그아웃함
+  S.snapTries = 0;
+  if (!snapMode) loadImgCache();
   // v1.37: 정지·승인 대기 상태에서 미리 받은 목록은 비어 있음 → 쓰지 않고 새로 받음
   if (S.me.status && S.me.status !== 'active') S.pre = null;
   // v1.18: 정지 기간이 끝났으면 풀고 들어감
   if (S.me.status === 'suspended' && api.refreshMyStatus) {
     try { if ((await api.refreshMyStatus()) === 'active') S.me = await api.getMyProfile(); } catch { /* 예전 데이터베이스 */ }
   }
-  if (S.me.status && S.me.status !== 'active') { S.pre = null; renderBlocked(S.me.status); return; }
+  if (S.me.status && S.me.status !== 'active') { S.pre = null; S.fromSnap = false; clearSnaps(); renderBlocked(S.me.status); return; }
   // v1.17: 약관 동의 전에 가입한 회원은 한 번 동의를 받음 (데이터베이스가 예전 버전이면 건너뜀)
   if ('terms_agreed_at' in S.me && !S.me.terms_agreed_at && api.agreeTerms) {
+    S.fromSnap = false; clearSnaps();
     if (!(await askTerms())) return;
     S.pre = null;   // v1.37: 동의 화면에 머문 사이 바뀌었을 수 있어서 새로 받음
   }
   cacheProfile(S.me);
-  buildShell();
+  const wasSnap = S.fromSnap && $('#main');
+  if (!wasSnap) buildShell();   // 지난 화면을 보여 주고 있으면 그대로 두고 내용만 바꿈
+  else if (S.tab === 'more' && !S.room) renderMain();
+  if (wasSnap && !S.me.is_admin && /^#\/admin/.test(location.hash)) go('#/friends');   // 지난 화면에선 관리자였지만 지금은 아님
+  if (S.unsub) { try { S.unsub(); } catch { /* 무시 */ } }
   S.unsub = api.subscribe(rtHandlers());
-  await Promise.all([loadFriends(), loadRooms(), loadBlocks(), loadAppInfo()]).catch(showErr);
+  let loadsOk = true;
+  await Promise.all([loadFriends(), loadRooms(), loadBlocks(), loadAppInfo()]).catch((e) => { loadsOk = false; showErr(e); });
+  if (!S.entered || S.uid !== id) return;
+  S.fromSnap = false; S.snapOk = loadsOk;   // 다 받았을 때만 저장 (예전 내용에 새 날짜가 붙지 않게)
+  if (wasSnap && S.room) catchUp({ force: true });   // 지난 화면에서 바로 연 대화방: 그 사이 온 메시지
   loadCustomStickers();   // v1.28
   loadSuggestions();
   loadRequests();
   loadMyInquiries().then(() => { const b = $('#inqBadge'); if (b) b.innerHTML = inqBadgeHtml(); });   // v1.18
-  route();
+  if (wasSnap) { if (!S.room) renderMain(); } else route();
+  saveSnapSoon();   // 다음에 켤 때 바로 보여 줄 화면
   handlePendingInvite();
   if (S.pendingNotifHash) { const h = S.pendingNotifHash; S.pendingNotifHash = null; if (location.hash !== h) go(h); }   // v1.35: 알림을 눌러 앱이 켜짐
   touchLastSeen();
   const pushP = enablePush({ silent: true }).then(() => { if (S.tab === 'more' && !S.room) renderMain(); }).catch((e) => console.warn('push', e));
   if (IN_APP) pushP.finally(() => maybeAskNotif()); else maybeAskNotif();   // v1.35: 앱은 권한 상태를 먼저 확인한 뒤
   setTimeout(sweepExpired, 8000);   // v1.19: 화면이 다 뜬 뒤 천천히
+  loadSecurity();   // v1.41: 임시 비밀번호로 들어왔는지, 복구 코드가 있는지
+  if (api.noteDevice && !dbOutdated()) api.noteDevice(devId()).catch(() => {});   // v1.42: 비밀번호 찾기 요청이 '전에 쓰던 기기'에서 왔는지 알 수 있게
+  { const tk = getTicket(); if (tk && S.me && tk.u === S.me.username) cancelTicket(); }   // 비밀번호가 생각나서 로그인함 → 요청도 취소
+  if (S.me && S.me.is_admin) setTimeout(() => notePwReqs(true), 2500);   // v1.42: 관리자 — 알림을 눌러 들어왔으면 바로 알 수 있게
 }
 
 // v1.19: 사진·파일 보관 기간 (데이터베이스가 예전 버전이면 0 → '보관 기간 지남' 표시 안 함)
@@ -1669,10 +1779,12 @@ function leaveApp() {
   S.pre = null;
   if (IN_APP && (S.pushOn || nat.saved)) { nat.gen++; appUnregister(); }   // v1.35: 로그인이 풀림(세션 만료 등) → 이 휴대폰으로 알림이 더 오지 않게
   clearImgCache();
+  clearSnaps();   // v1.42: 저장해 둔 지난 화면도 지움
+  stopSnapWait();
   Object.assign(S, {
-    uid: null, entered: false, me: null, friends: [], rooms: [], roomsLoaded: false, room: null,
+    uid: null, entered: false, fromSnap: false, snapOk: false, snapTries: 0, friendsOk: false, roomsOk: false, me: null, friends: [], rooms: [], roomsLoaded: false, room: null,
     fromList: false, unsub: null, wasSubscribed: false, rtPaused: false, rtUp: false, tab: 'friends', pushOn: false, friendQuery: '',
-    admin: null, adminFromMore: false, lastTouch: 0, pending: 0, suggestions: [], phone: undefined,
+    admin: null, adminFromMore: false, lastTouch: 0, pending: 0, suggestions: [], phone: undefined, sec: null, loginPw: '', pwReqs: 0,
     requests: [], chatFilter: 'all', blocks: new Set(), myInq: [], inqUnread: 0, openReports: 0, openInquiries: 0,
   });
   S.profiles.clear(); S.imgUrls.clear();
@@ -1737,8 +1849,10 @@ function backFromRoom() {
 // ---------------------------------------------------------------------
 async function loadFriends() {
   S.friends = await (takePre('friends') || api.listFriends());
+  S.friendsOk = true; if (S.roomsOk && !S.fromSnap) S.snapOk = true;   // v1.42: 한 번 실패해도 나중에 잘 받으면 다시 저장
   S.friends.forEach(cacheProfile);
   if (S.tab === 'friends' && !S.room) renderMain();
+  saveSnapSoon();
 }
 async function loadSuggestions() {
   if (!api.listSuggestions) return;
@@ -1770,6 +1884,7 @@ const roomTime = (r) => Date.parse(r && r.last_message_at) || 0;
 const roomOrder = (a, b) => (b.is_notice ? 1 : 0) - (a.is_notice ? 1 : 0) || roomTime(b) - roomTime(a);
 async function loadRooms() {
   S.rooms = (await (takePre('rooms') || api.listRooms())).sort(roomOrder);
+  S.roomsOk = true; if (S.friendsOk && !S.fromSnap) S.snapOk = true;
   S.roomsLoaded = true;
   S.muted = new Map(S.rooms.map((r) => [r.room_id, !!r.muted]));
   // 보고 있던 단체방에서 내보내졌으면 닫기 (실시간 알림을 못 받은 경우 대비)
@@ -1779,6 +1894,7 @@ async function loadRooms() {
   S.rooms.forEach((r) => (r.members || []).forEach(cacheProfile));
   updateBadges();
   if (S.tab === 'chats' && $('#main')) renderMain();
+  saveSnapSoon();
 }
 let roomsPromise = null;
 function refreshRoomsSoon() {
@@ -2003,6 +2119,7 @@ function renderMore(head, body) {
   const nb = S.notifBusy;
   const on = nb ? nb.on : notifOn();
   body.innerHTML = `<div class="more-body">
+    ${recoveryNudgeHtml()}
     <div class="card prof-card">${hasPhoto(me) ? `<button class="pav-zoom" data-act="my-photo" aria-label="내 프로필 사진 크게 보기">${av(me, 64)}</button>` : av(me, 64)}
       <div class="meta"><div class="name">${esc(me.display_name)}</div><div class="desc">${esc(me.status_message || '상태메시지가 없어요')}</div></div>
       <button class="edit-btn" data-act="edit-profile">${ic('pencil', 16)}편집</button></div>
@@ -2016,6 +2133,7 @@ function renderMore(head, body) {
         <button class="ibtn" data-act="copy-id" aria-label="아이디 복사" style="border-radius:12px;color:var(--ink3)">${ic('copy', 18)}</button></div>
       <button class="item" data-act="phone"><span class="tile sky">${ic('phone', 19)}</span><span class="label">휴대폰 번호</span><span class="val" id="phoneVal">${S.phone === undefined ? '' : S.phone ? esc(maskPhone(S.phone.phone)) : '등록하기'}</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
       <button class="item" data-act="change-password"><span class="tile lav">${ic('lock', 19)}</span><span class="label">비밀번호 변경</span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      ${api.createRecoveryCode && !dbOutdated() ? `<button class="item" data-act="recovery-code"><span class="tile mint">${ic('key', 19)}</span><span class="label">비밀번호 복구 코드<span class="sub">${S.sec ? (S.sec.recovery ? `${esc(fmtDate(S.sec.recovery_at))}에 만들었어요` : '비밀번호를 잊었을 때 혼자 바로 찾을 수 있어요') : '비밀번호를 잊었을 때 혼자 바로 찾을 수 있어요'}</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>` : ''}
       <div class="item tap" data-act="notif-row"><span class="tile peach">${ic('bell', 19)}</span><span class="label">알림<span class="sub">${nb ? esc(nb.text) : notifSub(on)}</span></span>
         <button class="switch ${on ? 'on' : ''}${nb ? ' busy' : ''}" data-act="notif" role="switch" aria-checked="${on}" aria-busy="${nb ? 'true' : 'false'}" aria-label="새 메시지 알림"></button></div>
       <button class="item" data-act="notif-sound"><span class="tile lemon">${ic('bell', 19)}</span><span class="label">알림 소리<span class="sub">${esc(soundLabel(soundPref()))}${vibratePref() && 'vibrate' in navigator ? ' · 진동' : ''} · 휴대폰 알림음 바꾸기</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
@@ -2168,7 +2286,8 @@ async function openRoom(id) {
   wireComposer();
 
   try {
-    const [info, members, msgs] = await Promise.all([api.getRoom(id), api.getMembers(id), api.getMessages(id)]);
+    const listed = S.rooms.find((x) => x.room_id === id);   // v1.40: 공지방이면 지운 공지는 빼고 받음
+    const [info, members, msgs] = await Promise.all([api.getRoom(id), api.getMembers(id), api.getMessages(id, null, !!(listed && listed.is_notice))]);
     if (token !== S.roomToken) return;
     if (!info) { toast('대화방을 찾을 수 없어요', { error: true }); closeRoom(); afterBack(() => location.replace('#/chats')); return; }
     S.room.info = info;
@@ -2188,6 +2307,7 @@ async function openRoom(id) {
     markReadSoon();
     watchReads();
     if (msgs.length) loadReactions(S.room, msgs[0].id);
+    fillNoticeSoon(S.room);   // v1.40
   } catch (e) {
     if (token !== S.roomToken) return;
     $('#msgs').innerHTML = `<div class="empty-state"><b>불러오지 못했어요</b><p>${esc(e.message || '')}</p></div>`;
@@ -2295,7 +2415,7 @@ function msgHtml(m, prev, next) {
     : m.kind === 'contact' ? contactBubble(m)
       : `<div class="bubble">${m.reply_to && !notice ? quoteHtml(m) : ''}${notice ? noticeText(m.content) : linkify(m.content)}</div>`;
   const showMeta = !m.pending && !m.failed;
-  const metaCol = showMeta ? `<div class="meta-col"><span class="unread" data-unread="${esc(m.id)}"></span>${m.edited_at && m.kind === 'text' ? '<span class="edited">수정됨</span>' : ''}<span class="tm">${fmtTime(m.created_at)}</span></div>` : '';
+  const metaCol = showMeta ? `<div class="meta-col"><span class="unread" data-unread="${esc(m.id)}"></span>${m.edited_at && m.kind === 'text' && !notice ? '<span class="edited">수정됨</span>' : ''}<span class="tm">${fmtTime(m.created_at)}</span></div>` : '';
   const cls = `msg ${mine ? 'mine' : ''} ${first ? 'first' : ''} ${m.pending ? 'pending' : ''} ${m.failed ? 'failed' : ''}`;
 
   if (mine) {
@@ -2313,9 +2433,13 @@ function msgHtml(m, prev, next) {
 
 function renderMsgs() {
   const box = $('#msgs'); if (!box || !S.room) return;
-  const ms = S.room.msgs;
+  // v1.40: 공지방에서 지운 공지는 '삭제된 메시지예요' 없이 사라짐
+  const ms = isNoticeRoom() ? S.room.msgs.filter((m) => m.kind !== 'deleted') : S.room.msgs;
   if (!ms.length) {
-    box.innerHTML = `<div class="empty-state" style="padding-top:22%"><div class="es-icon lav">${ic('logo', 64)}</div><b>대화를 시작해 보세요</b><p>첫 메시지를 보내면 상대방 채팅 목록에 나타나요.</p></div>`;
+    box.innerHTML = isNoticeRoom()
+      ? (S.room.hasMore ? '<div class="load-more">이전 공지를 불러오고 있어요</div>'
+        : `<div class="empty-state" style="padding-top:22%"><div class="es-icon lav">${ic('mega', 64)}</div><b>아직 공지가 없어요</b><p>새 공지가 올라오면 여기에 보여 드릴게요.</p></div>`)
+      : `<div class="empty-state" style="padding-top:22%"><div class="es-icon lav">${ic('logo', 64)}</div><b>대화를 시작해 보세요</b><p>첫 메시지를 보내면 상대방 채팅 목록에 나타나요.</p></div>`;
     return;
   }
   S.room.byId = new Map(ms.map((m) => [String(m.id), m]));
@@ -2473,7 +2597,7 @@ async function loadOlder() {
   if (!firstReal) return;
   R.loadingOlder = true;
   try {
-    const older = await api.getMessages(R.id, firstReal.id);
+    const older = await api.getMessages(R.id, firstReal.id, !!(R.info && R.info.is_notice));
     if (S.room !== R) return;
     R.hasMore = older.length >= 50;
     const box = $('#msgs');
@@ -2483,8 +2607,19 @@ async function loadOlder() {
     renderMsgs();
     box.scrollTop = box.scrollHeight - prevH + prevTop;
     if (older.length) loadReactions(R, older[0].id);
-  } catch (e) { showErr(e); }
+  } catch (e) { showErr(e); R.fillFail = true; }
   finally { R.loadingOlder = false; }
+  fillNoticeSoon(R);
+}
+// v1.40: 공지방 — 지운 공지 때문에 화면이 비거나 짧아서 위로 올릴 수 없으면, 보이는 공지가 생길 때까지 이전 공지를 이어서 불러옴
+function fillNoticeSoon(R) {
+  if (!R || S.room !== R || !R.info || !R.info.is_notice || !R.hasMore || R.loadingOlder || R.fillFail) return;
+  if ((R.fills = (R.fills || 0) + 1) > 30) return;
+  requestAnimationFrame(() => {
+    const box = $('#msgs'); if (!box || S.room !== R) return;
+    const shown = R.msgs.filter((m) => m.kind !== 'deleted').length;
+    if (shown === 0 || box.scrollHeight <= box.clientHeight + 40) loadOlder();
+  });
 }
 
 let readTimer = null;
@@ -2679,7 +2814,7 @@ async function sendText(retryMsg) {
     if (notice) {
       await api.adminBroadcast(text);
       const lastReal = [...R.msgs].reverse().find((m) => isNum(m.id));
-      const fresh = await api.getMessagesAfter(R.id, lastReal ? lastReal.id : 0);
+      const fresh = await api.getMessagesAfter(R.id, lastReal ? lastReal.id : 0, true);
       R.msgs = R.msgs.filter((m) => m !== tmp);
       if (S.room === R) { addMessages(fresh, { forceBottom: true }); renderMsgs(); scrollBottom(); }
       return;
@@ -2712,8 +2847,10 @@ function showMsgMenu(m) {
   if (m.kind === 'text' && !hiddenMsg) items.push(['copy', ic('copy', 22), '복사']);
   if (m.kind === 'contact' && contactOf(m) && !hiddenMsg) items.push(['copy', ic('copy', 22), '이름·번호 복사']);
   if (m.kind === 'file' && isNum(m.id) && !hiddenMsg && !mediaExpired(m)) items.push(['save', ic('download', 22), '저장']);
-  if (canEdit(m)) items.push(['edit', ic('pencil', 22), '수정']);   // v1.29
-  if (mineMsg) items.push(['delete', ic('ban', 22), local ? '보내기 취소' : '삭제']);
+  const noticeAdmin = isNoticeRoom() && !local && !!(S.me && S.me.is_admin) && !!api.adminDeleteNotice;   // v1.40: 공지는 관리자 누구나 고치고 지움
+  if (canEdit(m)) items.push(['edit', ic('pencil', 22), isNoticeRoom() ? '공지 수정' : '수정']);   // v1.29
+  if (noticeAdmin) items.push(['delete', ic('ban', 22), '공지 삭제']);
+  else if (mineMsg) items.push(['delete', ic('ban', 22), local ? '보내기 취소' : '삭제']);
   const canReport = !mineMsg && !local && !isNoticeRoom() && !!m.sender_id && !!api.report;
   if (canReport) items.push(['report', ic('flag', 22), '신고']);
   if (canReport) items.push(hiddenMsg ? ['unblock', ic('userx', 22), '차단 해제'] : ['block', ic('userx', 22), '이 사람 차단']);
@@ -2747,6 +2884,11 @@ function showMsgMenu(m) {
         }
         if (x.dataset.x === 'delete') {
           if (local) { R.msgs = R.msgs.filter((y) => y !== m); if (S.room === R) renderMsgs(); return; }
+          if (noticeAdmin) {
+            if (!(await ask('공지를 삭제할까요?', '모든 회원의 공지사항에서 이 공지가 사라져요. 되돌릴 수 없어요.', '삭제', true))) return;
+            try { await api.adminDeleteNotice(m.id); markDeleted(m.room_id, m.id); toast('공지를 삭제했어요'); } catch (ex) { showErr(ex); }
+            return;
+          }
           if (!(await ask('메시지를 삭제할까요?', '모든 대화 상대의 화면에서 "삭제된 메시지예요"로 바뀌어요. 되돌릴 수 없어요.', '삭제', true))) return;
           try {
             await api.deleteMessage(m);
@@ -2767,8 +2909,9 @@ function markDeleted(roomId, id) {
     for (const x of [m, ref]) if (x && x.kind !== 'deleted') { x.kind = 'deleted'; x.content = '-'; changed = true; }
     if (R.reacts && R.reacts.delete(Number(id))) changed = true;
     if (R.replyTo === id) cancelReply();
-    if (R.editing && R.editing.id === id) cancelEdit();
+    if (R.editing && R.editing.id === id) { cancelEdit(); if (isNoticeRoom()) toast('고치던 공지를 다른 관리자가 삭제했어요', { error: true }); }
     if (changed) renderMsgs();
+    fillNoticeSoon(R);   // v1.40: 지워서 화면이 비면 이전 공지 불러오기
   }
   refreshRoomsSoon();   // 목록 미리보기 갱신
 }
@@ -3757,16 +3900,18 @@ function cancelReply() { if (S.room) S.room.replyTo = null; renderReplyBar(); }
 // ---------- v1.29: 내가 보낸 글 수정 (보낸 지 24시간 안, 글 메시지만) ----------
 const EDIT_WINDOW = 24 * 3600 * 1000;
 function canEdit(m) {
-  return !!(api.editMessage && m && S.room && m.sender_id === S.uid && m.kind === 'text' && isNum(m.id) && !m.pending && !m.failed
-    && !isNoticeRoom() && $('#msgInput') && Date.now() - Date.parse(m.created_at) < EDIT_WINDOW);
+  if (!m || !S.room || m.kind !== 'text' || !isNum(m.id) || m.pending || m.failed || !$('#msgInput')) return false;
+  if (isNoticeRoom()) return !!(api.adminEditNotice && S.me && S.me.is_admin);   // v1.40: 공지는 관리자 누구나, 기간 제한 없음
+  return !!(api.editMessage && m.sender_id === S.uid && Date.now() - Date.parse(m.created_at) < EDIT_WINDOW);
 }
 function startEdit(m) {
   const R = S.room; if (!canEdit(m)) return;
   if (R.replyTo) cancelReply();
   if (R.pick) unpickSticker();
   toggleStickers(false);   // 수정 중에는 이모티콘·사진 버튼을 숨김 (글만 고칠 수 있게)
-  R.editing = m;
   const ta = $('#msgInput');
+  if (!R.editing) R.editDraft = ta.value;   // v1.40: 쓰던 글은 보관했다가 수정이 끝나면 되돌려 놓음
+  R.editing = m;
   ta.value = m.content; ta.dispatchEvent(new Event('input'));
   renderEditBar();
   ta.focus(); try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch { /* 없음 */ }
@@ -3780,34 +3925,44 @@ function renderEditBar() {
   if (!R || !R.editing) { if (bar) bar.remove(); const sb = $('#sendBtn'); if (sb) sb.setAttribute('aria-label', '보내기'); comp.classList.remove('editing'); return; }
   if (!bar) { comp.insertAdjacentHTML('afterbegin', '<div class="reply-bar edit-bar" id="editBar"></div>'); bar = $('#editBar'); }
   comp.classList.add('editing');
-  bar.innerHTML = `<span class="rb-ic">${ic('pencil', 18)}</span><div class="rb-t"><b>메시지 수정</b><span>${esc(snippetOf(R.editing))}</span></div>
+  bar.innerHTML = `<span class="rb-ic">${ic('pencil', 18)}</span><div class="rb-t"><b>${isNoticeRoom() ? '공지 수정' : '메시지 수정'}</b><span>${esc(snippetOf(R.editing))}</span></div>
     <button class="ibtn sm" data-act="cancel-edit" aria-label="수정 취소">${ic('x', 18)}</button>`;
 }
 function cancelEdit() {
   const R = S.room; if (!R || !R.editing) return;
   R.editing = null;
-  const ta = $('#msgInput'); if (ta) { ta.value = ''; ta.dispatchEvent(new Event('input')); }
+  const ta = $('#msgInput'); if (ta) { ta.value = R.editDraft || ''; ta.dispatchEvent(new Event('input')); }
+  R.editDraft = '';
   renderEditBar();
 }
 async function saveEdit() {
   const R = S.room; const m = R && R.editing; if (!m) return;
   const ta = $('#msgInput'); const text = ta ? ta.value.trim() : '';
-  if (!text) { toast('내용을 입력해 주세요. 지우려면 메시지를 길게 눌러 삭제를 고르세요', { error: true }); return; }
+  const notice = isNoticeRoom();
+  if (!text) { toast(`내용을 입력해 주세요. 지우려면 ${notice ? '공지' : '메시지'}를 길게 눌러 삭제를 고르세요`, { error: true }); return; }
   if (text === m.content) { cancelEdit(); return; }
-  if (Date.now() - Date.parse(m.created_at) >= EDIT_WINDOW) { cancelEdit(); toast('보낸 지 24시간이 지난 메시지는 수정할 수 없어요', { error: true }); return; }
+  if (!notice && Date.now() - Date.parse(m.created_at) >= EDIT_WINDOW) { cancelEdit(); toast('보낸 지 24시간이 지난 메시지는 수정할 수 없어요', { error: true }); return; }
   const btn = $('#sendBtn'); if (btn) btn.disabled = true;
   try {
-    const r = await api.editMessage(m.id, text);
+    const r = notice ? await api.adminEditNotice(m.id, text) : await api.editMessage(m.id, text);
     m.content = (r && r.content) || text; m.edited_at = (r && r.edited_at) || new Date().toISOString();
     const ref = R.refs && R.refs.get(Number(m.id)); if (ref) { ref.content = m.content; ref.edited_at = m.edited_at; }
     R.editing = null;
-    if (ta) { ta.value = ''; ta.dispatchEvent(new Event('input')); }
+    if (ta) { ta.value = R.editDraft || ''; ta.dispatchEvent(new Event('input')); }
+    R.editDraft = '';
     renderEditBar();
     if (S.room === R) renderMsgs();
-    const last = [...R.msgs].reverse().find((x) => isNum(x.id) && x.kind !== 'system');
+    const last = [...R.msgs].reverse().find((x) => isNum(x.id) && x.kind !== 'system' && x.kind !== 'deleted');
     if (last && last.id === m.id) { const rr = S.rooms.find((x) => x.room_id === R.id); if (rr) { rr.last_message = m.content.slice(0, 100); scheduleMain(); } }
-    toast('메시지를 수정했어요');
-  } catch (e) { if (btn) btn.disabled = false; showErr(e); }
+    toast(notice ? '공지를 수정했어요' : '메시지를 수정했어요');
+  } catch (e) {
+    if (btn) btn.disabled = false;
+    if (notice && /공지를 찾을 수 없어요/.test((e && e.message) || '')) {   // v1.40: 그사이 다른 관리자가 지움
+      markDeleted(R.id, m.id); if (R.editing) cancelEdit();
+      toast('다른 관리자가 이 공지를 삭제했어요', { error: true }); return;
+    }
+    showErr(e);
+  }
 }
 
 // 옆으로 밀어서 답장 (상대 글은 오른쪽으로, 내 글은 왼쪽으로)
@@ -3903,7 +4058,7 @@ async function catchUp({ force = false, periodic = false } = {}) {
     const lastReal = [...R.msgs].reverse().find((m) => isNum(m.id));
     const from = R.syncedId != null ? R.syncedId : (lastReal ? lastReal.id : 0);
     try {
-      const fresh = await api.getMessagesAfter(R.id, from);
+      const fresh = await api.getMessagesAfter(R.id, from, !!(R.info && R.info.is_notice));
       if (S.room === R) {
         if (fresh.length) R.syncedId = Math.max(from, ...fresh.map((m) => Number(m.id) || 0));
         addMessages(fresh);
@@ -4387,15 +4542,520 @@ function showImage(btn) {
   vid = ovPush(vclose, v);
 }
 
-function showChangePassword() {
+// ---------------------------------------------------------------------
+// v1.41: 비밀번호를 잊었을 때 — ① 복구 코드로 혼자 바로 ② 코드가 없으면 운영팀에 요청
+// ---------------------------------------------------------------------
+const RC_LATER_KEY = 'kkiri-rc-later';
+// v1.42: 이 기기 표시 (무작위 값, 서버에는 해시만) — 비밀번호 찾기 요청이 '전에 쓰던 기기'에서 왔는지 관리자가 알 수 있게
+const DEV_KEY = 'kkiri-dev-id';
+function devId() {
+  try {
+    let v = localStorage.getItem(DEV_KEY);
+    if (!v || !/^[0-9a-f]{32}$/.test(v)) { const b = new Uint8Array(16); crypto.getRandomValues(b); v = [...b].map((x) => x.toString(16).padStart(2, '0')).join(''); localStorage.setItem(DEV_KEY, v); }
+    return v;
+  } catch { return null; }
+}
+// 비밀번호 찾기 요청의 표(이 기기만 앎) — 승인되면 이걸로 새 비밀번호
+const PW_TICKET_KEY = 'kkiri-pw-ticket';
+function getTicket() {
+  try { const t = JSON.parse(localStorage.getItem(PW_TICKET_KEY) || 'null'); return t && /^[0-9a-f]{36}$/.test(t.t || '') ? t : null; } catch { return null; }
+}
+function setTicket(t, u, code) { try { localStorage.setItem(PW_TICKET_KEY, JSON.stringify({ t, u, code: code || '', at: Date.now() })); } catch { /* 저장 안 됨 */ } }
+const fmtCode = (c) => (c && c.length === 6 ? `${c.slice(0, 3)} ${c.slice(3)}` : c || '');
+function cancelTicket() {   // 서버 요청도 닫음 (관리자가 모르고 승인하지 않게)
+  const tk = getTicket(); clearTicket();
+  if (tk && api.cancelPwRequest) api.cancelPwRequest(tk.t).catch(() => {});
+}
+// 이 브라우저에 요청 표를 저장할 수 있는지 (사생활 보호 모드 등은 안 됨 → 예전 방식(임시 비밀번호 문자)으로)
+function canStore() { try { localStorage.setItem('kkiri-st', '1'); localStorage.removeItem('kkiri-st'); return true; } catch { return false; } }
+function clearTicket() { try { localStorage.removeItem(PW_TICKET_KEY); } catch { /* 없음 */ } }
+const devKind = () => (IN_APP ? 'app' : /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent) ? 'mobile' : 'desktop');
+// 승인·거절 알림을 이 기기로 받을 주소 (로그인 전이라 이 요청에만 씀). 안 되면 null — 그래도 앱을 다시 열면 확인됨
+async function requestDeviceAddr() {
+  return limitTime(requestDeviceAddr0(), 25000, 'device').catch(() => null);   // 알림 허용 창을 오래 두어도 요청은 보내지게
+}
+async function requestDeviceAddr0() {
+  try {
+    if (IN_APP) {
+      const P = PN(); if (!P || !api.saveAppPush) return null;
+      let st = await appNotifStatus();
+      if (st.perm !== 'granted' && st.perm !== 'denied') { try { await limitTime(P.requestPermissions(), 30000, 'perm'); } catch { /* 거절·시간 초과 */ } st = await appNotifStatus(); }
+      if (nat.perm !== 'granted') return null;
+      const tok = await limitTime(appRegister(), 15000, 'reg');
+      return tok ? { endpoint: 'fcm:' + tok } : null;
+    }
+    if (!push.supported()) return null;
+    if (Notification.permission === 'default') { try { await limitTime(Notification.requestPermission(), 30000, 'perm'); } catch { /* 시간 초과 */ } }
+    if (Notification.permission !== 'granted') return null;
+    let sub = await limitTime(push.current(), 8000, 'sub');
+    if (sub && !sameServerKey(sub)) { try { await sub.unsubscribe(); } catch { /* 무시 */ } sub = null; }
+    if (!sub) sub = await limitTime(push.subscribe(), 15000, 'sub');
+    const j = sub && sub.toJSON();
+    return j && j.endpoint && j.keys ? { endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth } : null;
+  } catch (e) { console.warn('pw device', e); return null; }
+}
+// 로그인 화면: 내 요청이 어떻게 됐는지 (승인되면 바로 새 비밀번호 정하기)
+let tkChecking = false; let tkAgain = false; let tkAuto = ''; let tkTimer = null;
+async function checkPwTicket() {
+  const box = $('#pwTicket'); if (!box || !api.pwRequestStatus) return;
+  const tk = getTicket();
+  if (!tk) { box.hidden = true; box.innerHTML = ''; return; }
+  if (Date.now() - (tk.at || 0) > 14 * 864e5) { clearTicket(); box.hidden = true; return; }   // 2주 지난 요청은 잊음
+  const card = (cls, title, sub, btns) => {
+    box.hidden = false;
+    box.innerHTML = `<div class="pwt ${cls}"><div class="pwt-t">${ic(cls === 'ok' ? 'check' : cls === 'warn' ? 'alert' : 'clock', 18, 'flex:none')}<div><b>${esc(title)}</b><span>${sub}</span></div></div><div class="pwt-b">${btns}</div></div>`;
+  };
+  const who = `<b>@${esc(tk.u)}</b>`;
+  clearTimeout(tkTimer);
+  if (!box.innerHTML) card('wait', '비밀번호 찾기 요청', `${who} 계정 요청을 확인하고 있어요…`, '');
+  if (tkChecking) { tkAgain = true; return; }   // 확인 중에 화면이 다시 그려지면 끝난 뒤 한 번 더
+  tkChecking = true;
+  let st;
+  try { st = await api.pwRequestStatus(tk.t); } catch { st = 'error'; } finally { tkChecking = false; }
+  if (tkAgain) { tkAgain = false; checkPwTicket(); return; }
+  if (!$('#pwTicket') || (getTicket() || {}).t !== tk.t) return;
+  if (st === 'approved') {
+    card('ok', '비밀번호 찾기가 승인됐어요', `${who} 계정의 새 비밀번호를 정해 주세요. (승인 후 24시간 안)`, '<button class="btn sm" data-tk="set">새 비밀번호 정하기</button>');
+    // 한 번만 저절로 열어 줌 (화면 바뀜이 끝난 뒤 · 다른 창이 떠 있으면 닫힌 뒤에). 닫으면 카드의 버튼으로 다시 열 수 있음
+    if (tkAuto !== tk.t) {
+      tkAuto = tk.t;
+      setTimeout(() => whenNoSheet(() => { if (!S.entered && $('#pwTicket') && !$('#tkOk') && (getTicket() || {}).t === tk.t) showSetPwWithTicket(tk); }), 900);
+    }
+  } else if (st === 'open' || st === 'error') {
+    const old = Date.now() - (tk.at || 0) > 2 * 864e5;
+    card('wait', '운영팀이 확인하고 있어요', `${who} 계정의 비밀번호 찾기 요청이에요. 승인되면 알림으로 알려 드리고, 이 화면에서 바로 새 비밀번호를 정할 수 있어요.`
+      + (tk.code ? `<span class="pwt-code">확인 번호 <b>${esc(fmtCode(tk.code))}</b> — 운영팀이 전화로 물어보면 알려 주세요</span>` : '')
+      + (old ? `<span>요청한 지 이틀이 지났어요. 아이디(@${esc(tk.u)})가 맞는지 확인하고, 틀렸다면 요청을 지우고 다시 보내 주세요.</span>` : '')
+      + (st === 'error' ? '<span>(지금은 상태를 확인하지 못했어요)</span>' : ''),
+      '<button class="btn text sm" data-tk="cancel">요청 지우기</button><button class="btn line sm" data-tk="check">다시 확인</button>');
+    tkTimer = setTimeout(() => { if (!document.hidden && !S.entered && $('#pwTicket')) checkPwTicket(); }, 25000);   // 화면을 보고 있는 동안 저절로 다시 확인
+  } else if (st === 'dismissed') {
+    card('warn', '요청이 처리되지 않았어요', `${who} 계정 요청이 닫혔어요. 아이디와 휴대폰 번호를 확인해 다시 요청해 주세요.`, '<button class="btn line sm" data-tk="cancel">확인</button>');
+  } else if (st === 'expired') {
+    card('warn', '승인한 지 24시간이 지났어요', `${who} 계정은 다시 요청해 주세요.`, '<button class="btn line sm" data-tk="cancel">확인</button>');
+  } else if (st === 'done') {
+    card('ok', '비밀번호 찾기 요청이 처리됐어요', `${who} 계정은 운영팀이 보낸 <b>임시 비밀번호</b>(문자) 또는 새로 정한 비밀번호로 로그인해 주세요.`, '<button class="btn line sm" data-tk="cancel">확인</button>');
+  } else { clearTicket(); box.hidden = true; box.innerHTML = ''; return; }   // unknown
+  box.onclick = (e) => {
+    const b = e.target.closest('[data-tk]'); if (!b) return;
+    if (b.dataset.tk === 'set') showSetPwWithTicket(tk);
+    else if (b.dataset.tk === 'check') { box.innerHTML = ''; checkPwTicket(); }
+    else { cancelTicket(); box.hidden = true; box.innerHTML = ''; clearTimeout(tkTimer); }
+  };
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !S.entered && $('#pwTicket')) checkPwTicket(); });
+// 알림이 왔을 때 (앱을 보고 있으면 알림창에 안 뜨니까) — 로그인 전이면 요청 상태, 관리자면 처리할 요청을 바로 다시 확인
+let pushNoteAt = 0; let pushNoteT = null;
+function onPushArrived() {
+  if (!S.entered) { if ($('#pwTicket')) checkPwTicket(); return; }
+  if (!S.me || !S.me.is_admin || pushNoteT) return;
+  const wait = Math.max(0, 20000 - (Date.now() - pushNoteAt));   // 대화 알림마다 서버에 묻지 않게 — 20초에 한 번, 놓치지 않게 미뤄서
+  pushNoteT = setTimeout(() => { pushNoteT = null; pushNoteAt = Date.now(); notePwReqs(); }, wait);
+}
+// 승인된 요청 → 이 기기에서 새 비밀번호
+function showSetPwWithTicket(tk) {
   openSheet({
-    title: '비밀번호 변경',
+    title: '새 비밀번호 정하기',
+    body: `<p class="sheet-desc" style="margin-top:0">운영팀이 <b>@${esc(tk.u)}</b> 계정의 비밀번호 찾기를 승인했어요. 새 비밀번호를 정해 주세요.</p>
+      <div class="auth-fields">
+        ${fieldHtml('tkPw1', '새 비밀번호', { type: 'password', ph: '6자 이상', auto: 'new-password' })}
+        ${fieldHtml('tkPw2', '새 비밀번호 확인', { type: 'password', ph: '한 번 더 입력', auto: 'new-password' })}
+      </div><button class="btn" id="tkOk" style="margin-top:20px">새 비밀번호로 바꾸기</button>`,
+    onMount(sheet, close) {
+      const $f = (k) => $(`#f-${k}`, sheet);
+      sheet.addEventListener('input', (e) => { if (e.target.name) setFieldErr(sheet, e.target.name, ''); });
+      setTimeout(() => { const i = $f('tkPw1'); if (i) i.focus(); }, 300);
+      $('#tkOk', sheet).onclick = async () => {
+        const p1 = $f('tkPw1').value; const p2 = $f('tkPw2').value;
+        setFieldErr(sheet, 'tkPw1', p1.length < 6 ? '6자 이상 입력해 주세요' : '');
+        setFieldErr(sheet, 'tkPw2', p1.length >= 6 && p2 !== p1 ? '비밀번호가 일치하지 않아요' : '');
+        if (p1.length < 6 || p2 !== p1) return;
+        const btn = $('#tkOk', sheet); btn.disabled = true;
+        try {
+          const r = await api.resetWithTicket(tk.t, p1);
+          clearTicket(); close();
+          const u = r.username || tk.u;
+          const fill = () => {
+            checkPwTicket();
+            if (S.entered) return;
+            const fu = $('#f-username'); const fp = $('#f-password');
+            if (fu) fu.value = u; if (fp) fp.value = p1;
+            toast('새 비밀번호로 로그인해 주세요');
+            const lb = $('#authBtn'); if (lb) lb.focus();
+          };
+          setTimeout(() => (r.code ? showRecoveryCodeResult(r.code, { afterReset: 'ticket', onDone: fill }) : fill()), 250);
+        } catch (e) {
+          btn.disabled = false;
+          let m = guestErr(e);
+          if (/인터넷/.test(m)) m = '인터넷이 끊겼어요. 비밀번호가 이미 바뀌었을 수 있으니 먼저 새 비밀번호로 로그인해 보세요';
+          if (/이미 새 비밀번호|24시간|승인되지/.test(m)) { clearTicket(); checkPwTicket(); }
+          setFieldErr(sheet, 'tkPw1', m);
+        }
+      };
+    },
+  });
+}
+// 로그인 전 화면의 오류 문구 (관리자용 안내 대신 손님에게 맞는 말로)
+const guestErr = (e) => {
+  const m = (e && e.message) || '';
+  if (/데이터베이스 업데이트/.test(m)) return '지금은 이 기능을 쓸 수 없어요. 잠시 후 다시 해 주세요';
+  if (!navigator.onLine || /Failed to fetch|NetworkError|Load failed/i.test(m)) return '인터넷 연결을 확인하고 다시 해 주세요';
+  return m || '잠시 후 다시 해 주세요';
+};
+const shortWhen = (iso) => { const d = new Date(iso); return `${d.getMonth() + 1}월 ${d.getDate()}일 ${fmtTime(iso)}`; };
+function showForgotPassword(username = '') {
+  openSheet({
+    title: '비밀번호를 잊었어요',
+    body: `<p class="sheet-desc" style="margin-top:0">비밀번호 복구 코드를 만들어 두었다면 지금 바로 새 비밀번호로 바꿀 수 있어요.</p>
+      <div class="card fp-list">
+        <button class="item" data-fp="code"><span class="tile mint">${ic('key', 19)}</span><span class="label">복구 코드가 있어요<span class="sub">아이디와 복구 코드로 바로 바꾸기</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+        <button class="item" data-fp="help"><span class="tile sky">${ic('phone', 19)}</span><span class="label">복구 코드가 없어요<span class="sub">운영팀에 요청하면 확인 뒤 임시 비밀번호를 알려 드려요</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>
+      </div>
+      <button class="btn gray" data-close style="margin-top:14px">닫기</button>`,
+    onMount(sheet, close) {
+      sheet.addEventListener('click', (e) => {
+        const b = e.target.closest('[data-fp]'); if (!b) return;
+        close(); setTimeout(() => (b.dataset.fp === 'code' ? showResetWithCode(username) : showPwHelpRequest(username)), 250);
+      });
+    },
+  });
+}
+function showResetWithCode(username = '') {
+  openSheet({
+    title: '복구 코드로 바꾸기',
     body: `<div class="auth-fields">
-        ${fieldHtml('cur', '현재 비밀번호', { type: 'password', ph: '현재 비밀번호', auto: 'current-password' })}
+        ${fieldHtml('rcUser', '아이디', { ph: '아이디', auto: 'username', max: 20 })}
+        ${fieldHtml('rcCode', '복구 코드', { ph: 'XXXX-XXXX-XXXX', help: '복구 코드를 만들 때 저장해 둔 12자리예요 (- 는 빼도 돼요)', max: 20 })}
+        ${fieldHtml('rcPw1', '새 비밀번호', { type: 'password', ph: '6자 이상', auto: 'new-password' })}
+        ${fieldHtml('rcPw2', '새 비밀번호 확인', { type: 'password', ph: '한 번 더 입력', auto: 'new-password' })}
+      </div><button class="btn" id="rcOk" style="margin-top:20px">새 비밀번호로 바꾸기</button>`,
+    onMount(sheet, close) {
+      const $f = (k) => $(`#f-${k}`, sheet);
+      $f('rcUser').value = username;
+      $f('rcCode').setAttribute('autocapitalize', 'characters');
+      sheet.addEventListener('input', (e) => { if (e.target.name) setFieldErr(sheet, e.target.name, ''); });
+      (username ? $f('rcCode') : $f('rcUser')).focus();
+      $('#rcOk', sheet).onclick = async () => {
+        const u = $f('rcUser').value.trim().toLowerCase(); const code = $f('rcCode').value.trim(); const p1 = $f('rcPw1').value; const p2 = $f('rcPw2').value;
+        const errs = {};
+        if (!u) errs.rcUser = '아이디를 입력해 주세요';
+        if (code.replace(/[^A-Za-z0-9]/g, '').length !== 12) errs.rcCode = '복구 코드 12자리를 입력해 주세요';
+        if (p1.length < 6) errs.rcPw1 = '6자 이상 입력해 주세요';
+        if (!p2 || p2 !== p1) errs.rcPw2 = '비밀번호가 일치하지 않아요';
+        ['rcUser', 'rcCode', 'rcPw1', 'rcPw2'].forEach((k) => setFieldErr(sheet, k, errs[k] || ''));
+        if (Object.keys(errs).length) return;
+        const btn = $('#rcOk', sheet); btn.disabled = true;
+        try {
+          const newCode = await api.resetWithCode(u, code, p1);
+          close();
+          setTimeout(() => showRecoveryCodeResult(newCode, { afterReset: true, onDone: () => {
+            if (S.entered) return;
+            const fu = $('#f-username'); const fp = $('#f-password');
+            if (fu) fu.value = u; if (fp) fp.value = p1;
+            toast('새 비밀번호로 로그인해 주세요');
+            const lb = $('#authBtn'); if (lb) lb.focus();
+          } }), 250);
+        } catch (e) {
+          btn.disabled = false;
+          let m = guestErr(e);
+          if (/인터넷/.test(m)) m = '인터넷이 끊겼어요. 비밀번호가 이미 바뀌었을 수 있으니 먼저 새 비밀번호로 로그인해 보세요';
+          setFieldErr(sheet, /비밀번호/.test(m) && !/코드|인터넷/.test(m) ? 'rcPw1' : 'rcCode', m);
+        }
+      };
+    },
+  });
+}
+function showPwHelpRequest(username = '') {
+  openSheet({
+    title: '운영팀에 요청하기',
+    body: `<p class="sheet-desc" style="margin-top:0">아이디와 휴대폰 번호를 알려 주세요. 운영팀이 본인인지 확인하고 <b>승인하면 알림</b>으로 알려 드려요. 그다음 <b>지금 이 화면(같은 앱 또는 같은 브라우저)</b>에서 바로 새 비밀번호를 정할 수 있어요.</p>
+      <div class="auth-fields">
+        ${fieldHtml('hpUser', '아이디', { ph: '아이디', auto: 'username', max: 20 })}
+        ${fieldHtml('hpPhone', '휴대폰 번호', { type: 'tel', ph: '010-1234-5678', auto: 'tel', max: 16, help: '가입할 때 넣은 번호를 적어 주세요. 번호를 등록하지 않았다면 연락받을 번호를 적어 주세요 — 운영팀이 전화로 본인인지 확인해요' })}
+        ${fieldHtml('hpNote', '남길 말 (선택)', { ph: '예: 저녁 6시 이후에 연락 주세요', max: 200 })}
+      </div>
+      <p class="sheet-desc" style="margin:14px 0 0">요청을 보낼 때 <b>알림 허용</b>을 물어보면 '허용'을 눌러 주세요. 승인되면 이 기기로 알림이 와요.</p>
+      <button class="btn" id="hpOk" style="margin-top:16px">요청 보내기</button>`,
+    onMount(sheet, close) {
+      const $f = (k) => $(`#f-${k}`, sheet);
+      $f('hpUser').value = username;
+      sheet.addEventListener('input', (e) => { if (e.target.name) setFieldErr(sheet, e.target.name, ''); });
+      $('#hpOk', sheet).onclick = async () => {
+        const u = $f('hpUser').value.trim().toLowerCase(); const ph = $f('hpPhone').value.trim();
+        const errs = {};
+        if (!u) errs.hpUser = '아이디를 입력해 주세요';
+        if (!normPhone(ph)) errs.hpPhone = '휴대폰 번호를 정확히 입력해 주세요 (예: 010-1234-5678)';
+        ['hpUser', 'hpPhone'].forEach((k) => setFieldErr(sheet, k, errs[k] || ''));
+        if (Object.keys(errs).length) return;
+        const prev = getTicket();
+        if (prev && prev.u === u && !(await ask('이미 요청했어요', '운영팀이 확인하고 있어요. 다시 보내면 앞의 요청은 없어지고 새 요청으로 바뀌어요.', '다시 보내기', false))) return;
+        const btn = $('#hpOk', sheet); btn.disabled = true; btn.textContent = '보내는 중…';
+        try {
+          const store = canStore();   // 저장이 안 되는 브라우저면 승인 방식 대신 예전 방식(임시 비밀번호 문자)
+          const device = store ? await requestDeviceAddr() : null;   // 알림 허용을 물어볼 수 있음 (승인 알림을 받을 곳)
+          const res = await limitTime(api.requestPasswordHelp(u, ph, $f('hpNote').value.trim(), store ? { dev: devId(), device, kind: devKind() } : {}), 20000, '인터넷 연결을 확인하고 다시 해 주세요');
+          const ticket = store && res && res.ticket;   // 저장이 안 되는 브라우저 → 예전 방식 안내 (임시 비밀번호 문자)
+          if (prev && prev.u !== u && ticket) cancelTicket();   // 다른 아이디로 다시 보냄 → 앞의 요청은 취소
+          if (ticket) setTicket(ticket, u, res.code);
+          close();
+          setTimeout(() => {
+            openSheet({ title: '요청을 보냈어요', body: ticket
+              ? `<p class="sheet-desc" style="margin-top:0">운영팀이 본인인지 확인하고 승인하면 ${device ? '<b>이 휴대폰으로 알림</b>이 가요' : '로그인 화면에 표시돼요 (알림은 받을 수 없어서 <b>끼리톡을 다시 열어</b> 확인해 주세요)'}. 보통 하루 안에 처리돼요.</p>
+                <div class="pw-code-big">확인 번호<b>${esc(fmtCode(res.code))}</b><span>운영팀이 가입할 때 등록한 번호로 전화해서 이 번호를 물어볼 수 있어요. 다른 사람에게는 알려 주지 마세요.</span></div>
+                <p class="sheet-desc">승인되면 <b>지금 이 화면(같은 앱 또는 같은 브라우저)</b>에서 바로 새 비밀번호를 정할 수 있어요.</p>
+                <button class="btn" data-close>확인</button>`
+              : `<p class="sheet-desc" style="margin-top:0">운영팀이 확인한 뒤 <b>가입할 때 등록한 휴대폰 번호</b>로 임시 비밀번호를 알려 드려요. 보통 하루 안에 연락드려요.</p>
+                <button class="btn" data-close>확인</button>` });
+            checkPwTicket();
+          }, 250);
+        } catch (e) { btn.disabled = false; btn.textContent = '요청 보내기'; const m = guestErr(e); setFieldErr(sheet, /휴대폰 번호/.test(m) ? 'hpPhone' : 'hpUser', m); }
+      };
+    },
+  });
+}
+// 더보기 맨 위 권유 (복구 코드가 없을 때, '나중에'를 누르면 7일 동안 숨김)
+function recoveryNudgeHtml() {
+  if (!S.sec || !api.createRecoveryCode || dbOutdated()) return '';
+  if (S.sec.temp_pw) return `<div class="card rc-nudge warn"><div class="rc-n-t">${ic('lock', 20, 'flex:none')}<div><b>임시 비밀번호를 쓰고 있어요</b><span>운영팀이 알려 드린 비밀번호예요. 나만 아는 새 비밀번호로 바꿔 주세요.</span></div></div>
+    <div class="rc-n-b"><button class="btn sm" data-act="change-password-temp">지금 바꾸기</button></div></div>`;
+  if (S.sec.recovery) return '';
+  let later = 0; try { later = Number(localStorage.getItem(RC_LATER_KEY)) || 0; } catch { /* 없음 */ }
+  if (Date.now() - later < 7 * 864e5) return '';
+  return `<div class="card rc-nudge"><div class="rc-n-t">${ic('key', 20, 'flex:none')}<div><b>복구 코드를 만들어 두세요</b><span>비밀번호를 잊었을 때 운영팀을 기다리지 않고 혼자 바로 찾을 수 있어요.</span></div></div>
+    <div class="rc-n-b"><button class="btn sm" data-act="recovery-code">만들기</button><button class="btn text sm" data-act="rc-later">나중에</button></div></div>`;
+}
+async function loadSecurity() {
+  if (!api.mySecurity || dbOutdated()) return;
+  const uid = S.uid;
+  try { S.sec = await api.mySecurity(); } catch (e) { console.warn('security', e); return; }
+  if (!S.entered || S.uid !== uid) return;
+  if (S.sec && !S.sec.temp_pw) S.loginPw = '';   // 임시 비밀번호가 아니면 기억할 필요 없음
+  if (S.tab === 'more' && !S.room) renderMain();
+  if (S.sec && S.sec.temp_pw) whenNoSheet(() => { if (S.entered && S.uid === uid && S.sec && S.sec.temp_pw) showChangePassword({ temp: true }); });
+}
+// 다른 안내 창(알림 받기 등)이 떠 있으면 닫힌 뒤에
+function whenNoSheet(fn, tries = 0) {
+  if (!$('.sheet-back')) { fn(); return; }
+  if (tries < 200) setTimeout(() => whenNoSheet(fn, tries + 1), 1500);
+}
+// 임시 비밀번호를 바꾼 직전 → 방금 정한 새 비밀번호로 바로 복구 코드 만들기 권유
+function offerRecoveryAfterReset(pw, { signup = false } = {}) {
+  if (!S.entered || (S.sec && S.sec.recovery)) return;
+  const uid = S.uid;
+  whenNoSheet(() => {
+    if (!S.entered || S.uid !== uid || (S.sec && S.sec.recovery) || !S.me || (S.me.status && S.me.status !== 'active') || dbOutdated()) return;
+    openSheet({ title: signup ? '비밀번호 복구 코드를 만들어 둘까요?' : '복구 코드도 만들어 둘까요?', body: `<p class="sheet-desc" style="margin-top:0">${signup ? '비밀번호를 잊거나 <b>휴대폰을 바꿨을 때</b>도 이 코드만 있으면 운영팀을 기다리지 않고 혼자 바로 새 비밀번호를 정할 수 있어요. 1분이면 돼요.' : '다음에 비밀번호를 잊으면 복구 코드로 운영팀을 기다리지 않고 혼자 바로 바꿀 수 있어요.'}</p>
+      <button class="btn" data-rc-now>지금 만들기</button><button class="btn text" data-close style="margin-top:6px">나중에</button>`,
+    onMount(sheet, close) {
+      $('[data-rc-now]', sheet).onclick = async (e) => {
+        e.currentTarget.disabled = true;
+        try { const code = await makeCode(pw); close(); setTimeout(() => showRecoveryCodeResult(code), 250); }
+        catch (ex) { close(); showErr(ex); }
+      };
+    } });
+  });
+}
+async function makeCode(pw) {
+  const code = await api.createRecoveryCode(pw);
+  S.sec = { ...(S.sec || {}), recovery: true, recovery_at: new Date().toISOString() };
+  if (S.tab === 'more' && !S.room) renderMain();
+  return code;
+}
+function showRecoveryCode() {
+  const has = !!(S.sec && S.sec.recovery);
+  openSheet({
+    title: '비밀번호 복구 코드',
+    body: `<div style="display:flex;flex-direction:column;align-items:center;text-align:center;padding-top:6px"><div class="key-icon">${ic('key', 30)}</div></div>
+      <p class="sheet-desc" style="margin-top:14px">비밀번호를 잊었을 때 <b>아이디 + 복구 코드</b>로 혼자 바로 새 비밀번호를 정할 수 있어요. 코드는 만들 때 <b>한 번만</b> 보여 드려요.</p>
+      ${has ? `<p class="sheet-desc"><b>${esc(fmtDate(S.sec.recovery_at))}</b>에 만든 코드가 있어요. 잃어버렸다면 새로 만들어 주세요. 새로 만들면 예전 코드는 쓸 수 없어요.</p>` : ''}
+      <div class="auth-fields">${fieldHtml('rcCur', '지금 비밀번호', { type: 'password', ph: '본인 확인을 위해 입력해 주세요', auto: 'current-password' })}</div>
+      <button class="btn" id="rcMake" style="margin-top:16px">${has ? '새 코드 만들기' : '복구 코드 만들기'}</button>
+      <button class="btn text" data-close style="margin-top:6px">닫기</button>`,
+    onMount(sheet, close) {
+      sheet.addEventListener('input', () => setFieldErr(sheet, 'rcCur', ''));
+      $('#rcMake', sheet).onclick = async () => {
+        const pw = $('#f-rcCur', sheet).value;
+        if (!pw) { setFieldErr(sheet, 'rcCur', '지금 비밀번호를 입력해 주세요'); return; }
+        if (has && !(await ask('새 복구 코드를 만들까요?', '예전에 저장해 둔 코드는 더 이상 쓸 수 없어요.', '새로 만들기', false))) return;
+        const btn = $('#rcMake', sheet); btn.disabled = true;
+        try { const code = await makeCode(pw); close(); setTimeout(() => showRecoveryCodeResult(code), 250); }
+        catch (e) { btn.disabled = false; setFieldErr(sheet, 'rcCur', e.message || '복구 코드를 만들지 못했어요'); }
+      };
+    },
+  });
+}
+function savedOrAgain() {
+  return new Promise((resolve) => {
+    let v = 'close';
+    openSheet({ title: '복구 코드를 저장했나요?', bare: true,
+      body: `<div class="confirm"><h3>복구 코드를 저장했나요?</h3><p>이 창을 닫으면 코드를 다시 볼 수 없어요.</p></div>
+        <div class="two"><button class="btn gray" data-again>다시 보기</button><button class="btn" data-saved>저장했어요</button></div>`,
+      onMount(sheet, close) {
+        $('[data-again]', sheet).onclick = () => { v = 'again'; close(); };
+        $('[data-saved]', sheet).onclick = () => { v = 'saved'; close(); };
+        onSheetGone(sheet, () => resolve(v));
+      } });
+  });
+}
+// 새 복구 코드 보여 주기 — '저장했어요' 없이 닫으면(뒤로 가기 등) 저장했는지 한 번 더 물음
+function showRecoveryCodeResult(code, { afterReset = false, onDone } = {}) {
+  openSheet({
+    title: afterReset ? '비밀번호를 바꿨어요' : '복구 코드가 만들어졌어요', bare: true,   // afterReset: true(복구 코드로) · 'ticket'(승인으로)
+    body: `<div style="display:flex;flex-direction:column;align-items:center;text-align:center;padding-top:16px">
+        <div class="key-icon">${ic('key', 30)}</div>
+        <h3 style="font-size:19px;font-weight:700;margin:14px 0 0;letter-spacing:-0.4px">${afterReset === 'ticket' ? '새 비밀번호를 정했어요' : afterReset ? '새 복구 코드도 함께 만들었어요' : '이 코드를 꼭 저장해 두세요'}</h3>
+        <p style="font-size:14px;color:var(--ink2);margin:8px 0 0;line-height:1.6">${afterReset === 'ticket' ? '다음에 비밀번호를 잊으면 아래 <b>복구 코드</b>로 운영팀을 기다리지 않고 혼자 바로 바꿀 수 있어요. 꼭 저장해 두세요.' : afterReset ? '비밀번호를 바꿨어요. 방금 쓴 코드는 이제 쓸 수 없어요. 다음에 쓸 새 코드를 저장해 두세요.' : '비밀번호를 잊었을 때 이 코드로 혼자 바로 찾을 수 있어요.'}<br>화면을 캡처하거나 메모장에 적어 두세요. 다른 사람에게는 알려 주지 마세요.</p>
+        <div class="temp-pw rc-code" id="rcCodeView">${esc(code)}</div></div>
+      <button class="btn" data-copy style="margin-top:16px">${ic('copy', 20)}복사하기</button>
+      <button class="btn text" id="rcSaved" style="margin-top:6px">저장했어요</button>`,
+    onMount(sheet, close) {
+      const dim = sheet.previousElementSibling; if (dim) dim.removeAttribute('data-close');   // 바깥을 잘못 눌러 코드를 놓치지 않게
+      let saved = false;
+      onSheetGone(sheet, async () => {
+        // '다시 보기'를 눌렀을 때만 다시 보여 줌 (뒤로 가기로 또 닫으면 그냥 닫힘 — 두 창을 오가지 않게)
+        if (!saved && (await savedOrAgain()) === 'again') { showRecoveryCodeResult(code, { afterReset, onDone }); return; }
+        if (onDone) onDone();
+      });
+      $('[data-copy]', sheet).onclick = async (e) => {
+        const b = e.currentTarget;
+        try { await navigator.clipboard.writeText(code); } catch { toast('복사하지 못했어요. 직접 적어 주세요', { error: true }); return; }
+        b.style.background = 'var(--mint-bubble)'; b.innerHTML = `${ic('check', 20)}복사했어요`;
+        toast('복구 코드를 복사했어요');
+      };
+      $('#rcSaved', sheet).onclick = () => { saved = true; close(); };
+    },
+  });
+}
+// 관리자: 처리할 비밀번호 찾기 요청이 새로 있으면 눌러서 바로 여는 안내
+let pwReqShown = -1;
+async function notePwReqs(first = false) {
+  if (!S.entered || !S.me || !S.me.is_admin || !api.adminPwRequests || dbOutdated()) return;
+  await refreshAdminBadges();
+  if (!S.entered) return;
+  const n = S.pwReqs || 0;
+  if (n > 0 && (first || n > pwReqShown) && !$('.sheet-back')) toast(`비밀번호 찾기 요청이 ${n}건 있어요 — 눌러서 확인`, { onClick: () => showPwRequests(), ms: 6000 });
+  pwReqShown = n;
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S.entered && S.me && S.me.is_admin) notePwReqs(); });
+// 관리자: 비밀번호 찾기 요청 — v1.42: '승인하기' 한 번 → 고객 기기로 알림, 고객이 그 기기에서 바로 새 비밀번호
+//   안심할 수 있는 요청(전에 로그인했던 기기 + 등록 번호와 같음)은 바로 승인, 아니면 확인을 한 번 더 받음
+async function showPwRequests() {
+  if (!api.adminPwRequests) return;
+  let list;
+  try { list = await api.adminPwRequests(); } catch (e) { showErr(e); return; }
+  const tel = (v) => esc(fmtTel(v || ''));
+  const safe = (r) => r.can_approve && (r.safe ?? (r.dev_known && r.phone_match));   // 서버가 판단 (다른 기기에서 온 요청이 함께 있으면 안전하지 않음)
+  const sig = (good, text) => `<div class="${good ? 'pwr-ok' : 'pwr-warn'}">${ic(good ? 'check' : 'alert', 15, 'flex:none')}<span>${text}</span></div>`;
+  const row = (r) => `<div class="pwr" data-id="${esc(r.id)}" data-uid="${esc(r.user_id)}">
+      <div class="pwr-h"><b>${esc(r.display_name || '(이름 없음)')}</b><span>@${esc(r.username)}</span>${r.status === 'suspended' ? '<span class="pwr-tag">이용 정지</span>' : r.status === 'pending' ? '<span class="pwr-tag">승인 대기</span>' : ''}<span class="pwr-t">${esc(shortWhen(r.created_at))}</span></div>
+      <div class="pwr-p">입력한 번호 <b>${tel(r.phone)}</b>${r.reg_phone && !r.phone_match ? ` · 등록한 번호 <b>${tel(r.reg_phone)}</b>` : ''}${r.dev_kind ? ` · ${esc(r.dev_kind)}` : ''}</div>
+      ${r.can_approve ? sig(r.dev_known, r.dev_known ? '전에 이 계정으로 로그인했던 기기에서 보낸 요청이에요' : '처음 보는 기기에서 보낸 요청이에요') : ''}
+      ${sig(r.phone_match, r.phone_match ? '가입할 때 등록한 번호와 같아요' : r.reg_phone ? '입력한 번호가 등록한 번호와 달라요' : '등록한 번호가 없는 계정이에요')}
+      ${r.note ? `<div class="pwr-n">남긴 말: ${esc(r.note)}</div>` : ''}
+      ${r.can_approve && !safe(r) ? `<div class="pwr-n">${r.dev_known && r.phone_match ? '같은 회원에게 다른 기기에서 온 요청도 있어요. ' : ''}다른 사람이 남의 계정을 가져가려는 것일 수 있어요. ${r.reg_phone ? `<b>등록한 번호(${tel(r.reg_phone)})</b>로 전화해서` : '입력한 번호로 전화해 친구 이름·최근 대화 상대처럼 본인만 아는 것을 확인하고,'} 고객 화면에 보이는 <b>확인 번호 6자리</b>를 받아 승인해 주세요.</div>` : ''}
+      <div class="pwr-b">${r.can_approve ? `<button class="btn sm" data-pw-approve>${safe(r) ? '승인하기' : '확인 번호로 승인'}</button>` : '<button class="btn sm" data-pw-reset>임시 비밀번호 만들기</button>'}<button class="btn text sm" data-pw-dismiss>요청 닫기</button></div></div>`;
+  openSheet({
+    title: '비밀번호 찾기 요청',
+    body: `<p class="sheet-desc" style="margin-top:0">승인하면 고객 기기로 알림이 가고, 고객이 <b>요청한 기기에서 24시간 안에</b> 새 비밀번호를 정할 수 있어요. 문자를 보낼 필요가 없어요.</p>
+      <div id="pwrList">${list.length ? list.map(row).join('') : '<div class="empty-line">처리할 요청이 없어요</div>'}</div>
+      <button class="btn gray" data-close style="margin-top:14px">닫기</button>`,
+    onMount(sheet, close) {
+      let busy = false;
+      const drop = (pred) => { $$('.pwr', sheet).forEach((x) => { if (pred(x)) x.remove(); }); afterPwReq(sheet); };
+      sheet.addEventListener('click', async (e) => {
+        const box = e.target.closest('.pwr'); if (!box || busy) return;
+        const r = list.find((x) => String(x.id) === box.dataset.id); if (!r) return;
+        const act = e.target.closest('[data-pw-approve]') ? 'approve' : e.target.closest('[data-pw-reset]') ? 'reset' : e.target.closest('[data-pw-dismiss]') ? 'dismiss' : '';
+        if (!act) return;
+        if (act === 'dismiss' && !(await ask('요청을 닫을까요?', '비밀번호는 바뀌지 않아요. 장난이거나 이미 해결된 요청일 때 닫아 주세요.', '닫기', false))) return;
+        let code = null;
+        if (act === 'approve' && !safe(r)) { code = await askConfirmCode(r); if (!code) return; }
+        if (act === 'reset' && !r.phone_match && !(await ask('본인인지 확인했나요?', r.reg_phone
+          ? `입력한 번호가 등록한 번호와 달라요. 임시 비밀번호는 등록한 번호(${fmtTel(r.reg_phone)})로만 보낼게요.`
+          : '등록한 번호가 없는 계정이에요. 전화로 본인만 아는 것을 물어 확인했을 때만 진행해 주세요.', '확인했어요', true))) return;
+        busy = true; $$('.pwr-b .btn', box).forEach((b) => { b.disabled = true; });
+        try {
+          const pw = await api.adminResolvePwRequest(r.id, act, code);
+          if (act === 'approve') {   // 같은 회원의 다른 요청은 서버에서 함께 닫힘
+            drop((x) => x.dataset.uid === String(r.user_id));
+            toast(r.can_notify ? '승인했어요. 고객 기기로 알림을 보냈어요' : '승인했어요. 고객이 끼리톡을 다시 열면 새 비밀번호를 정할 수 있어요', { ms: 4000 });
+          } else if (act === 'reset') {
+            drop((x) => x.dataset.uid === String(r.user_id)); close();
+            setTimeout(() => showTempPasswordFor(r, pw), 250);
+          } else { drop((x) => x === box); toast('요청을 닫았어요'); }
+        } catch (ex) {
+          if (/이미 처리된/.test(ex.message || '')) { drop((x) => x === box); toast('다른 관리자가 이미 처리했거나 고객이 취소한 요청이에요'); }
+          else { $$('.pwr-b .btn', box).forEach((b) => { b.disabled = false; }); showErr(ex); }
+        } finally { busy = false; }
+      });
+    },
+  });
+}
+// 확인 번호 넣기 — 고객 화면에 보이는 6자리 (전화로 물어봄) → 요청한 사람이 그 고객인지 정확히 맞춤
+function askConfirmCode(r) {
+  return new Promise((resolve) => {
+    let v = null;
+    const to = r.reg_phone || r.phone;
+    openSheet({ title: '확인 번호로 승인',
+      body: `<p class="sheet-desc" style="margin-top:0"><b>${esc(r.display_name || '')} (@${esc(r.username)})</b>님의 ${r.reg_phone ? '<b>등록한 번호</b>' : '입력한 번호'} <b>${esc(fmtTel(to || ''))}</b>로 전화해서, 고객 끼리톡 화면에 보이는 <b>확인 번호 6자리</b>를 불러 달라고 하세요.</p>
+        ${r.reg_phone ? '' : '<p class="sheet-desc">등록한 번호가 없는 계정이에요. 친구 이름·최근 대화 상대처럼 본인만 아는 것도 꼭 물어보세요.</p>'}
+        ${to ? `<a class="btn line" href="tel:${esc(to.replace(/[^0-9]/g, ''))}" style="margin-bottom:12px">${ic('call', 20)}전화 걸기</a>` : ''}
+        <div class="auth-fields">${fieldHtml('cfCode', '확인 번호', { type: 'tel', ph: '6자리 숫자', max: 7, help: '번호가 다르면 승인하지 마세요 — 다른 사람이 보낸 요청일 수 있어요' })}</div>
+        <button class="btn" id="cfOk" style="margin-top:16px">승인하기</button>`,
+      onMount(sheet, close) {
+        const inp = $('#f-cfCode', sheet); inp.setAttribute('inputmode', 'numeric');
+        setTimeout(() => inp.focus(), 300);
+        inp.addEventListener('input', () => setFieldErr(sheet, 'cfCode', ''));
+        $('#cfOk', sheet).onclick = () => {
+          const c = inp.value.replace(/[^0-9]/g, '');
+          if (c.length !== 6) { setFieldErr(sheet, 'cfCode', '확인 번호 6자리를 넣어 주세요'); return; }
+          v = c; close();
+        };
+        onSheetGone(sheet, () => resolve(v));
+      } });
+  });
+}
+function afterPwReq(sheet) {
+  { const l = $('#pwrList', sheet); if (l && !$('.pwr', l)) l.innerHTML = '<div class="empty-line">처리할 요청이 없어요</div>'; }
+  refreshAdminBadges();
+  if (S.admin && S.admin.sec === 'home' && admMain()) renderHomeSec();   // 현황의 '처리할 일' 다시 그림
+}
+// 임시 비밀번호 + 보낼 문자 (등록한 번호로 · 문자 앱 바로 열기)
+function showTempPasswordFor(r, pw) {
+  const text = `[${APP}] @${r.username} 님의 임시 비밀번호는 ${pw} 이에요. 로그인하면 새 비밀번호로 바꾸는 화면이 나와요.`;
+  const to = r.reg_phone || r.phone || '';
+  const tel = to.replace(/[^0-9]/g, '');
+  openSheet({
+    title: '임시 비밀번호', bare: true,
+    body: `<div style="display:flex;flex-direction:column;align-items:center;text-align:center;padding-top:16px">
+        <div class="key-icon">${ic('key', 30)}</div>
+        <h3 style="font-size:19px;font-weight:700;margin:14px 0 0;letter-spacing:-0.4px">임시 비밀번호가 발급됐어요</h3>
+        <p style="font-size:14px;color:var(--ink2);margin:8px 0 0;line-height:1.6">${esc(r.display_name || r.username)}님의 ${r.reg_phone ? '등록한 번호' : '확인한 번호'} <b>${esc(fmtTel(to))}</b>로 문자를 보내 주세요.</p>
+        <div class="temp-pw">${esc(pw)}</div></div>
+      <div class="pwr-msg" id="pwrMsg">${esc(text)}</div>
+      ${tel ? `<a class="btn" style="margin-top:12px" href="sms:${tel}?&body=${encodeURIComponent(text)}">${ic('mail', 20)}문자 앱으로 보내기</a>` : ''}
+      <button class="btn line" data-copy-msg style="margin-top:8px">${ic('copy', 20)}보낼 문자 복사</button>
+      <button class="btn text" data-close style="margin-top:6px">닫기</button>`,
+    onMount(sheet) {
+      const dim = sheet.previousElementSibling; if (dim) dim.removeAttribute('data-close');   // 바깥을 잘못 눌러 놓치지 않게
+      $('[data-copy-msg]', sheet).onclick = async () => {
+        try { await navigator.clipboard.writeText(text); toast('보낼 문자를 복사했어요'); } catch { toast('복사하지 못했어요. 직접 적어 주세요', { error: true }); }
+      };
+    },
+  });
+}
+
+function showChangePassword({ temp = false } = {}) {
+  openSheet({
+    title: temp ? '새 비밀번호로 바꿔 주세요' : '비밀번호 변경',
+    body: `<div class="auth-fields">
+        ${temp ? `<p class="sheet-desc" style="margin-top:0">지금은 운영팀이 알려 드린 <b>임시 비밀번호</b>로 로그인했어요. 나만 아는 새 비밀번호로 바꿔 주세요.</p>` : ''}
+        ${fieldHtml('cur', temp ? '임시 비밀번호' : '현재 비밀번호', { type: 'password', ph: temp ? '받은 임시 비밀번호' : '현재 비밀번호', auto: 'current-password' })}
         ${fieldHtml('n1', '새 비밀번호', { type: 'password', ph: '6자 이상', help: '6자 이상', auto: 'new-password' })}
         ${fieldHtml('n2', '새 비밀번호 확인', { type: 'password', ph: '한 번 더 입력', auto: 'new-password' })}
       </div><button class="btn" id="pwOk" style="margin-top:20px">변경하기</button>`,
     onMount(sheet, close) {
+      if (temp && S.loginPw) { const c = $('#f-cur', sheet); if (c) c.value = S.loginPw; }   // 방금 로그인할 때 쓴 임시 비밀번호
       sheet.addEventListener('input', (e) => { if (e.target.name) setFieldErr(sheet, e.target.name, ''); });
       $('#pwOk', sheet).onclick = async () => {
         const v = (k) => $(`#f-${k}`, sheet).value;
@@ -4406,7 +5066,15 @@ function showChangePassword() {
         ['cur', 'n1', 'n2'].forEach((k) => setFieldErr(sheet, k, errs[k] || ''));
         if (Object.keys(errs).length) return;
         const btn = $('#pwOk', sheet); btn.disabled = true;
-        try { await api.changePassword(v('cur'), v('n1'), await getCaptchaToken()); close(); toast('비밀번호를 바꿨어요'); }
+        try {
+          await api.changePassword(v('cur'), v('n1'), await getCaptchaToken()); close(); toast('비밀번호를 바꿨어요');
+          S.loginPw = '';
+          if (S.sec && S.sec.temp_pw && api.clearTempPassword) {   // v1.41
+            S.sec.temp_pw = false; api.clearTempPassword().catch(() => {});
+            if (S.tab === 'more' && !S.room) renderMain();
+            const np = v('n1'); if (!S.sec.recovery && api.createRecoveryCode) setTimeout(() => offerRecoveryAfterReset(np), 600);
+          }
+        }
         catch (e) { btn.disabled = false; setFieldErr(sheet, /현재/.test(e.message) ? 'cur' : 'n1', e.message); }
       };
     },
@@ -4492,14 +5160,14 @@ async function refreshAdminBadges() {
     try { b.pending = ((await api.adminSettings()) || {}).pending || 0; } catch { /* 없음 */ }
     try { b.reports = api.adminOpenReports ? await api.adminOpenReports() : 0; } catch { /* 없음 */ }
   }
-  S.pending = b.pending || 0; S.openReports = b.reports || 0; S.openInquiries = b.inquiries || 0;
+  S.pending = b.pending || 0; S.openReports = b.reports || 0; S.openInquiries = b.inquiries || 0; S.pwReqs = b.pw_requests || 0;
   if (S.admin) S.admin.badges = b;
   const set = (id, n) => { const e = $('#' + id); if (e) e.textContent = n ? (n > 99 ? '99+' : String(n)) : ''; };
-  set('admBadge-members', b.pending); set('admBadge-reports', b.reports); set('admBadge-inquiries', b.inquiries);
+  set('admBadge-members', b.pending); set('admBadge-reports', b.reports); set('admBadge-inquiries', b.inquiries); set('admBadge-home', b.pw_requests);
   const more = $('#adminTodo');
   if (more) more.innerHTML = adminTodoChips();
 }
-const adminTodoChips = () => [[S.pending, '승인 대기'], [S.openReports, '신고'], [S.openInquiries, '문의']]
+const adminTodoChips = () => [[S.pending, '승인 대기'], [S.openReports, '신고'], [S.openInquiries, '문의'], [S.pwReqs, '비밀번호 요청']]
   .filter(([n]) => n).map(([n, l]) => `<span class="chip-lemon">${l} ${n}</span>`).join('');
 function refreshReportBadge() { refreshAdminBadges(); }
 
@@ -4526,6 +5194,7 @@ async function renderHomeSec() {
     ['members', 'pending', d.pending, '가입 승인 대기', '승인하거나 거절해 주세요'],
     ['reports', null, d.open_reports, '처리할 신고', '가능한 한 24시간 안에 확인해요'],
     ['inquiries', null, d.open_inquiries, '답변할 문의', '회원이 답을 기다리고 있어요'],
+    ['pwreq', null, d.pw_requests ?? S.pwReqs, '비밀번호 찾기 요청', '본인인지 확인하고 승인해 주세요'],   // v1.41
   ].filter((t) => t[2] > 0);
   admMain().innerHTML = `<div class="adm-sec">
     <div class="adm-h"><h2>현황</h2><span class="adm-date">${fmtDate(new Date().toISOString())}</span></div>
@@ -4537,7 +5206,7 @@ async function renderHomeSec() {
       ${tile('오늘 메시지', d.messages_today, '시스템 안내 제외')}
     </div>
     <div class="card adm-card"><div class="card-head">처리할 일</div>
-      ${todo.length ? todo.map(([s, f, n, l, sub]) => `<button class="item" data-act="admin-todo" data-s="${s}" data-f="${f || ''}"><span class="todo-n">${n}</span><span class="label">${l}<span class="sub">${sub}</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>`).join('')
+      ${todo.length ? todo.map(([s, f, n, l, sub]) => `<button class="item" data-act="${s === 'pwreq' ? 'admin-pwreq' : 'admin-todo'}" data-s="${s}" data-f="${f || ''}"><span class="todo-n">${n}</span><span class="label">${l}<span class="sub">${sub}</span></span>${ic('chev', 18, 'color:#A3ABB6;flex:none')}</button>`).join('')
     : '<div class="empty-line">지금 처리할 일이 없어요</div>'}</div>
     <div class="card adm-card"><div class="card-head chart-head">최근 14일
       <div class="seg mini">${[['active', '접속'], ['signups', '가입'], ['messages', '메시지']].map(([k, l]) => `<button type="button" data-act="admin-chart" data-k="${k}" class="${A.chart === k ? 'on' : ''}">${l}</button>`).join('')}</div></div>
@@ -4552,7 +5221,7 @@ async function renderHomeSec() {
 }
 
 // ---------- v1.20.2: 데이터베이스(schema.sql) 버전 확인 ----------
-const DB_VERSION_NEEDED = '1.28';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
+const DB_VERSION_NEEDED = '1.31';   // 이 앱이 쓰는 데이터베이스 기능의 버전 (schema.sql 을 바꾸면 함께 올림)
 const verNum = (v) => String(v || '0').split('.').reduce((a, x, i) => a + (Number(x) || 0) / (1000 ** i), 0);
 const dbOutdated = () => verNum(S.dbVersion) < verNum(DB_VERSION_NEEDED);
 function dbUpdateCard() {
@@ -5519,6 +6188,10 @@ app.addEventListener('click', async (e) => {
       catch { toast(`내 아이디: @${S.me.username}`); }
       break;
     case 'change-password': showChangePassword(); break;
+    case 'recovery-code': showRecoveryCode(); break;   // v1.41
+    case 'change-password-temp': showChangePassword({ temp: true }); break;
+    case 'rc-later': { try { localStorage.setItem(RC_LATER_KEY, String(Date.now())); } catch { /* 저장 안 됨 */ } if (S.tab === 'more' && !S.room) renderMain(); break; }
+    case 'admin-pwreq': showPwRequests(); break;
     case 'install': showInstall(); break;
     case 'open-admin': S.adminFromMore = true; go('#/admin'); break;
     case 'admin-back':   // v1.18: 관리자 안에서 메뉴를 옮겨 다녀도 한 번에 더보기로
@@ -5741,6 +6414,7 @@ if ('serviceWorker' in navigator && !window.__MINITALK_API__ && !IN_APP) {
   navigator.serviceWorker.addEventListener('message', (e) => {
     if (e.data && e.data.type === 'open' && e.data.hash) go(e.data.hash);
     if (e.data && e.data.type === 'resubscribed' && S.entered) enablePush({ silent: true }).catch(() => {});
+    if (e.data && e.data.type === 'push') onPushArrived();   // v1.42
   });
 }
 
